@@ -1,0 +1,28 @@
+[package]
+name = "urbilateria"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "A small, educational pure-Rust multi-model inference and analysis framework"
+license = "MIT"
+repository = "https://github.com/inspirewind/Urbilateria"
+readme = "README.md"
+
+[lib]
+name = "urbilateria"
+path = "src/lib.rs"
+
+[[bin]]
+name = "urb"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-general-category = "1.1"
+unicode-normalization = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

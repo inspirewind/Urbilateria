@@ -1,0 +1,35 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+*.tmp
+__pycache__/
+*.pyc
+
+# Local research inputs. They are intentionally kept outside Urbilateria's source history.
+/third_party/
+
+# Internal design notes are excluded from the initial public release.
+/docs/
+
+# Never commit checkpoints, generated containers, or runtime state.
+*.safetensors
+*.safetensors.index.json
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+*.coli_usage
+*.urb-cache
+
+# Local profiler output produced by README examples and performance runs.
+/profile*.json
+
+# Local secrets and machine-specific configuration.
+.env
+.env.*
+!.env.example
