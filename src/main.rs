@@ -699,6 +699,7 @@ Usage:\n  \
   urb decode MODEL_DIR TOKEN_IDS [--skip-special] [--json]\n  \
   urb generate MODEL_DIR --prompt TEXT --ram-gib N --allow-large-model\n    \
       [--max-new-tokens N] [--threads N] [--profile] [--profile-json PATH]\n    \
+      [--profile-trace PATH]\n    \
       [--raw-prompt | --no-thinking]\n  \
   urb explain MODEL_DIR\n\n\
 Commands:\n  \
@@ -785,6 +786,7 @@ fn run_generate_to<W: Write>(
             "--max-new-tokens",
             "--threads",
             "--profile-json",
+            "--profile-trace",
         ],
     )?;
     let requested_threads = option_value(args, "--threads")?
@@ -796,8 +798,13 @@ fn run_generate_to<W: Write>(
     }
     let print_profile = has_flag(args, "--profile");
     let profile_json = option_value(args, "--profile-json")?.map(PathBuf::from);
-    let profile = (print_profile || profile_json.is_some())
-        .then(|| ProfileSession::start_with_threads(requested_threads));
+    let profile_trace = option_value(args, "--profile-trace")?.map(PathBuf::from);
+    if profile_json.is_some() && profile_json == profile_trace {
+        return Err("--profile-json and --profile-trace must use different paths".into());
+    }
+    let profile = (print_profile || profile_json.is_some() || profile_trace.is_some()).then(|| {
+        ProfileSession::start_with_threads_and_trace(requested_threads, profile_trace.is_some())
+    });
     let result = {
         let _profile = span(ProfileStage::GenerateTotal);
         run_generate_inner(model_dir, args, available_ram_override, output)
@@ -807,17 +814,31 @@ fn run_generate_to<W: Write>(
         if print_profile {
             eprint!("{}", report.render_text());
         }
-        if let Some(path) = profile_json {
-            serde_json::to_vec_pretty(&report)
-                .map_err(|error| -> Box<dyn Error> { Box::new(error) })
-                .and_then(|json| {
-                    fs::write(&path, json).map_err(|error| {
-                        format!("could not write profile {}: {error}", path.display()).into()
-                    })
-                })
-        } else {
+        (|| {
+            if let Some(path) = profile_json {
+                let json = serde_json::to_vec_pretty(&report)
+                    .map_err(|error| -> Box<dyn Error> { Box::new(error) })?;
+                fs::write(&path, json).map_err(|error| -> Box<dyn Error> {
+                    format!("could not write profile {}: {error}", path.display()).into()
+                })?;
+            }
+            if let Some(path) = profile_trace {
+                let json = report
+                    .chrome_trace_json_pretty()
+                    .map_err(|error| -> Box<dyn Error> { Box::new(error) })?
+                    .ok_or("profile trace collection was not enabled")?;
+                fs::write(&path, json).map_err(|error| -> Box<dyn Error> {
+                    format!("could not write profile trace {}: {error}", path.display()).into()
+                })?;
+                if report.trace_dropped_events() != 0 {
+                    eprintln!(
+                        "warning: profile trace reached its event limit; {} span events were dropped",
+                        report.trace_dropped_events()
+                    );
+                }
+            }
             Ok(())
-        }
+        })()
     } else {
         Ok(())
     };
@@ -855,6 +876,7 @@ fn run_generate_inner<W: Write>(
             "--max-new-tokens",
             "--threads",
             "--profile-json",
+            "--profile-trace",
         ],
     )?;
     if !has_flag(args, "--allow-large-model") {
@@ -3169,6 +3191,7 @@ mod tests {
         let dir = empty_model_dir();
         write_tiny_generate_fixture(&dir);
         let profile_path = dir.join("profile.json");
+        let trace_path = dir.join("profile.trace.json");
         let args = [
             "--prompt".to_owned(),
             "[gMASK]<sop>A".to_owned(),
@@ -3180,14 +3203,23 @@ mod tests {
             "--raw-prompt".to_owned(),
             "--profile-json".to_owned(),
             profile_path.display().to_string(),
+            "--profile-trace".to_owned(),
+            trace_path.display().to_string(),
         ];
         let mut output = Vec::new();
         run_generate_to(&dir, &args, Some(2 * 1024 * 1024 * 1024), &mut output).unwrap();
         assert_eq!(output, b"B\n");
         let profile: serde_json::Value =
             serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
-        assert_eq!(profile["schema_version"], 1);
+        assert_eq!(profile["schema_version"], 2);
         assert!(profile["worker_threads"].as_u64().unwrap() >= 1);
+        #[cfg(target_os = "linux")]
+        {
+            let resources = profile["resources"].as_object().unwrap();
+            assert_eq!(resources["source"], "linux_procfs");
+            assert!(resources["samples"].as_array().unwrap().len() >= 2);
+            assert!(resources["summary"]["peak_rss_bytes"].as_u64().unwrap() > 0);
+        }
         let stages = profile["stages"].as_array().unwrap();
         assert!(stages
             .iter()
@@ -3195,6 +3227,17 @@ mod tests {
         assert!(stages
             .iter()
             .any(|entry| entry["stage"] == "kernel.matvec.f32"));
+        let trace: serde_json::Value =
+            serde_json::from_slice(&fs::read(&trace_path).unwrap()).unwrap();
+        assert_eq!(trace["metadata"]["source"], "urbilateria");
+        assert!(trace["metadata"]["recorded_span_events"].as_u64().unwrap() > 0);
+        let events = trace["traceEvents"].as_array().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event["ph"] == "X" && event["name"] == "generate.total"));
+        assert!(events
+            .iter()
+            .any(|event| event["ph"] == "C" && event["name"] == "RSS MiB"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

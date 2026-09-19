@@ -221,7 +221,9 @@ where
         return Err(GenerationError::EmptyPrompt);
     }
 
-    let mut time_to_first_token = Some(span(ProfileStage::TimeToFirstToken));
+    let mut time_to_first_token_span = span(ProfileStage::TimeToFirstToken);
+    time_to_first_token_span.set_batch_tokens(prompt.len());
+    let mut time_to_first_token = Some(time_to_first_token_span);
     let mut logits = model
         .prefill(prompt, state)
         .map_err(GenerationError::Model)?;
@@ -251,11 +253,12 @@ where
             });
         }
         if step + 1 < config.max_new_tokens {
-            let _profile = span_with_work(ProfileStage::Decode, 1);
+            let mut profile = span_with_work(ProfileStage::Decode, 1);
+            profile.set_token(prompt.len().saturating_add(step), token as usize);
             logits = model
                 .forward_token(token, state)
                 .map_err(GenerationError::Model)?;
-            drop(_profile);
+            drop(profile);
             validate_logits(&logits)?;
             validate_decode_domain(&logits, config.allowed_token_mask.as_deref())?;
             validate_eos_domain(&logits, config)?;

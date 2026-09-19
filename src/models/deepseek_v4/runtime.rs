@@ -251,7 +251,7 @@ impl DeepseekRuntimeModel {
         token: u32,
         state: &mut DeepseekRuntimeState,
     ) -> Result<DeepseekRuntimeStep, DeepseekRuntimeError> {
-        let _profile = span(ProfileStage::DeepseekToken);
+        let mut profile = span(ProfileStage::DeepseekToken);
         if state.instance_id != self.instance_id {
             return Err(DeepseekRuntimeError::Invalid(
                 "state belongs to another runtime instance".to_owned(),
@@ -271,8 +271,10 @@ impl DeepseekRuntimeModel {
             });
         }
         let position = state.position;
+        profile.set_token(position, token_index);
         let checkpoint = {
-            let _profile = span(ProfileStage::DeepseekStateCheckpoint);
+            let mut profile = span(ProfileStage::DeepseekStateCheckpoint);
+            profile.set_token(position, token_index);
             state.attention.clone()
         };
         let result = self.forward_token_inner(token_index, position, state);
@@ -330,7 +332,9 @@ impl DeepseekRuntimeModel {
         }
         let start_position = state.position;
         let checkpoint = {
-            let _profile = span(ProfileStage::DeepseekStateCheckpoint);
+            let mut profile = span(ProfileStage::DeepseekStateCheckpoint);
+            profile.set_token_position(start_position);
+            profile.set_batch_tokens(tokens.len());
             state.attention.clone()
         };
         let result = self.prefill_tokens_inner(&token_indices, start_position, state);
@@ -352,11 +356,16 @@ impl DeepseekRuntimeModel {
         position: usize,
         state: &mut DeepseekRuntimeState,
     ) -> Result<DeepseekRuntimeStep, DeepseekRuntimeError> {
-        let mut hidden = self.load_hidden(token)?;
+        let mut hidden = self.load_hidden(token, position)?;
         let mut routes_by_layer = Vec::with_capacity(self.config.num_hidden_layers);
         for layer_id in 0..self.config.num_hidden_layers {
+            let flow_id = layer_flow_id(position, layer_id);
             let layer = {
-                let _profile = span(ProfileStage::DeepseekLayerLoad);
+                let mut profile = span(ProfileStage::DeepseekLayerLoad);
+                profile.set_token(position, token);
+                profile.set_layer_id(layer_id);
+                profile.set_flow_id(flow_id);
+                profile.set_batch_tokens(1);
                 DecoderLayer::load(&self.index, &self.config, layer_id)?
             };
             let (next, routes) = layer.forward(
@@ -366,11 +375,12 @@ impl DeepseekRuntimeModel {
                 &mut state.attention[layer_id],
                 &mut state.experts,
                 &self.config,
+                flow_id,
             )?;
             hidden = next;
             routes_by_layer.push(routes);
         }
-        self.finish_step(hidden, routes_by_layer)
+        self.finish_step(hidden, routes_by_layer, position, token)
     }
 
     fn prefill_tokens_inner(
@@ -381,13 +391,19 @@ impl DeepseekRuntimeModel {
     ) -> Result<DeepseekRuntimeStep, DeepseekRuntimeError> {
         let mut hidden_by_token = tokens
             .iter()
-            .map(|&token| self.load_hidden(token))
+            .enumerate()
+            .map(|(offset, &token)| self.load_hidden(token, start_position + offset))
             .collect::<Result<Vec<_>, _>>()?;
         let final_offset = tokens.len() - 1;
         let mut routes_by_layer = Vec::with_capacity(self.config.num_hidden_layers);
         for layer_id in 0..self.config.num_hidden_layers {
+            let flow_id = layer_flow_id(start_position, layer_id);
             let layer = {
-                let _profile = span(ProfileStage::DeepseekLayerLoad);
+                let mut profile = span(ProfileStage::DeepseekLayerLoad);
+                profile.set_token_position(start_position);
+                profile.set_layer_id(layer_id);
+                profile.set_flow_id(flow_id);
+                profile.set_batch_tokens(tokens.len());
                 DecoderLayer::load(&self.index, &self.config, layer_id)?
             };
             let attention = &mut state.attention[layer_id];
@@ -400,6 +416,7 @@ impl DeepseekRuntimeModel {
                     attention,
                     &mut state.experts,
                     &self.config,
+                    flow_id,
                 )?;
                 *hidden = next;
                 if offset == final_offset {
@@ -410,12 +427,18 @@ impl DeepseekRuntimeModel {
         let hidden = hidden_by_token
             .pop()
             .expect("a non-empty prefill has a final hidden state");
-        self.finish_step(hidden, routes_by_layer)
+        self.finish_step(
+            hidden,
+            routes_by_layer,
+            start_position + final_offset,
+            tokens[final_offset],
+        )
     }
 
-    fn load_hidden(&self, token: usize) -> Result<Vec<f32>, DeepseekRuntimeError> {
+    fn load_hidden(&self, token: usize, position: usize) -> Result<Vec<f32>, DeepseekRuntimeError> {
         let embedding = {
-            let _profile = span(ProfileStage::DeepseekEmbeddingRead);
+            let mut profile = span(ProfileStage::DeepseekEmbeddingRead);
+            profile.set_token(position, token);
             load_reference_matrix_row(
                 &self.index,
                 "embed.weight",
@@ -435,9 +458,12 @@ impl DeepseekRuntimeModel {
         &self,
         hidden: Vec<f32>,
         routes_by_layer: Vec<Vec<RouteChoice>>,
+        position: usize,
+        token: usize,
     ) -> Result<DeepseekRuntimeStep, DeepseekRuntimeError> {
         let hidden = {
-            let _profile = span(ProfileStage::DeepseekFinalization);
+            let mut profile = span(ProfileStage::DeepseekFinalization);
+            profile.set_token(position, token);
             let hidden = hyper_connection_head(
                 &hidden,
                 self.config.hidden_size,
@@ -451,7 +477,8 @@ impl DeepseekRuntimeModel {
             bf16_rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps as f32)?
         };
         let logits = {
-            let _profile = span(ProfileStage::DeepseekLmHead);
+            let mut profile = span(ProfileStage::DeepseekLmHead);
+            profile.set_token(position, token);
             streamed_reference_matvec(
                 &self.index,
                 "head.weight",
@@ -591,6 +618,7 @@ impl HcHeadWeights {
 
 #[derive(Debug)]
 struct DecoderLayer {
+    layer: usize,
     attn_hc: HcWeights,
     ffn_hc: HcWeights,
     attn_norm: Vec<f32>,
@@ -607,6 +635,7 @@ impl DecoderLayer {
     ) -> Result<Self, DeepseekRuntimeError> {
         let prefix = format!("layers.{layer}");
         Ok(Self {
+            layer,
             attn_hc: HcWeights::load(index, config, &prefix, "attn")?,
             ffn_hc: HcWeights::load(index, config, &prefix, "ffn")?,
             attn_norm: load_reference_vector(
@@ -633,13 +662,20 @@ impl DecoderLayer {
         attention_state: &mut AttentionState,
         experts: &mut DeepExpertStore,
         config: &DeepseekV4Config,
+        flow_id: u64,
     ) -> Result<(Vec<f32>, Vec<RouteChoice>), DeepseekRuntimeError> {
-        let _layer_profile = span(ProfileStage::DeepseekLayer);
+        let mut layer_profile = span(ProfileStage::DeepseekLayer);
+        layer_profile.set_token(position, token);
+        layer_profile.set_layer_id(self.layer);
+        layer_profile.set_flow_id(flow_id);
         let residual = hidden;
         let (collapsed, mix) = self.attn_hc.pre(hidden, config)?;
         let normalized = bf16_rms_norm(&collapsed, &self.attn_norm, config.rms_norm_eps as f32)?;
         let branch = {
-            let _profile = span(ProfileStage::DeepseekAttention);
+            let mut profile = span(ProfileStage::DeepseekAttention);
+            profile.set_token(position, token);
+            profile.set_layer_id(self.layer);
+            profile.set_flow_id(flow_id);
             self.attention
                 .forward(&normalized, position, attention_state, config)?
         };
@@ -649,8 +685,12 @@ impl DecoderLayer {
         let (collapsed, mix) = self.ffn_hc.pre(&residual, config)?;
         let normalized = bf16_rms_norm(&collapsed, &self.ffn_norm, config.rms_norm_eps as f32)?;
         let (branch, routes) = {
-            let _profile = span(ProfileStage::DeepseekMoe);
-            self.moe.forward(&normalized, token, experts, config)?
+            let mut profile = span(ProfileStage::DeepseekMoe);
+            profile.set_token(position, token);
+            profile.set_layer_id(self.layer);
+            profile.set_flow_id(flow_id);
+            self.moe
+                .forward(&normalized, token, position, flow_id, experts, config)?
         };
         Ok((
             hyper_connection_post(&branch, &residual, config.hidden_size, &mix)?,
@@ -1077,6 +1117,8 @@ impl MoeWeights {
         &self,
         input: &[f32],
         token: usize,
+        position: usize,
+        flow_id: u64,
         experts: &mut DeepExpertStore,
         config: &DeepseekV4Config,
     ) -> Result<(Vec<f32>, Vec<RouteChoice>), DeepseekRuntimeError> {
@@ -1111,10 +1153,26 @@ impl MoeWeights {
             .iter()
             .map(|&(expert, _)| expert)
             .collect::<Vec<_>>();
-        let loaded = experts.acquire_batch(self.layer, &expert_ids)?;
-        for ((_, route_weight), expert) in execution_order.into_iter().zip(loaded) {
+        let cache_hits = expert_ids
+            .iter()
+            .map(|&expert| experts.contains(self.layer, expert))
+            .collect::<Vec<_>>();
+        let trace_context = ExpertTraceContext {
+            position,
+            token,
+            flow_id,
+        };
+        let loaded = experts.acquire_batch(self.layer, &expert_ids, trace_context)?;
+        for (((expert_id, route_weight), expert), cache_hit) in
+            execution_order.into_iter().zip(loaded).zip(cache_hits)
+        {
             let computed = {
-                let _profile = span(ProfileStage::DeepseekExpertCompute);
+                let mut profile = span(ProfileStage::DeepseekExpertCompute);
+                profile.set_token(position, token);
+                profile.set_layer_id(self.layer);
+                profile.set_expert_id(expert_id);
+                profile.set_cache_hit(cache_hit);
+                profile.set_flow_id(flow_id);
                 expert.forward(input, Some(route_weight))?
             };
             for (output, expert) in output.iter_mut().zip(computed) {
@@ -1234,6 +1292,13 @@ struct DeepExpertStore {
     telemetry: ExpertTelemetry,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExpertTraceContext {
+    position: usize,
+    token: usize,
+    flow_id: u64,
+}
+
 impl DeepExpertStore {
     fn new(
         index: Arc<TensorIndex>,
@@ -1259,6 +1324,7 @@ impl DeepExpertStore {
         &mut self,
         layer: usize,
         expert: usize,
+        trace_context: ExpertTraceContext,
     ) -> Result<Arc<DeepExpert>, DeepseekRuntimeError> {
         if layer >= self.config.num_hidden_layers || expert >= self.config.n_routed_experts {
             return Err(DeepseekRuntimeError::Invalid(
@@ -1274,6 +1340,11 @@ impl DeepExpertStore {
             expert,
             || {
                 let mut profile = span(ProfileStage::DeepseekExpertLoad);
+                profile.set_token(trace_context.position, trace_context.token);
+                profile.set_layer_id(layer);
+                profile.set_expert_id(expert);
+                profile.set_cache_hit(false);
+                profile.set_flow_id(trace_context.flow_id);
                 let loaded = DeepExpert::load(
                     &index,
                     &format!("layers.{layer}.ffn.experts.{expert}"),
@@ -1291,6 +1362,7 @@ impl DeepExpertStore {
         &mut self,
         layer: usize,
         experts: &[usize],
+        trace_context: ExpertTraceContext,
     ) -> Result<Vec<Arc<DeepExpert>>, DeepseekRuntimeError> {
         if layer >= self.config.num_hidden_layers
             || experts
@@ -1304,7 +1376,7 @@ impl DeepExpertStore {
         if !self.cache.can_insert_without_eviction(layer, experts) {
             return experts
                 .iter()
-                .map(|&expert| self.acquire(layer, expert))
+                .map(|&expert| self.acquire(layer, expert, trace_context))
                 .collect();
         }
 
@@ -1324,6 +1396,11 @@ impl DeepExpertStore {
                 .map(|&expert| {
                     profile_context.enter(|| {
                         let mut profile = span(ProfileStage::DeepseekExpertLoad);
+                        profile.set_token(trace_context.position, trace_context.token);
+                        profile.set_layer_id(layer);
+                        profile.set_expert_id(expert);
+                        profile.set_cache_hit(false);
+                        profile.set_flow_id(trace_context.flow_id);
                         let loaded = DeepExpert::load(
                             &index,
                             &format!("layers.{layer}.ffn.experts.{expert}"),
@@ -1365,6 +1442,20 @@ impl DeepExpertStore {
             })
             .collect()
     }
+
+    fn contains(&self, layer: usize, expert: usize) -> bool {
+        self.cache.contains(layer, expert)
+    }
+}
+
+fn layer_flow_id(position: usize, layer: usize) -> u64 {
+    let position = u64::try_from(position)
+        .unwrap_or(u64::MAX)
+        .min(u32::MAX.into());
+    let layer = u64::try_from(layer)
+        .unwrap_or(u64::MAX)
+        .min(u32::MAX.into());
+    (position << 32) | layer
 }
 
 fn load_compressor(
@@ -1892,7 +1983,7 @@ mod tests {
         let mut experts = DeepExpertStore::new(Arc::clone(&index), &config, 0, u64::MAX).unwrap();
 
         let (output, routes) = layer
-            .forward(&hidden, 0, 0, &mut attention, &mut experts, &config)
+            .forward(&hidden, 0, 0, &mut attention, &mut experts, &config, 0)
             .unwrap();
 
         assert_eq!(output.len(), config.hc_mult * config.hidden_size);
@@ -1991,7 +2082,7 @@ mod tests {
         assert_eq!(next_batched, next_sequential);
 
         let mut profiled_state = model.new_state().unwrap();
-        let profile = ProfileSession::start();
+        let profile = ProfileSession::start_with_threads_and_trace(None, true);
         let logits = CausalDecoder::prefill(&model, &prompt, &mut profiled_state).unwrap();
         let report = profile.finish();
         assert_eq!(logits, sequential.logits);
@@ -2005,6 +2096,30 @@ mod tests {
             (model.config().num_hidden_layers * prompt.len()) as u64
         );
         assert_eq!(report.stage(ProfileStage::DeepseekLmHead).unwrap().calls, 1);
+        let trace: serde_json::Value = serde_json::from_slice(
+            &report
+                .chrome_trace_json_pretty()
+                .unwrap()
+                .expect("trace collection was enabled"),
+        )
+        .unwrap();
+        let events = trace["traceEvents"].as_array().unwrap();
+        let layer_load = events
+            .iter()
+            .find(|event| event["name"] == "deepseek.layer.load")
+            .unwrap();
+        assert_eq!(layer_load["args"]["token_position"], 0);
+        assert_eq!(layer_load["args"]["layer_id"], 0);
+        assert_eq!(layer_load["args"]["flow_id"], 0);
+        assert_eq!(layer_load["args"]["batch_tokens"], prompt.len());
+        let expert_compute = events
+            .iter()
+            .find(|event| event["name"] == "deepseek.expert.compute")
+            .unwrap();
+        assert_eq!(expert_compute["args"]["token_position"], 0);
+        assert_eq!(expert_compute["args"]["layer_id"], 0);
+        assert!(expert_compute["args"]["expert_id"].is_u64());
+        assert!(expert_compute["args"]["cache_hit"].is_boolean());
         fs::remove_dir_all(directory).unwrap();
     }
 

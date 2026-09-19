@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Urbilateria Profile Viewer</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0e14; --panel:#131823; --line:#273044; --text:#e7edf7; --muted:#8f9bb2; --accent:#65d1b5; --accent2:#7ba7ff; --warn:#ffbe5c; }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--text); background:radial-gradient(circle at 15% 0,#18243a 0,transparent 30%),var(--bg) }
+    header { position:sticky; top:0; z-index:3; display:flex; align-items:center; gap:18px; padding:14px 22px; border-bottom:1px solid var(--line); background:#0b0e14e8; backdrop-filter:blur(12px) }
+    h1 { margin:0; font-size:18px; letter-spacing:.02em }
+    header small { color:var(--muted) }
+    header a { margin-left:auto; color:var(--accent2); text-decoration:none }
+    main { max-width:1500px; margin:auto; padding:20px }
+    .drop { display:flex; align-items:center; justify-content:center; min-height:108px; padding:18px; border:1px dashed #4a5873; border-radius:14px; color:var(--muted); background:#101622aa; cursor:pointer; transition:.15s }
+    .drop.drag { border-color:var(--accent); color:var(--text); background:#14251f }
+    .drop strong { color:var(--text) }
+    input[type=file] { display:none }
+    .status { margin:10px 2px 18px; color:var(--muted) }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:16px }
+    .card,.panel { border:1px solid var(--line); border-radius:12px; background:linear-gradient(145deg,#151b27,#10141d); box-shadow:0 8px 32px #0003 }
+    .card { padding:13px 15px }
+    .card label { display:block; color:var(--muted); font-size:12px }
+    .card b { display:block; margin-top:5px; font-size:21px; font-variant-numeric:tabular-nums }
+    .grid { display:grid; grid-template-columns:minmax(360px,.8fr) minmax(500px,1.2fr); gap:16px }
+    .panel { min-width:0; padding:15px; margin-bottom:16px }
+    .panel h2 { margin:0 0 12px; font-size:15px }
+    .empty { padding:40px 12px; text-align:center; color:var(--muted) }
+    .stage { display:grid; grid-template-columns:minmax(145px,1fr) 3fr 78px; gap:9px; align-items:center; margin:7px 0 }
+    .stage-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#cdd8ec }
+    .bar-track { height:15px; border-radius:4px; background:#20283a; overflow:hidden }
+    .bar { height:100%; min-width:1px; border-radius:4px; background:linear-gradient(90deg,var(--accent2),var(--accent)) }
+    .number { text-align:right; color:var(--muted); font-variant-numeric:tabular-nums }
+    canvas { display:block; width:100%; border-radius:7px; background:#0d1119 }
+    #resourceCanvas { height:280px }
+    #flameWrap { overflow:auto; border:1px solid var(--line); border-radius:8px; background:#0d1119 }
+    #flameCanvas { min-width:900px; cursor:grab }
+    #flameCanvas.dragging { cursor:grabbing }
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px }
+    button,input[type=search],select { border:1px solid #35415a; border-radius:7px; color:var(--text); background:#171e2c; padding:7px 10px }
+    button { cursor:pointer }
+    button:hover { border-color:var(--accent2) }
+    input[type=search] { min-width:220px }
+    .legend { display:flex; flex-wrap:wrap; gap:13px; margin:8px 0; color:var(--muted); font-size:12px }
+    .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px }
+    .details { min-height:42px; margin-top:10px; color:var(--muted); font-variant-numeric:tabular-nums }
+    .details b { color:var(--text) }
+    .hint { color:var(--warn) }
+    @media(max-width:900px){ .grid{grid-template-columns:1fr} header small{display:none} }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Urbilateria Profile Viewer</h1>
+    <small>聚合指标 · 资源曲线 · 交互式时间火焰图</small>
+    <a href="https://ui.perfetto.dev/" target="_blank" rel="noreferrer">在 Perfetto 中打开 trace ↗</a>
+  </header>
+  <main>
+    <label class="drop" id="drop">
+      <input id="files" type="file" accept=".json,application/json" multiple>
+      <span><strong>拖入或选择 JSON</strong><br>可同时选择 <code>profile.json</code> 和 <code>profile.trace.json</code>，文件只在本地浏览器处理</span>
+    </label>
+    <div class="status" id="status">等待文件</div>
+    <section class="cards" id="cards"></section>
+    <div class="grid">
+      <section class="panel">
+        <h2>阶段累计耗时</h2>
+        <div id="stages" class="empty">载入 profile v2 JSON 后显示</div>
+      </section>
+      <section class="panel">
+        <h2>资源时间序列</h2>
+        <canvas id="resourceCanvas"></canvas>
+        <div class="legend">
+          <span><i style="background:#65d1b5"></i>CPU cores</span>
+          <span><i style="background:#7ba7ff"></i>RSS GiB</span>
+          <span><i style="background:#ffbe5c"></i>syscall read GiB/s</span>
+          <span><i style="background:#ee6f87"></i>storage read GiB/s</span>
+        </div>
+      </section>
+    </div>
+    <section class="panel">
+      <h2>Span 时间火焰图</h2>
+      <div class="toolbar">
+        <button id="reset">重置视图</button>
+        <button id="zoomIn">放大</button>
+        <button id="zoomOut">缩小</button>
+        <select id="thread"><option value="all">全部线程</option></select>
+        <input id="search" type="search" placeholder="搜索 stage，例如 layer.load">
+        <span id="range" class="number"></span>
+      </div>
+      <div id="flameWrap"><canvas id="flameCanvas" height="260"></canvas></div>
+      <div class="details" id="details">载入由 <code>--profile-trace</code> 生成的 JSON 后显示。滚轮缩放，拖拽平移，点击事件查看详情。</div>
+    </section>
+  </main>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const state = { profile:null, trace:null, events:[], lanes:[], viewStart:0, viewEnd:1, fullEnd:1, hoverRects:[], selected:null, dragging:false, dragX:0, dragStart:0, thread:'all' };
+  const drop=$('drop'), files=$('files'), flame=$('flameCanvas'), wrap=$('flameWrap'), resource=$('resourceCanvas');
+
+  ['dragenter','dragover'].forEach(type => drop.addEventListener(type,e=>{e.preventDefault();drop.classList.add('drag')}));
+  ['dragleave','drop'].forEach(type => drop.addEventListener(type,e=>{e.preventDefault();drop.classList.remove('drag')}));
+  drop.addEventListener('drop',e=>loadFiles(e.dataTransfer.files));
+  files.addEventListener('change',()=>loadFiles(files.files));
+
+  async function loadFiles(list){
+    const loaded=[];
+    for(const file of list){
+      try{
+        const data=JSON.parse(await file.text());
+        if(Array.isArray(data.traceEvents)){ state.trace=data; loaded.push(`${file.name}（trace）`); }
+        else if(Array.isArray(data.stages)){ state.profile=data; loaded.push(`${file.name}（profile v${data.schema_version ?? '?'}）`); }
+        else throw new Error('无法识别的 JSON schema');
+      }catch(error){ $('status').textContent=`${file.name}: ${error.message}`; }
+    }
+    if(loaded.length){ $('status').textContent=`已载入 ${loaded.join('、')}`; renderAll(); }
+  }
+
+  function renderAll(){ renderCards(); renderStages(); prepareTrace(); renderResources(); renderFlame(); }
+  const fmtSeconds=ns=>`${(ns/1e9).toFixed(ns<1e9?3:2)} s`;
+  const fmtBytes=n=> n>=2**30?`${(n/2**30).toFixed(2)} GiB`:`${(n/2**20).toFixed(1)} MiB`;
+  function renderCards(){
+    const p=state.profile, s=p?.resources?.summary, cards=[];
+    if(p){ cards.push(['总耗时',fmtSeconds(p.wall_time_ns)],['Worker',`${p.worker_threads ?? '—'} / requested ${p.requested_threads ?? 'auto'}`]); }
+    if(s){ cards.push(['平均 CPU',`${s.average_cpu_cores.toFixed(2)} cores`],['CPU 峰值',`${s.peak_interval_cpu_cores.toFixed(2)} cores`],['RSS 峰值',fmtBytes(s.peak_rss_bytes)],['存储读取',fmtBytes(s.storage_read_bytes)]); }
+    if(state.trace?.metadata) cards.push(['Trace spans',Number(state.trace.metadata.recorded_span_events||0).toLocaleString()],['Dropped',Number(state.trace.metadata.dropped_span_events||0).toLocaleString()]);
+    $('cards').replaceChildren(...cards.map(([label,value])=>{const d=document.createElement('div');d.className='card';const l=document.createElement('label');l.textContent=label;const b=document.createElement('b');b.textContent=value;d.append(l,b);return d;}));
+  }
+
+  function renderStages(){
+    const root=$('stages'), stages=state.profile?.stages;
+    if(!stages?.length){root.className='empty';root.textContent='载入 profile v2 JSON 后显示';return;}
+    root.className=''; root.replaceChildren();
+    const sorted=[...stages].sort((a,b)=>b.total_ns-a.total_ns), max=sorted[0].total_ns||1;
+    for(const item of sorted){
+      const row=document.createElement('div');row.className='stage';row.title=`calls=${item.calls.toLocaleString()} avg=${(item.total_ns/item.calls/1e6).toFixed(3)} ms`;
+      const name=document.createElement('span');name.className='stage-name';name.textContent=item.stage;
+      const track=document.createElement('span');track.className='bar-track';const bar=document.createElement('span');bar.className='bar';bar.style.width=`${100*item.total_ns/max}%`;track.append(bar);
+      const value=document.createElement('span');value.className='number';value.textContent=`${(item.total_ns/1e9).toFixed(2)}s`;
+      row.append(name,track,value);root.append(row);
+    }
+  }
+
+  function profileSeries(){
+    const samples=state.profile?.resources?.samples;if(!samples?.length)return [];
+    return samples.map((x,i)=>{const p=samples[Math.max(0,i-1)],dt=Math.max(1,x.elapsed_ns-p.elapsed_ns);return {t:x.elapsed_ns/1e9,cpu:(x.cpu_time_ns-p.cpu_time_ns)/dt,rss:x.rss_bytes/2**30,read:(x.read_char_bytes-p.read_char_bytes)*1e9/dt/2**30,storage:(x.storage_read_bytes-p.storage_read_bytes)*1e9/dt/2**30};});
+  }
+  function traceSeries(){
+    const groups=new Map();for(const e of state.trace?.traceEvents||[]){if(e.ph==='C'&&e.args&&Number.isFinite(e.args.value)){if(!groups.has(e.name))groups.set(e.name,[]);groups.get(e.name).push([e.ts/1e6,e.args.value]);}}
+    const times=groups.get('CPU cores')||[];return times.map(([t,cpu],i)=>({t,cpu,rss:(groups.get('RSS MiB')?.[i]?.[1]||0)/1024,read:(groups.get('syscall read MiB/s')?.[i]?.[1]||0)/1024,storage:(groups.get('storage read MiB/s')?.[i]?.[1]||0)/1024}));
+  }
+  function renderResources(){
+    const data=profileSeries().length?profileSeries():traceSeries();
+    setupCanvas(resource,280);const ctx=resource.getContext('2d'),w=resource.clientWidth,h=280,pad={l:42,r:12,t:12,b:25};ctx.clearRect(0,0,w,h);
+    if(data.length<2){emptyCanvas(ctx,w,h,'暂无资源时间序列');return;}
+    const maxT=data.at(-1).t||1, metrics=[['cpu','#65d1b5'],['rss','#7ba7ff'],['read','#ffbe5c'],['storage','#ee6f87']];
+    ctx.strokeStyle='#273044';ctx.lineWidth=1;ctx.fillStyle='#7f8ba3';ctx.font='11px system-ui';
+    for(let i=0;i<=4;i++){const y=pad.t+(h-pad.t-pad.b)*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();}
+    for(const [key,color] of metrics){const max=Math.max(...data.map(x=>x[key]),1e-9);ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.5;data.forEach((x,i)=>{const px=pad.l+x.t/maxT*(w-pad.l-pad.r),py=pad.t+(1-x[key]/max)*(h-pad.t-pad.b);i?ctx.lineTo(px,py):ctx.moveTo(px,py)});ctx.stroke();}
+    ctx.fillText('0',pad.l-5,h-8);ctx.fillText(`${maxT.toFixed(1)}s`,w-52,h-8);
+  }
+
+  function prepareTrace(){
+    const raw=(state.trace?.traceEvents||[]).filter(e=>e.ph==='X'&&Number.isFinite(e.ts)&&Number.isFinite(e.dur));
+    const names=new Map();for(const e of state.trace?.traceEvents||[]){if(e.ph==='M'&&e.name==='thread_name')names.set(String(e.tid),e.args?.name||`thread ${e.tid}`);}
+    const byThread=new Map();for(const e of raw){const tid=String(e.tid);if(!byThread.has(tid))byThread.set(tid,[]);byThread.get(tid).push({...e,start:e.ts/1e6,end:(e.ts+e.dur)/1e6,depth:0});}
+    state.events=[];state.lanes=[];let laneY=24;
+    for(const [tid,events] of byThread){events.sort((a,b)=>a.start-b.start||b.end-a.end);const stack=[];let maxDepth=0;for(const e of events){while(stack.length&&stack.at(-1)<=e.start)stack.pop();e.depth=stack.length;stack.push(e.end);maxDepth=Math.max(maxDepth,e.depth);state.events.push(e);}state.lanes.push({tid,name:names.get(tid)||`thread ${tid}`,y:laneY,depths:maxDepth+1});laneY+=(maxDepth+1)*18+25;}
+    state.fullEnd=Math.max(1,...state.events.map(e=>e.end));state.viewStart=0;state.viewEnd=state.fullEnd;
+    const selector=$('thread'),old=selector.value;selector.replaceChildren(new Option('全部线程','all'),...state.lanes.map(l=>new Option(l.name,l.tid)));selector.value=[...selector.options].some(o=>o.value===old)?old:'all';state.thread=selector.value;
+  }
+
+  function renderFlame(){
+    const laneList=state.thread==='all'?state.lanes:state.lanes.filter(x=>x.tid===state.thread), offsets=new Map();let y=24;for(const lane of laneList){offsets.set(lane.tid,y);y+=(lane.depths)*18+25;}
+    const height=Math.max(220,y+10);setupCanvas(flame,height);flame.style.height=`${height}px`;const ctx=flame.getContext('2d'),w=flame.clientWidth;ctx.clearRect(0,0,w,height);state.hoverRects=[];
+    if(!state.events.length){emptyCanvas(ctx,w,height,'载入 --profile-trace 生成的 JSON 后显示');return;}
+    const span=Math.max(.000001,state.viewEnd-state.viewStart),search=$('search').value.toLowerCase();ctx.font='10px system-ui';ctx.textBaseline='middle';
+    for(const lane of laneList){const ly=offsets.get(lane.tid);ctx.fillStyle='#8f9bb2';ctx.fillText(lane.name,6,ly-10);}
+    for(const e of state.events){if(!offsets.has(String(e.tid))||e.end<state.viewStart||e.start>state.viewEnd)continue;const x=Math.max(0,(e.start-state.viewStart)/span*w),right=Math.min(w,(e.end-state.viewStart)/span*w),width=Math.max(.6,right-x),yy=offsets.get(String(e.tid))+e.depth*18;const match=!search||e.name.toLowerCase().includes(search);ctx.fillStyle=match?colorFor(e.cat||e.name):'#273044';ctx.globalAlpha=match?1:.25;ctx.fillRect(x,yy,width,16);ctx.globalAlpha=1;if(width>48){ctx.save();ctx.beginPath();ctx.rect(x+2,yy,width-4,16);ctx.clip();ctx.fillStyle='#071018';ctx.fillText(e.name,x+4,yy+8);ctx.restore();}state.hoverRects.push({x,y:yy,w:width,h:16,e});}
+    $('range').textContent=`${state.viewStart.toFixed(3)}–${state.viewEnd.toFixed(3)} s`;
+  }
+
+  function setupCanvas(canvas,height){const dpr=devicePixelRatio||1,w=Math.max(300,canvas.clientWidth);canvas.width=Math.round(w*dpr);canvas.height=Math.round(height*dpr);const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);}
+  function emptyCanvas(ctx,w,h,text){ctx.fillStyle='#8f9bb2';ctx.font='13px system-ui';ctx.textAlign='center';ctx.fillText(text,w/2,h/2);ctx.textAlign='left';}
+  function colorFor(s){let h=0;for(const c of s)h=(h*31+c.charCodeAt(0))>>>0;return `hsl(${h%360} 63% 61%)`;}
+  function zoom(factor,center=(state.viewStart+state.viewEnd)/2){const old=state.viewEnd-state.viewStart,next=Math.min(state.fullEnd,Math.max(.001,old*factor)),ratio=(center-state.viewStart)/old;state.viewStart=Math.max(0,center-next*ratio);state.viewEnd=state.viewStart+next;if(state.viewEnd>state.fullEnd){state.viewEnd=state.fullEnd;state.viewStart=Math.max(0,state.viewEnd-next);}renderFlame();}
+  $('reset').onclick=()=>{state.viewStart=0;state.viewEnd=state.fullEnd;renderFlame()};$('zoomIn').onclick=()=>zoom(.5);$('zoomOut').onclick=()=>zoom(2);$('search').oninput=renderFlame;$('thread').onchange=e=>{state.thread=e.target.value;renderFlame()};
+  flame.addEventListener('wheel',e=>{e.preventDefault();const r=flame.getBoundingClientRect(),center=state.viewStart+(e.clientX-r.left)/r.width*(state.viewEnd-state.viewStart);zoom(e.deltaY>0?1.35:.72,center)},{passive:false});
+  flame.addEventListener('pointerdown',e=>{state.dragging=true;state.dragX=e.clientX;state.dragStart=state.viewStart;flame.classList.add('dragging');flame.setPointerCapture(e.pointerId)});
+  flame.addEventListener('pointermove',e=>{if(state.dragging){const delta=(e.clientX-state.dragX)/flame.clientWidth*(state.viewEnd-state.viewStart),width=state.viewEnd-state.viewStart;state.viewStart=Math.max(0,Math.min(state.fullEnd-width,state.dragStart-delta));state.viewEnd=state.viewStart+width;renderFlame();return;}const r=flame.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,hit=[...state.hoverRects].reverse().find(q=>x>=q.x&&x<=q.x+q.w&&y>=q.y&&y<=q.y+q.h);flame.title=hit?`${hit.e.name} · ${(hit.e.dur/1000).toFixed(3)} ms`:'';});
+  flame.addEventListener('pointerup',e=>{state.dragging=false;flame.classList.remove('dragging');flame.releasePointerCapture(e.pointerId)});
+  flame.addEventListener('click',e=>{if(Math.abs(e.clientX-state.dragX)>3)return;const r=flame.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,hit=[...state.hoverRects].reverse().find(q=>x>=q.x&&x<=q.x+q.w&&y>=q.y&&y<=q.y+q.h);if(hit){const v=hit.e,a=v.args||{},context=[['position',a.token_position],['token_id',a.token_id],['layer',a.layer_id],['expert',a.expert_id],['cache_hit',a.cache_hit],['flow',a.flow_id],['batch',a.batch_tokens]].filter(([,value])=>value!==undefined).map(([name,value])=>`${name}=${escapeHtml(String(value))}`).join(' · ');$('details').innerHTML=`<b>${escapeHtml(v.name)}</b> · thread ${escapeHtml(String(v.tid))} · start ${v.start.toFixed(6)} s · duration ${(v.dur/1000).toFixed(3)} ms${context?` · ${context}`:''} · logical bytes ${Number(a.logical_bytes||0).toLocaleString()} · work items ${Number(a.work_items||0).toLocaleString()}`;}});
+  function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+  addEventListener('resize',()=>{renderResources();renderFlame()});
+  renderAll();
+})();
+</script>
+</body>
+</html>

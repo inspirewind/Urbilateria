@@ -355,14 +355,26 @@ Kimi-K3 明确划定了信任边界：协议标记只由带类型的结构片段
 ## 性能分析
 
 人类可读的 profile 输出到 stderr。具有稳定 schema 的 JSON 只会写入请求的文件，
-绝不会混入流式模型输出。计时为 inclusive，因此嵌套阶段会有意重叠；逻辑字节描述
-某阶段处理的检查点 payload，而不是物理块设备流量。
+绝不会混入流式模型输出。计时为 inclusive，因此嵌套阶段会有意重叠。Linux 上的
+profile schema v2 还会每 100 ms 采样进程 CPU、RSS/swap、缺页、线程数、系统内存和
+进程 I/O，并强制记录结束样本。`storage_read_bytes`/`storage_write_bytes` 是 Linux
+存储层对该进程的记账；`read_char_bytes`/`write_char_bytes` 包括 page cache 流量。
+两者都不能与阶段的逻辑 checkpoint payload 或整块 SSD 利用率混为一谈。
 
 ```bash
 ./target/release/urb generate /path/to/model \
   --prompt "Hello" --ram-gib 32 --max-new-tokens 1 --no-thinking \
-  --allow-large-model --threads 20 --profile --profile-json profile-20.json
+  --allow-large-model --threads 20 --profile \
+  --profile-json profile-20.json --profile-trace profile-20.trace.json
 ```
+
+`--profile-trace` 会开启有界的逐 span 记录并输出 Chrome Trace Event JSON。可以直接用
+[Perfetto UI](https://ui.perfetto.dev/) 打开，也可以在本地打开
+[`tools/profile_viewer.html`](tools/profile_viewer.html)，把两份 JSON 一起拖入。这个零依赖
+查看器支持阶段排名、资源曲线、线程筛选、搜索、缩放/平移和按时间排列的火焰图；未指定
+该参数时不会承担逐事件记录开销。
+DeepSeek-V4 的 trace span 会在语义明确的边界记录 token 位置/ID、layer ID、expert ID、
+批处理开始前的缓存驻留状态、batch 大小，以及稳定的逐层 flow ID。
 
 使用 `--threads 1` 作为串行基线。不指定 `--threads` 时，持久 worker 池使用平台
 可用的逻辑并行度。在 SMT 或混合核心 CPU 上，更多线程并不总是更快，因此请在相同的

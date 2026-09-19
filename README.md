@@ -361,14 +361,26 @@ official template always requires thinking, so `--no-thinking` is invalid for th
 ## Profiling
 
 Human-readable profiles go to stderr. Stable-schema JSON goes only to the requested file, never into
-streamed model output. Timings are inclusive, so nested stages intentionally overlap; logical bytes
-describe checkpoint payload handled by a stage rather than physical block-device traffic.
+streamed model output. Timings are inclusive, so nested stages intentionally overlap. On Linux,
+profile schema v2 also samples process CPU, RSS/swap, page faults, thread count, system memory, and
+process I/O every 100 ms, with an exact final sample. `storage_read_bytes`/`storage_write_bytes` are
+Linux storage-layer accounting; `read_char_bytes`/`write_char_bytes` include page-cache traffic.
+Neither should be confused with a stage's logical checkpoint payload or whole-device utilization.
 
 ```bash
 ./target/release/urb generate /path/to/model \
   --prompt "Hello" --ram-gib 32 --max-new-tokens 1 --no-thinking \
-  --allow-large-model --threads 20 --profile --profile-json profile-20.json
+  --allow-large-model --threads 20 --profile \
+  --profile-json profile-20.json --profile-trace profile-20.trace.json
 ```
+
+`--profile-trace` enables bounded per-span recording and writes Chrome Trace Event JSON. Open the
+trace directly in [Perfetto UI](https://ui.perfetto.dev/), or open
+[`tools/profile_viewer.html`](tools/profile_viewer.html) locally and drop both JSON files onto it.
+The dependency-free viewer provides stage ranking, resource charts, thread filtering, search,
+zoom/pan, and a time-ordered flame chart. Trace collection is disabled unless the flag is present.
+DeepSeek-V4 trace spans attach token position/ID, layer ID, expert ID, pre-batch cache residency,
+batch size, and a stable per-layer flow ID where those values are meaningful.
 
 Use `--threads 1` as the serial baseline. Without `--threads`, the persistent worker pool uses the
 platform's available logical parallelism. More threads are not always faster on SMT or hybrid-core

@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod resources;
+mod trace;
+pub use resources::{ResourceSample, ResourceSummary, SystemResourceReport};
+
 thread_local! {
     static ACTIVE: RefCell<Vec<Arc<Collector>>> = const { RefCell::new(Vec::new()) };
 }
@@ -276,8 +280,13 @@ pub struct ProfileReport {
     pub requested_threads: Option<usize>,
     /// Effective workers when the CPU pool was initialized during the session.
     pub worker_threads: Option<usize>,
+    /// Session-aligned Linux process resource samples. `None` on unsupported platforms or when
+    /// procfs is unavailable.
+    pub resources: Option<SystemResourceReport>,
     /// Inclusive stage timings in a stable schema order. Nested totals may overlap.
     pub stages: Vec<ProfileEntry>,
+    #[serde(skip)]
+    trace: Option<trace::TraceSnapshot>,
 }
 
 impl ProfileReport {
@@ -300,6 +309,26 @@ impl ProfileReport {
                 .map(|threads| format!(", requested={threads}"))
                 .unwrap_or_default()
         );
+        if let Some(resources) = &self.resources {
+            let summary = &resources.summary;
+            let _ = writeln!(
+                output,
+                "resources: CPU avg={:.2} cores ({}) peak={:.2} cores; RSS start/end/peak={:.1}/{:.1}/{:.1} MiB; storage read/write={:.1}/{:.1} MiB ({:.1}/{:.1} MiB/s avg)",
+                summary.average_cpu_cores,
+                summary
+                    .average_machine_cpu_percent
+                    .map(|percent| format!("{percent:.1}% machine"))
+                    .unwrap_or_else(|| "machine share unavailable".to_owned()),
+                summary.peak_interval_cpu_cores,
+                bytes_to_mib(summary.start_rss_bytes),
+                bytes_to_mib(summary.end_rss_bytes),
+                bytes_to_mib(summary.peak_rss_bytes),
+                bytes_to_mib(summary.storage_read_bytes),
+                bytes_to_mib(summary.storage_write_bytes),
+                bytes_to_mib(summary.average_storage_read_bytes_per_second as u64),
+                bytes_to_mib(summary.average_storage_write_bytes_per_second as u64),
+            );
+        }
         let _ = writeln!(
             output,
             "  {:<32} {:>8} {:>12} {:>12} {:>10} {:>10}",
@@ -339,6 +368,26 @@ impl ProfileReport {
         }
         output
     }
+
+    /// Serializes the optional per-span timeline as Chrome Trace Event JSON for Perfetto.
+    pub fn chrome_trace_json_pretty(&self) -> serde_json::Result<Option<Vec<u8>>> {
+        self.trace
+            .as_ref()
+            .map(|trace| trace.to_json_pretty(self.resources.as_ref()))
+            .transpose()
+    }
+
+    pub fn trace_event_count(&self) -> usize {
+        self.trace
+            .as_ref()
+            .map_or(0, trace::TraceSnapshot::event_count)
+    }
+
+    pub fn trace_dropped_events(&self) -> u64 {
+        self.trace
+            .as_ref()
+            .map_or(0, trace::TraceSnapshot::dropped_events)
+    }
 }
 
 /// Activates profiling until [`finish`](Self::finish) or drop on the creating thread.
@@ -347,6 +396,7 @@ pub struct ProfileSession {
     started: Instant,
     requested_threads: Option<usize>,
     active: bool,
+    resources: Option<resources::ResourceMonitor>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -356,13 +406,22 @@ impl ProfileSession {
     }
 
     pub fn start_with_threads(requested_threads: Option<usize>) -> Self {
-        let collector = Arc::new(Collector::default());
+        Self::start_with_threads_and_trace(requested_threads, false)
+    }
+
+    pub fn start_with_threads_and_trace(
+        requested_threads: Option<usize>,
+        trace_enabled: bool,
+    ) -> Self {
+        let started = Instant::now();
+        let collector = Arc::new(Collector::new(started, trace_enabled));
         ACTIVE.with(|active| active.borrow_mut().push(Arc::clone(&collector)));
         Self {
             collector,
-            started: Instant::now(),
+            started,
             requested_threads,
             active: true,
+            resources: resources::ResourceMonitor::start(),
             _not_send: PhantomData,
         }
     }
@@ -371,7 +430,9 @@ impl ProfileSession {
         let elapsed = self.started.elapsed();
         self.collector.close();
         self.deactivate();
-        self.collector.snapshot(elapsed, self.requested_threads)
+        let resources = self.resources.take().map(|monitor| monitor.finish(elapsed));
+        self.collector
+            .snapshot(elapsed, self.requested_threads, resources)
     }
 
     fn deactivate(&mut self) {
@@ -403,6 +464,8 @@ pub struct ProfileSpan {
     started: Option<Instant>,
     work_items: u64,
     logical_bytes: u64,
+    trace_thread_id: Option<u64>,
+    trace_metadata: TraceMetadata,
 }
 
 impl ProfileSpan {
@@ -410,6 +473,75 @@ impl ProfileSpan {
     pub fn add_logical_bytes(&mut self, bytes: u64) {
         self.logical_bytes = self.logical_bytes.saturating_add(bytes);
     }
+
+    pub fn set_token(&mut self, position: usize, token_id: usize) {
+        self.set_token_position(position);
+        self.set_token_id(token_id);
+    }
+
+    pub fn set_token_position(&mut self, position: usize) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.token_position = Some(saturating_u64(position));
+        }
+    }
+
+    pub fn set_token_id(&mut self, token_id: usize) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.token_id = Some(saturating_u64(token_id));
+        }
+    }
+
+    pub fn set_layer_id(&mut self, layer_id: usize) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.layer_id = Some(saturating_u64(layer_id));
+        }
+    }
+
+    pub fn set_expert_id(&mut self, expert_id: usize) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.expert_id = Some(saturating_u64(expert_id));
+        }
+    }
+
+    pub fn set_cache_hit(&mut self, cache_hit: bool) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.cache_hit = Some(cache_hit);
+        }
+    }
+
+    pub fn set_flow_id(&mut self, flow_id: u64) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.flow_id = Some(flow_id);
+        }
+    }
+
+    pub fn set_batch_tokens(&mut self, batch_tokens: usize) {
+        if self.trace_thread_id.is_some() {
+            self.trace_metadata.batch_tokens = Some(saturating_u64(batch_tokens));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TraceMetadata {
+    token_position: Option<u64>,
+    token_id: Option<u64>,
+    layer_id: Option<u64>,
+    expert_id: Option<u64>,
+    cache_hit: Option<bool>,
+    flow_id: Option<u64>,
+    batch_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletedSpan {
+    stage: ProfileStage,
+    started: Instant,
+    elapsed: Duration,
+    trace_thread_id: Option<u64>,
+    trace_metadata: TraceMetadata,
+    work_items: u64,
+    logical_bytes: u64,
 }
 
 /// Starts an inclusive stage span when a profile session is active.
@@ -430,37 +562,54 @@ pub fn span_with_metrics(
 ) -> ProfileSpan {
     let collector = ACTIVE.with(|active| active.borrow().last().cloned());
     let started = collector.as_ref().map(|_| Instant::now());
+    let trace_thread_id = collector
+        .as_ref()
+        .and_then(|collector| collector.trace.as_ref())
+        .map(trace::TraceRecorder::thread_id);
     ProfileSpan {
         collector,
         stage,
         started,
         work_items: u64::try_from(work_items).unwrap_or(u64::MAX),
         logical_bytes: u64::try_from(logical_bytes).unwrap_or(u64::MAX),
+        trace_thread_id,
+        trace_metadata: TraceMetadata::default(),
     }
 }
 
 impl Drop for ProfileSpan {
     fn drop(&mut self) {
         if let (Some(collector), Some(started)) = (&self.collector, self.started) {
-            collector.record(
-                self.stage,
-                started.elapsed(),
-                self.work_items,
-                self.logical_bytes,
-            );
+            collector.record(CompletedSpan {
+                stage: self.stage,
+                started,
+                elapsed: started.elapsed(),
+                trace_thread_id: self.trace_thread_id,
+                trace_metadata: self.trace_metadata,
+                work_items: self.work_items,
+                logical_bytes: self.logical_bytes,
+            });
         }
     }
 }
 
-#[derive(Default)]
 struct Collector {
     stages: Mutex<HashMap<ProfileStage, Aggregate>>,
     closed: AtomicBool,
+    trace: Option<trace::TraceRecorder>,
 }
 
 impl Collector {
-    fn record(&self, stage: ProfileStage, elapsed: Duration, work_items: u64, logical_bytes: u64) {
-        let nanoseconds = duration_ns(elapsed);
+    fn new(origin: Instant, trace_enabled: bool) -> Self {
+        Self {
+            stages: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            trace: trace_enabled.then(|| trace::TraceRecorder::new(origin)),
+        }
+    }
+
+    fn record(&self, completed: CompletedSpan) {
+        let nanoseconds = duration_ns(completed.elapsed);
         let mut stages = self
             .stages
             .lock()
@@ -468,7 +617,7 @@ impl Collector {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let aggregate = stages.entry(stage).or_insert(Aggregate {
+        let aggregate = stages.entry(completed.stage).or_insert(Aggregate {
             calls: 0,
             total_ns: 0,
             min_ns: u64::MAX,
@@ -480,11 +629,21 @@ impl Collector {
         aggregate.total_ns = aggregate.total_ns.saturating_add(nanoseconds);
         aggregate.min_ns = aggregate.min_ns.min(nanoseconds);
         aggregate.max_ns = aggregate.max_ns.max(nanoseconds);
-        aggregate.work_items = aggregate.work_items.saturating_add(work_items);
-        aggregate.logical_bytes = aggregate.logical_bytes.saturating_add(logical_bytes);
+        aggregate.work_items = aggregate.work_items.saturating_add(completed.work_items);
+        aggregate.logical_bytes = aggregate
+            .logical_bytes
+            .saturating_add(completed.logical_bytes);
+        if let (Some(trace), Some(thread_id)) = (&self.trace, completed.trace_thread_id) {
+            trace.record(completed, thread_id);
+        }
     }
 
-    fn snapshot(&self, wall_time: Duration, requested_threads: Option<usize>) -> ProfileReport {
+    fn snapshot(
+        &self,
+        wall_time: Duration,
+        requested_threads: Option<usize>,
+        resources: Option<SystemResourceReport>,
+    ) -> ProfileReport {
         self.close();
         let stages = self
             .stages
@@ -505,11 +664,13 @@ impl Collector {
             })
             .collect();
         ProfileReport {
-            schema_version: 1,
+            schema_version: 2,
             wall_time_ns: duration_ns(wall_time),
             requested_threads,
             worker_threads: crate::execution::initialized_worker_threads(),
+            resources,
             stages: entries,
+            trace: self.trace.as_ref().map(trace::TraceRecorder::snapshot),
         }
     }
 
@@ -532,6 +693,14 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn bytes_to_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,7 +717,7 @@ mod tests {
             }
         }
         let report = session.finish();
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, 2);
         assert_eq!(report.stage(ProfileStage::GlmToken).unwrap().calls, 1);
         let kernel = report.stage(ProfileStage::MatvecF32).unwrap();
         assert_eq!(kernel.calls, 2);
@@ -599,5 +768,48 @@ mod tests {
         let report = session.finish();
         drop(late_span);
         assert!(report.stage(ProfileStage::MatvecF32).is_none());
+    }
+
+    #[test]
+    fn optional_trace_exports_complete_spans_and_resource_counters() {
+        let session = ProfileSession::start_with_threads_and_trace(Some(2), true);
+        {
+            let _outer = span(ProfileStage::GenerateTotal);
+            let mut inner = span_with_metrics(ProfileStage::MatvecF32, 128, 64);
+            inner.set_token(7, 42);
+            inner.set_layer_id(3);
+            inner.set_expert_id(11);
+            inner.set_cache_hit(true);
+            inner.set_flow_id(99);
+            inner.set_batch_tokens(1);
+        }
+        let report = session.finish();
+        assert_eq!(report.trace_event_count(), 2);
+        assert_eq!(report.trace_dropped_events(), 0);
+        let trace: serde_json::Value = serde_json::from_slice(
+            &report
+                .chrome_trace_json_pretty()
+                .unwrap()
+                .expect("trace collection was enabled"),
+        )
+        .unwrap();
+        let events = trace["traceEvents"].as_array().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event["ph"] == "X" && event["name"] == "kernel.matvec.f32"));
+        let kernel = events
+            .iter()
+            .find(|event| event["name"] == "kernel.matvec.f32")
+            .unwrap();
+        assert_eq!(kernel["args"]["token_position"], 7);
+        assert_eq!(kernel["args"]["token_id"], 42);
+        assert_eq!(kernel["args"]["layer_id"], 3);
+        assert_eq!(kernel["args"]["expert_id"], 11);
+        assert_eq!(kernel["args"]["cache_hit"], true);
+        assert_eq!(kernel["args"]["flow_id"], 99);
+        assert_eq!(kernel["args"]["batch_tokens"], 1);
+        assert!(events
+            .iter()
+            .any(|event| event["ph"] == "C" && event["name"] == "CPU cores"));
     }
 }
