@@ -67,6 +67,31 @@ def version_tuple(text):
     return parts + (0,) * (3 - len(parts))
 
 
+def macos_deployment_versions(details):
+    # "version" also appears in build-tool and source-version records. Interpret it
+    # only inside LC_VERSION_MIN_MACOSX; LC_BUILD_VERSION uses "minos" for the OS.
+    commands = re.split(r"^[ \t]*cmd[ \t]+(\S+)[ \t]*$", details, flags=re.MULTILINE)
+    versions = []
+    for command, body in zip(commands[1::2], commands[2::2]):
+        if command == "LC_BUILD_VERSION":
+            platforms = re.findall(r"^[ \t]*platform[ \t]+(\S+)[ \t]*$", body, re.MULTILINE)
+            if len(platforms) != 1 or platforms[0].upper() not in ("1", "MACOS"):
+                raise ValueError(f"Expected macOS platform in LC_BUILD_VERSION; found {platforms!r}")
+            field = "minos"
+        elif command == "LC_VERSION_MIN_MACOSX":
+            field = "version"
+        else:
+            continue
+        values = re.findall(r"^[ \t]*" + field + r"[ \t]+(\d+(?:\.\d+){0,2})[ \t]*$",
+                            body, re.MULTILINE)
+        if len(values) != 1:
+            raise ValueError(f"Expected one valid {field} in {command}; found {values!r}")
+        versions.extend(values)
+    if not versions:
+        raise ValueError("No macOS deployment target found in otool load commands")
+    return versions
+
+
 def check_runtime(target, header, details):
     """Check binary architecture and the OS version recorded by the native linker."""
     if target == "x86_64-unknown-linux-gnu":
@@ -78,9 +103,9 @@ def check_runtime(target, header, details):
     else:
         if header[:4] != b"\xcf\xfa\xed\xfe" or int.from_bytes(header[4:8], "little") != 0x0100000C:
             raise ValueError("Expected an Apple Silicon arm64 Mach-O binary")
-        versions = re.findall(r"^\s*(?:minos|version)\s+(\d+(?:\.\d+)+)\s*$", details, re.MULTILINE)
-        if not versions or max(map(version_tuple, versions)) > (13, 0, 0):
-            raise ValueError("macOS binary must target macOS 13.0 or older; set MACOSX_DEPLOYMENT_TARGET=13.0")
+        minimum = max(macos_deployment_versions(details), key=version_tuple)
+        if version_tuple(minimum) > (13, 0, 0):
+            raise ValueError(f"macOS deployment target {minimum} exceeds 13.0; set MACOSX_DEPLOYMENT_TARGET=13.0")
 
 
 def archive_name(tag, target):
@@ -142,7 +167,10 @@ def package_release(tag, target, binary, output):
         header = source.read(32)
     details = (run("readelf", "--version-info", str(binary)) if system == "Linux"
                else run("otool", "-l", str(binary)))
-    check_runtime(target, header, details)
+    try:
+        check_runtime(target, header, details)
+    except ValueError as error:
+        raise ValueError(f"{error}\nInspected runtime metadata for {target}:\n{details}") from error
     if run(str(binary), "--version") != f"urb {version}":
         raise ValueError("Binary version does not match the tag; rebuild before packaging")
     run(str(binary), "help")
