@@ -537,7 +537,8 @@ impl MxFp8Matrix {
         self.values.len().saturating_add(scale_bytes)
     }
 
-    /// Returns native E8M0 storage for reuse after an MXFP8 matrix leaves an expert cache.
+    /// Returns native E8M0 storage for reuse after an MXFP8 matrix leaves a streamed layer or
+    /// expert cache.
     pub(crate) fn into_e8m0_buffers(self) -> Option<(ReadBuffer, ReadBuffer)> {
         match self.scales {
             MxFp8Scales::E8M0(scales) => Some((self.values, scales)),
@@ -559,10 +560,22 @@ impl MxFp8Matrix {
 
     /// Applies the same native MXFP8 matrix to consecutive input rows `[batch, cols]`.
     ///
-    /// For two through twelve ModelOpt inputs, the AVX2 path decodes each weight block once and
-    /// updates independent accumulators. Each accumulator observes the exact same FMA and lane
-    /// reduction order as [`Self::matvec`], so batching does not move numerical boundaries.
+    /// For two through twelve inputs, the AVX2 paths decode each weight block once and update
+    /// independent accumulators. ModelOpt 1x32 matrices retain their FP32 FMA/lane reduction;
+    /// larger block layouts retain the exact ordered-F64 product and addition sequence used by
+    /// [`Self::matvec`].
     pub fn matmul_rows(&self, input: &[f32], batch: usize) -> Result<Vec<f32>, MxError> {
+        self.matmul_row_range(0, self.rows, input, batch)
+    }
+
+    /// Batched counterpart of [`Self::matvec_rows`], restricted to one contiguous output range.
+    pub fn matmul_row_range(
+        &self,
+        start: usize,
+        count: usize,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, MxError> {
         let expected = batch
             .checked_mul(self.cols)
             .ok_or_else(|| MxError::Shape("batch * columns overflows usize".to_owned()))?;
@@ -575,6 +588,12 @@ impl MxFp8Matrix {
         if input.iter().any(|value| !value.is_finite()) {
             return Err(MxError::NonFinite);
         }
+        let end = start
+            .checked_add(count)
+            .filter(|&end| end <= self.rows)
+            .ok_or_else(|| {
+                MxError::Shape("batched matvec row range is out of bounds".to_owned())
+            })?;
         #[cfg(target_arch = "x86_64")]
         let compact_avx2_fma = (2..=12).contains(&batch)
             && self.block_rows == 1
@@ -585,63 +604,68 @@ impl MxFp8Matrix {
             && std::arch::is_x86_feature_detected!("fma");
         #[cfg(not(target_arch = "x86_64"))]
         let compact_avx2_fma = false;
+        #[cfg(target_arch = "x86_64")]
+        let ordered_avx2 = (2..=12).contains(&batch)
+            && self.block_cols >= 8
+            && matches!(self.scales, MxFp8Scales::E8M0(_))
+            && std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let ordered_avx2 = false;
 
-        if !compact_avx2_fma {
-            let mut output = Vec::with_capacity(batch.saturating_mul(self.rows));
+        if !compact_avx2_fma && !ordered_avx2 {
+            let mut output = Vec::with_capacity(batch.saturating_mul(count));
             for input in input.chunks_exact(self.cols) {
-                output.extend(self.matvec(input)?);
+                output.extend(self.matvec_rows(start, count, input)?);
             }
             return Ok(output);
         }
 
-        let work = batch.saturating_mul(self.rows).saturating_mul(self.cols);
+        let work = batch.saturating_mul(count).saturating_mul(self.cols);
         let _profile = span_with_work(ProfileStage::MatvecMxFp8, work);
-        let scale_cols = self.cols / 32;
+        let scale_cols = self.cols.div_ceil(self.block_cols);
         let MxFp8Scales::E8M0(scales) = &self.scales else {
-            unreachable!("compact batched AVX2 is selected only for E8M0 scales")
+            unreachable!("batched AVX2 is selected only for E8M0 scales")
         };
-        let mut output_by_row = vec![0.0f32; self.rows.saturating_mul(batch)];
+        let mut output_by_row = vec![0.0f32; count.saturating_mul(batch)];
         let compute_row = |row: usize, output: &mut [f32]| {
             let codes = &self.values[row * self.cols..(row + 1) * self.cols];
-            let row_scales = &scales[row * scale_cols..(row + 1) * scale_cols];
-            // SAFETY: the dispatch above proves AVX2/FMA support and aligned 32-column geometry;
-            // every input row has exactly `self.cols` values.
+            let scale_row = row / self.block_rows;
+            let row_scales = &scales[scale_row * scale_cols..(scale_row + 1) * scale_cols];
+            macro_rules! compute_batch {
+                ($batch:literal) => {
+                    if compact_avx2_fma {
+                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<$batch>(
+                            codes, row_scales, input, output,
+                        )
+                    } else {
+                        dot_e4m3_e8m0_batch_f64_ordered_avx2::<$batch>(
+                            codes,
+                            row_scales,
+                            input,
+                            self.cols,
+                            self.block_cols,
+                            output,
+                        )
+                    }
+                };
+            }
+            // SAFETY: dispatch proves AVX2 support, batch is in 2..=12, and validated matrix/input
+            // slices cover every code, scale block, and input row. The compact branch additionally
+            // proves FMA support and aligned 1x32 geometry.
             unsafe {
                 match batch {
-                    2 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<2>(codes, row_scales, input, output)
-                    }
-                    3 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<3>(codes, row_scales, input, output)
-                    }
-                    4 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<4>(codes, row_scales, input, output)
-                    }
-                    5 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<5>(codes, row_scales, input, output)
-                    }
-                    6 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<6>(codes, row_scales, input, output)
-                    }
-                    7 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<7>(codes, row_scales, input, output)
-                    }
-                    8 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<8>(codes, row_scales, input, output)
-                    }
-                    9 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<9>(codes, row_scales, input, output)
-                    }
-                    10 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<10>(codes, row_scales, input, output)
-                    }
-                    11 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<11>(codes, row_scales, input, output)
-                    }
-                    12 => {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<12>(codes, row_scales, input, output)
-                    }
-                    _ => unreachable!("compact batch dispatch is limited to two through twelve"),
+                    2 => compute_batch!(2),
+                    3 => compute_batch!(3),
+                    4 => compute_batch!(4),
+                    5 => compute_batch!(5),
+                    6 => compute_batch!(6),
+                    7 => compute_batch!(7),
+                    8 => compute_batch!(8),
+                    9 => compute_batch!(9),
+                    10 => compute_batch!(10),
+                    11 => compute_batch!(11),
+                    12 => compute_batch!(12),
+                    _ => unreachable!("MXFP8 batch dispatch is limited to two through twelve"),
                 }
             }
         };
@@ -650,17 +674,17 @@ impl MxFp8Matrix {
                 output_by_row
                     .par_chunks_mut(batch)
                     .enumerate()
-                    .for_each(|(row, output)| compute_row(row, output));
+                    .for_each(|(offset, output)| compute_row(start + offset, output));
             });
         } else {
-            for (row, output) in output_by_row.chunks_mut(batch).enumerate() {
+            for (row, output) in (start..end).zip(output_by_row.chunks_mut(batch)) {
                 compute_row(row, output);
             }
         }
-        let mut output = vec![0.0f32; batch.saturating_mul(self.rows)];
+        let mut output = vec![0.0f32; batch.saturating_mul(count)];
         for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
             for (token, &value) in values.iter().enumerate() {
-                output[token * self.rows + row] = value;
+                output[token * count + row] = value;
             }
         }
         if output.iter().any(|value| !value.is_finite()) {
@@ -702,6 +726,10 @@ impl MxFp8Matrix {
             && matches!(self.scales, MxFp8Scales::E8M0(_))
             && std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma");
+        #[cfg(target_arch = "x86_64")]
+        let ordered_avx2 = self.block_cols >= 8
+            && matches!(self.scales, MxFp8Scales::E8M0(_))
+            && std::arch::is_x86_feature_detected!("avx2");
         let dot_row = |row: usize| {
             let scale_row = row / self.block_rows;
             let row_values = &self.values[row * self.cols..(row + 1) * self.cols];
@@ -714,6 +742,17 @@ impl MxFp8Matrix {
                 // SAFETY: feature detection above proves AVX2/FMA support. The helper bounds every
                 // vector load to complete 8-value chunks and handles any final tail scalarly.
                 return unsafe { dot_e4m3_e8m0_avx2_fma(row_values, row_scales, input) };
+            }
+            #[cfg(target_arch = "x86_64")]
+            if ordered_avx2 {
+                let MxFp8Scales::E8M0(scales) = &self.scales else {
+                    unreachable!("ordered AVX2 is selected only for E8M0 scales")
+                };
+                let row_scales = &scales[scale_row * scale_cols..(scale_row + 1) * scale_cols];
+                // SAFETY: AVX2 is detected and validated row/scale slices cover every column.
+                return unsafe {
+                    dot_e4m3_e8m0_f64_ordered_avx2(row_values, row_scales, input, self.block_cols)
+                };
             }
             let mut sum = 0.0f64;
             let mut column = 0;
@@ -919,6 +958,115 @@ unsafe fn contains_invalid_e8m0_avx2(values: &[u8]) -> bool {
         offset += 32;
     }
     values[offset..].contains(&u8::MAX)
+}
+
+/// Block-layout E4M3/E8M0 counterpart of the scalar ordered-F64 reference. Weight decoding and
+/// widening multiplications are vectorized, while the final additions retain column order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_e4m3_e8m0_f64_ordered_avx2(
+    codes: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    block_cols: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(codes.len(), input.len());
+    debug_assert_eq!(scales.len(), codes.len().div_ceil(block_cols));
+    let mut sum = 0.0f64;
+    let mut products = [0.0f64; 8];
+    let mut column = 0usize;
+    for (block, block_codes) in codes.chunks(block_cols).enumerate() {
+        let scale = _mm256_set1_ps(decode_e8m0_unchecked(scales[block]));
+        let block_input = &input[column..column + block_codes.len()];
+        let complete = block_codes.len() / 8 * 8;
+        for offset in (0..complete).step_by(8) {
+            let packed = _mm_loadl_epi64(block_codes.as_ptr().add(offset).cast::<__m128i>());
+            let indices = _mm256_cvtepu8_epi32(packed);
+            let weights = _mm256_mul_ps(decode_e4m3fn_avx2(indices), scale);
+            let inputs = _mm256_loadu_ps(block_input.as_ptr().add(offset));
+            let weight_low = _mm256_cvtps_pd(_mm256_castps256_ps128(weights));
+            let weight_high = _mm256_cvtps_pd(_mm256_extractf128_ps(weights, 1));
+            let input_low = _mm256_cvtps_pd(_mm256_castps256_ps128(inputs));
+            let input_high = _mm256_cvtps_pd(_mm256_extractf128_ps(inputs, 1));
+            _mm256_storeu_pd(products.as_mut_ptr(), _mm256_mul_pd(weight_low, input_low));
+            _mm256_storeu_pd(
+                products.as_mut_ptr().add(4),
+                _mm256_mul_pd(weight_high, input_high),
+            );
+            for product in products {
+                sum += product;
+            }
+        }
+        let scale = decode_e8m0_unchecked(scales[block]);
+        for offset in complete..block_codes.len() {
+            let weight = e4m3_table()[usize::from(block_codes[offset])] * scale;
+            sum += f64::from(weight) * f64::from(block_input[offset]);
+        }
+        column += block_codes.len();
+    }
+    sum as f32
+}
+
+/// Batched counterpart of [`dot_e4m3_e8m0_f64_ordered_avx2`]. Each E4M3 weight block is decoded
+/// once, while every token keeps an independent accumulator with the original ordered-F64
+/// multiplication and addition boundaries.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_e4m3_e8m0_batch_f64_ordered_avx2<const BATCH: usize>(
+    codes: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    columns: usize,
+    block_cols: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!((2..=12).contains(&BATCH));
+    debug_assert_eq!(codes.len(), columns);
+    debug_assert_eq!(scales.len(), columns.div_ceil(block_cols));
+    debug_assert_eq!(input.len(), BATCH * columns);
+    debug_assert_eq!(output.len(), BATCH);
+    let mut sums = [0.0f64; BATCH];
+    let mut products = [0.0f64; 8];
+    let mut column = 0usize;
+    for (block, block_codes) in codes.chunks(block_cols).enumerate() {
+        let scale = _mm256_set1_ps(decode_e8m0_unchecked(scales[block]));
+        let complete = block_codes.len() / 8 * 8;
+        for offset in (0..complete).step_by(8) {
+            let packed = _mm_loadl_epi64(block_codes.as_ptr().add(offset).cast::<__m128i>());
+            let indices = _mm256_cvtepu8_epi32(packed);
+            let weights = _mm256_mul_ps(decode_e4m3fn_avx2(indices), scale);
+            let weight_low = _mm256_cvtps_pd(_mm256_castps256_ps128(weights));
+            let weight_high = _mm256_cvtps_pd(_mm256_extractf128_ps(weights, 1));
+            for (token, sum) in sums.iter_mut().enumerate() {
+                let inputs = _mm256_loadu_ps(input.as_ptr().add(token * columns + column + offset));
+                let input_low = _mm256_cvtps_pd(_mm256_castps256_ps128(inputs));
+                let input_high = _mm256_cvtps_pd(_mm256_extractf128_ps(inputs, 1));
+                _mm256_storeu_pd(products.as_mut_ptr(), _mm256_mul_pd(weight_low, input_low));
+                _mm256_storeu_pd(
+                    products.as_mut_ptr().add(4),
+                    _mm256_mul_pd(weight_high, input_high),
+                );
+                for product in products {
+                    *sum += product;
+                }
+            }
+        }
+        let scale = decode_e8m0_unchecked(scales[block]);
+        for offset in complete..block_codes.len() {
+            let weight = e4m3_table()[usize::from(block_codes[offset])] * scale;
+            for (token, sum) in sums.iter_mut().enumerate() {
+                *sum += f64::from(weight) * f64::from(input[token * columns + column + offset]);
+            }
+        }
+        column += block_codes.len();
+    }
+    for (output, sum) in output.iter_mut().zip(sums) {
+        *output = sum as f32;
+    }
 }
 
 /// AVX2/FMA implementation for ModelOpt's native 1x32 E4M3/E8M0 layout.
@@ -1219,8 +1367,8 @@ pub struct MxFp4Matrix {
     rows: usize,
     cols: usize,
     group_size: usize,
-    packed: Vec<u8>,
-    scale_bytes: Vec<u8>,
+    packed: ReadBuffer,
+    scale_bytes: ReadBuffer,
 }
 
 impl MxFp4Matrix {
@@ -1230,6 +1378,40 @@ impl MxFp4Matrix {
         group_size: usize,
         packed: Vec<u8>,
         scale_bytes: Vec<u8>,
+    ) -> Result<Self, MxError> {
+        Self::from_read_buffers(rows, cols, group_size, packed.into(), scale_bytes.into())
+    }
+
+    pub(crate) fn from_read_buffers(
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        packed: ReadBuffer,
+        scale_bytes: ReadBuffer,
+    ) -> Result<Self, MxError> {
+        Self::from_read_buffers_with_validation(rows, cols, group_size, packed, scale_bytes, true)
+    }
+
+    /// Reconstructs an MXFP4 matrix after these immutable checkpoint ranges were validated by an
+    /// earlier layer load. Shape checks remain mandatory; only the repeated E8M0 scale scan is
+    /// skipped.
+    pub(crate) fn from_read_buffers_prevalidated(
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        packed: ReadBuffer,
+        scale_bytes: ReadBuffer,
+    ) -> Result<Self, MxError> {
+        Self::from_read_buffers_with_validation(rows, cols, group_size, packed, scale_bytes, false)
+    }
+
+    fn from_read_buffers_with_validation(
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        packed: ReadBuffer,
+        scale_bytes: ReadBuffer,
+        validate_scales: bool,
     ) -> Result<Self, MxError> {
         if rows == 0 || cols == 0 || group_size == 0 {
             return Err(MxError::Shape(
@@ -1249,8 +1431,10 @@ impl MxFp4Matrix {
                 scale_bytes.len()
             )));
         }
-        for &scale in &scale_bytes {
-            decode_e8m0(scale)?;
+        if validate_scales {
+            for &scale in scale_bytes.iter() {
+                decode_e8m0(scale)?;
+            }
         }
         Ok(Self {
             rows,
@@ -1259,6 +1443,12 @@ impl MxFp4Matrix {
             packed,
             scale_bytes,
         })
+    }
+
+    /// Returns native packed E2M1/E8M0 storage so a retired layer or evicted expert can donate its
+    /// allocations to the next same-shaped checkpoint read.
+    pub(crate) fn into_e2m1_buffers(self) -> (ReadBuffer, ReadBuffer) {
+        (self.packed, self.scale_bytes)
     }
 
     pub fn rows(&self) -> usize {
@@ -1275,6 +1465,102 @@ impl MxFp4Matrix {
 
     pub fn matvec(&self, input: &[f32]) -> Result<Vec<f32>, MxError> {
         self.matvec_rows(0, self.rows, input)
+    }
+
+    /// Applies one native MXFP4 matrix to consecutive input rows `[batch, cols]`.
+    ///
+    /// The AVX2 path decodes each packed weight group once for two through twelve inputs. Every
+    /// input retains the same ordered-F64 product and addition sequence as [`Self::matvec`].
+    pub fn matmul_rows(&self, input: &[f32], batch: usize) -> Result<Vec<f32>, MxError> {
+        let expected = batch
+            .checked_mul(self.cols)
+            .ok_or_else(|| MxError::Shape("batch * columns overflows usize".to_owned()))?;
+        if batch == 0 || input.len() != expected {
+            return Err(MxError::Shape(format!(
+                "batched matvec expects a non-zero batch and {expected} inputs, got {}",
+                input.len()
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(MxError::NonFinite);
+        }
+        #[cfg(target_arch = "x86_64")]
+        let ordered_avx2 = (2..=12).contains(&batch)
+            && self.group_size >= 8
+            && self.group_size % 2 == 0
+            && std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let ordered_avx2 = false;
+
+        if !ordered_avx2 {
+            let mut output = Vec::with_capacity(batch.saturating_mul(self.rows));
+            for input in input.chunks_exact(self.cols) {
+                output.extend(self.matvec(input)?);
+            }
+            return Ok(output);
+        }
+
+        let work = batch.saturating_mul(self.rows).saturating_mul(self.cols);
+        let _profile = span_with_work(ProfileStage::MatvecMxFp4, work);
+        let row_bytes = self.cols.div_ceil(2);
+        let groups = self.cols.div_ceil(self.group_size);
+        let mut output_by_row = vec![0.0f32; self.rows.saturating_mul(batch)];
+        let compute_row = |row: usize, output: &mut [f32]| {
+            let packed = &self.packed[row * row_bytes..(row + 1) * row_bytes];
+            let scales = &self.scale_bytes[row * groups..(row + 1) * groups];
+            macro_rules! compute_batch {
+                ($batch:literal) => {
+                    dot_e2m1_e8m0_batch_f64_ordered_avx2::<$batch>(
+                        packed,
+                        scales,
+                        input,
+                        self.cols,
+                        self.group_size,
+                        output,
+                    )
+                };
+            }
+            // SAFETY: dispatch proves AVX2 support, batch is in 2..=12, and validated matrix/input
+            // slices cover every packed nibble, scale group, and input row.
+            unsafe {
+                match batch {
+                    2 => compute_batch!(2),
+                    3 => compute_batch!(3),
+                    4 => compute_batch!(4),
+                    5 => compute_batch!(5),
+                    6 => compute_batch!(6),
+                    7 => compute_batch!(7),
+                    8 => compute_batch!(8),
+                    9 => compute_batch!(9),
+                    10 => compute_batch!(10),
+                    11 => compute_batch!(11),
+                    12 => compute_batch!(12),
+                    _ => unreachable!("MXFP4 batch dispatch is limited to two through twelve"),
+                }
+            }
+        };
+        if should_parallelize(self.rows, work) {
+            install(|| {
+                output_by_row
+                    .par_chunks_mut(batch)
+                    .enumerate()
+                    .for_each(|(row, output)| compute_row(row, output));
+            });
+        } else {
+            for (row, output) in output_by_row.chunks_mut(batch).enumerate() {
+                compute_row(row, output);
+            }
+        }
+        let mut output = vec![0.0f32; batch.saturating_mul(self.rows)];
+        for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
+            for (token, &value) in values.iter().enumerate() {
+                output[token * self.rows + row] = value;
+            }
+        }
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(MxError::NonFinite);
+        }
+        Ok(output)
     }
 
     pub(crate) fn matvec_fp32(&self, input: &[f32]) -> Result<Vec<f32>, MxError> {
@@ -1367,27 +1653,22 @@ impl MxFp4Matrix {
         let work = count.saturating_mul(self.cols);
         let _profile = span_with_work(ProfileStage::MatvecMxFp4, work);
         let mut output = vec![0.0; count];
+        #[cfg(target_arch = "x86_64")]
+        let ordered_avx2 = self.group_size >= 8
+            && self.group_size % 2 == 0
+            && std::arch::is_x86_feature_detected!("avx2");
         let dot_row = |row: usize| {
             let row_packed = &self.packed[row * row_bytes..(row + 1) * row_bytes];
             let row_scales = &self.scale_bytes[row * groups..(row + 1) * groups];
-            let mut sum = 0.0f64;
-            let mut column = 0;
-            for (input_group, &scale_byte) in input.chunks(self.group_size).zip(row_scales) {
-                let scale = decode_e8m0(scale_byte)
-                    .expect("MXFP4 scale bytes were validated during construction");
-                for &input_value in input_group {
-                    let byte = row_packed[column >> 1];
-                    let code = if column & 1 == 0 {
-                        byte & 0x0f
-                    } else {
-                        byte >> 4
-                    };
-                    let weight = decode_e2m1(code) * scale;
-                    sum += f64::from(weight) * f64::from(input_value);
-                    column += 1;
-                }
+            #[cfg(target_arch = "x86_64")]
+            if ordered_avx2 {
+                // SAFETY: AVX2 is detected; validated row slices cover every input column,
+                // and even group widths keep each group's first nibble byte-aligned.
+                return unsafe {
+                    dot_e2m1_e8m0_f64_ordered_avx2(row_packed, row_scales, input, self.group_size)
+                };
             }
-            sum as f32
+            dot_e2m1_e8m0_f64_ordered(row_packed, row_scales, input, self.group_size)
         };
         if should_parallelize(count, work) {
             install(|| {
@@ -1472,6 +1753,32 @@ impl MxFp4Matrix {
 }
 
 #[inline]
+fn dot_e2m1_e8m0_f64_ordered(
+    packed: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    group_size: usize,
+) -> f32 {
+    let mut sum = 0.0f64;
+    let mut column = 0;
+    for (input_group, &scale_byte) in input.chunks(group_size).zip(scales) {
+        let scale = decode_e8m0_unchecked(scale_byte);
+        for &input_value in input_group {
+            let byte = packed[column / 2];
+            let code = if column % 2 == 0 {
+                byte & 15
+            } else {
+                byte >> 4
+            };
+            let weight = decode_e2m1(code) * scale;
+            sum += f64::from(weight) * f64::from(input_value);
+            column += 1;
+        }
+    }
+    sum as f32
+}
+
+#[inline]
 fn dot_e2m1_e8m0_fp32_ordered(
     packed: &[u8],
     scales: &[u8],
@@ -1494,6 +1801,164 @@ fn dot_e2m1_e8m0_fp32_ordered(
         }
     }
     sum
+}
+
+/// SIMD-decodes eight weights at a time, then multiplies and accumulates them in the scalar
+/// reference's original F64 order. Keeping the multiply scalar is intentional: converting an
+/// FP32 product to F64 would not match multiplying the separately widened operands.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_e2m1_e8m0_f64_ordered_avx2(
+    packed: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    group_size: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(group_size % 2, 0);
+    debug_assert_eq!(packed.len(), input.len().div_ceil(2));
+    debug_assert_eq!(scales.len(), input.len().div_ceil(group_size));
+    let magnitudes = _mm256_loadu_ps(E2M1_TABLE.as_ptr());
+    let magnitude_mask = _mm256_set1_epi32(7);
+    let sign_mask = _mm256_set1_epi32(8);
+    let mut sum = 0.0f64;
+    let mut column = 0;
+    let mut products = [0.0f64; 8];
+    for (input_group, &scale_byte) in input.chunks(group_size).zip(scales) {
+        let scale = decode_e8m0_unchecked(scale_byte);
+        let scale_vector = _mm256_set1_ps(scale);
+        let complete = input_group.len() / 8 * 8;
+        for offset in (0..complete).step_by(8) {
+            let bytes = _mm_cvtsi32_si128(
+                packed
+                    .as_ptr()
+                    .add(column / 2)
+                    .cast::<i32>()
+                    .read_unaligned(),
+            );
+            let nibbles = _mm_unpacklo_epi8(bytes, _mm_srli_epi16(bytes, 4));
+            let codes = _mm256_cvtepu8_epi32(nibbles);
+            let indices = _mm256_and_si256(codes, magnitude_mask);
+            let magnitude = _mm256_permutevar8x32_ps(magnitudes, indices);
+            let signs = _mm256_slli_epi32(_mm256_and_si256(codes, sign_mask), 28);
+            let signs =
+                _mm256_and_si256(signs, _mm256_cmpgt_epi32(indices, _mm256_setzero_si256()));
+            let decoded = _mm256_xor_ps(magnitude, _mm256_castsi256_ps(signs));
+            let weights = _mm256_mul_ps(decoded, scale_vector);
+            let inputs = _mm256_loadu_ps(input_group.as_ptr().add(offset));
+            let weight_low = _mm256_cvtps_pd(_mm256_castps256_ps128(weights));
+            let weight_high = _mm256_cvtps_pd(_mm256_extractf128_ps(weights, 1));
+            let input_low = _mm256_cvtps_pd(_mm256_castps256_ps128(inputs));
+            let input_high = _mm256_cvtps_pd(_mm256_extractf128_ps(inputs, 1));
+            _mm256_storeu_pd(products.as_mut_ptr(), _mm256_mul_pd(weight_low, input_low));
+            _mm256_storeu_pd(
+                products.as_mut_ptr().add(4),
+                _mm256_mul_pd(weight_high, input_high),
+            );
+            for product in products {
+                sum += product;
+            }
+            column += 8;
+        }
+        for &input_value in &input_group[complete..] {
+            let byte = packed[column / 2];
+            let code = if column % 2 == 0 {
+                byte & 15
+            } else {
+                byte >> 4
+            };
+            let weight = decode_e2m1(code) * scale;
+            sum += f64::from(weight) * f64::from(input_value);
+            column += 1;
+        }
+    }
+    sum as f32
+}
+
+/// Batched counterpart of [`dot_e2m1_e8m0_f64_ordered_avx2`]. Packed weights are decoded once,
+/// then multiplied into independent token accumulators without changing any token's reduction
+/// order or FP64 multiplication boundary.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_e2m1_e8m0_batch_f64_ordered_avx2<const BATCH: usize>(
+    packed: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    columns: usize,
+    group_size: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!((2..=12).contains(&BATCH));
+    debug_assert_eq!(group_size % 2, 0);
+    debug_assert_eq!(packed.len(), columns.div_ceil(2));
+    debug_assert_eq!(scales.len(), columns.div_ceil(group_size));
+    debug_assert_eq!(input.len(), BATCH * columns);
+    debug_assert_eq!(output.len(), BATCH);
+    let magnitudes = _mm256_loadu_ps(E2M1_TABLE.as_ptr());
+    let magnitude_mask = _mm256_set1_epi32(7);
+    let sign_mask = _mm256_set1_epi32(8);
+    let mut sums = [0.0f64; BATCH];
+    let mut products = [0.0f64; 8];
+    let mut column = 0usize;
+    for (group, &scale_byte) in scales.iter().enumerate() {
+        let group_end = ((group + 1) * group_size).min(columns);
+        let group_columns = group_end - column;
+        let scale = _mm256_set1_ps(decode_e8m0_unchecked(scale_byte));
+        let complete = group_columns / 8 * 8;
+        for offset in (0..complete).step_by(8) {
+            let bytes = _mm_cvtsi32_si128(
+                packed
+                    .as_ptr()
+                    .add((column + offset) / 2)
+                    .cast::<i32>()
+                    .read_unaligned(),
+            );
+            let nibbles = _mm_unpacklo_epi8(bytes, _mm_srli_epi16(bytes, 4));
+            let codes = _mm256_cvtepu8_epi32(nibbles);
+            let indices = _mm256_and_si256(codes, magnitude_mask);
+            let magnitude = _mm256_permutevar8x32_ps(magnitudes, indices);
+            let signs = _mm256_slli_epi32(_mm256_and_si256(codes, sign_mask), 28);
+            let signs =
+                _mm256_and_si256(signs, _mm256_cmpgt_epi32(indices, _mm256_setzero_si256()));
+            let weights =
+                _mm256_mul_ps(_mm256_xor_ps(magnitude, _mm256_castsi256_ps(signs)), scale);
+            let weight_low = _mm256_cvtps_pd(_mm256_castps256_ps128(weights));
+            let weight_high = _mm256_cvtps_pd(_mm256_extractf128_ps(weights, 1));
+            for (token, sum) in sums.iter_mut().enumerate() {
+                let inputs = _mm256_loadu_ps(input.as_ptr().add(token * columns + column + offset));
+                let input_low = _mm256_cvtps_pd(_mm256_castps256_ps128(inputs));
+                let input_high = _mm256_cvtps_pd(_mm256_extractf128_ps(inputs, 1));
+                _mm256_storeu_pd(products.as_mut_ptr(), _mm256_mul_pd(weight_low, input_low));
+                _mm256_storeu_pd(
+                    products.as_mut_ptr().add(4),
+                    _mm256_mul_pd(weight_high, input_high),
+                );
+                for product in products {
+                    *sum += product;
+                }
+            }
+        }
+        for offset in complete..group_columns {
+            let absolute = column + offset;
+            let byte = packed[absolute / 2];
+            let code = if absolute % 2 == 0 {
+                byte & 15
+            } else {
+                byte >> 4
+            };
+            let weight = decode_e2m1(code) * decode_e8m0_unchecked(scale_byte);
+            for (token, sum) in sums.iter_mut().enumerate() {
+                *sum += f64::from(weight) * f64::from(input[token * columns + absolute]);
+            }
+        }
+        column = group_end;
+    }
+    for (output, sum) in output.iter_mut().zip(sums) {
+        *output = sum as f32;
+    }
 }
 
 /// SIMD decodes and multiplies eight weights at a time, then adds their products in the
@@ -1750,6 +2215,66 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn block_mxfp8_batched_avx2_matches_independent_matvec_bits() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let rows = 257usize;
+        let cols = 259usize;
+        let block_rows = 128usize;
+        let block_cols = 128usize;
+        let finite_codes = [0x00, 0x07, 0x18, 0x38, 0x48, 0x70, 0x7e, 0xb8, 0xfe];
+        let values = (0..rows * cols)
+            .map(|index| finite_codes[index.wrapping_mul(17) % finite_codes.len()])
+            .collect::<Vec<_>>();
+        let scales = (0..rows.div_ceil(block_rows) * cols.div_ceil(block_cols))
+            .map(|index| 119 + (index.wrapping_mul(13) % 17) as u8)
+            .collect::<Vec<_>>();
+        let matrix =
+            MxFp8Matrix::from_packed(rows, cols, block_rows, block_cols, values, scales).unwrap();
+        for batch in 2..=12 {
+            let input = (0..batch * cols)
+                .map(|index| ((index.wrapping_mul(29) % 127) as f32 - 63.0) / 128.0)
+                .collect::<Vec<_>>();
+            let expected = input
+                .chunks_exact(cols)
+                .flat_map(|input| matrix.matvec(input).unwrap())
+                .collect::<Vec<_>>();
+            let actual = matrix.matmul_rows(&input, batch).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            let start = 63;
+            let count = 131;
+            let expected_range = input
+                .chunks_exact(cols)
+                .flat_map(|input| matrix.matvec_rows(start, count, input).unwrap())
+                .collect::<Vec<_>>();
+            let actual_range = matrix
+                .matmul_row_range(start, count, &input, batch)
+                .unwrap();
+            assert_eq!(
+                actual_range
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_range
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn modelopt_avx2_transpose_fma_is_bit_exact_to_ordered_f64_columns() {
         if !std::arch::is_x86_feature_detected!("avx2")
             || !std::arch::is_x86_feature_detected!("fma")
@@ -1819,6 +2344,16 @@ mod tests {
     }
 
     #[test]
+    fn native_mxfp4_storage_can_be_recovered_for_reuse() {
+        let packed = vec![0x21, 0x43];
+        let scales = vec![127];
+        let matrix = MxFp4Matrix::from_packed(1, 4, 32, packed.clone(), scales.clone()).unwrap();
+        let (recovered_packed, recovered_scales) = matrix.into_e2m1_buffers();
+        assert_eq!(recovered_packed.as_ref(), packed);
+        assert_eq!(recovered_scales.as_ref(), scales);
+    }
+
+    #[test]
     fn prevalidated_mxfp8_constructor_keeps_shape_checks() {
         let matrix =
             MxFp8Matrix::from_packed_prevalidated(1, 2, 1, 32, vec![0x38, 0xb8], vec![127])
@@ -1827,6 +2362,30 @@ mod tests {
         assert_eq!(matrix.cols(), 2);
         assert!(matches!(
             MxFp8Matrix::from_packed_prevalidated(1, 2, 1, 32, vec![0x38], vec![127]),
+            Err(MxError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn prevalidated_mxfp4_constructor_keeps_shape_checks() {
+        let matrix = MxFp4Matrix::from_read_buffers_prevalidated(
+            1,
+            4,
+            32,
+            vec![0x21, 0x43].into(),
+            vec![127].into(),
+        )
+        .unwrap();
+        assert_eq!(matrix.rows(), 1);
+        assert_eq!(matrix.cols(), 4);
+        assert!(matches!(
+            MxFp4Matrix::from_read_buffers_prevalidated(
+                1,
+                4,
+                32,
+                vec![0x21].into(),
+                vec![127].into(),
+            ),
             Err(MxError::Shape(_))
         ));
     }
@@ -1862,6 +2421,43 @@ mod tests {
         ));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mxfp4_batched_avx2_matches_independent_matvec_bits() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let rows = 17usize;
+        let cols = 129usize;
+        let group_size = 32usize;
+        let row_bytes = cols.div_ceil(2);
+        let groups = cols.div_ceil(group_size);
+        let packed = (0..rows * row_bytes)
+            .map(|index| (index.wrapping_mul(83).wrapping_add(11)) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..rows * groups)
+            .map(|index| 118 + (index.wrapping_mul(7) % 19) as u8)
+            .collect::<Vec<_>>();
+        let matrix = MxFp4Matrix::from_packed(rows, cols, group_size, packed, scales).unwrap();
+        for batch in 1..=12 {
+            let input = (0..batch * cols)
+                .map(|index| ((index.wrapping_mul(29) % 127) as f32 - 63.0) / 131.0)
+                .collect::<Vec<_>>();
+            let expected = input
+                .chunks_exact(cols)
+                .flat_map(|input| matrix.matvec(input).unwrap())
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            let actual = matrix
+                .matmul_rows(&input, batch)
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "batch={batch}");
+        }
+    }
+
     #[test]
     fn fp8_block_scales_follow_both_matrix_axes() {
         let values = vec![0x38; 9];
@@ -1875,29 +2471,40 @@ mod tests {
     #[test]
     fn fp8_scalar_blocks_preserve_ordered_dot_bits_across_partial_blocks() {
         let rows = 35usize;
-        for cols in [1usize, 31, 32, 65, 2049] {
-            let values = (0..rows * cols)
-                .map(|index| ((index * 79 + 17) % 127) as u8 | ((index % 2) as u8 * 128))
-                .collect::<Vec<_>>();
-            let scale_cols = cols.div_ceil(32);
-            let scales = (0..rows.div_ceil(32) * scale_cols)
-                .map(|index| 115 + (index % 19) as u8)
-                .collect::<Vec<_>>();
-            let input = (0..cols)
-                .map(|index| ((index * 29 % 127) as f32 - 63.0) / 131.0)
-                .collect::<Vec<_>>();
-            let matrix =
-                MxFp8Matrix::from_packed(rows, cols, 32, 32, values.clone(), scales.clone())
-                    .unwrap();
-            let actual = matrix.matvec_rows(1, rows - 2, &input).unwrap();
-            for (row, actual) in (1..rows - 1).zip(actual) {
-                let mut expected = 0.0f64;
-                for column in 0..cols {
-                    let weight = decode_e4m3fn(values[row * cols + column])
-                        * decode_e8m0(scales[row / 32 * scale_cols + column / 32]).unwrap();
-                    expected += f64::from(weight) * f64::from(input[column]);
+        for (block_rows, block_cols) in [(32usize, 32usize), (128, 128)] {
+            for cols in [1usize, 31, 32, 65, 129, 2049] {
+                let values = (0..rows * cols)
+                    .map(|index| ((index * 79 + 17) % 127) as u8 | ((index % 2) as u8 * 128))
+                    .collect::<Vec<_>>();
+                let scale_cols = cols.div_ceil(block_cols);
+                let scales = (0..rows.div_ceil(block_rows) * scale_cols)
+                    .map(|index| 115 + (index % 19) as u8)
+                    .collect::<Vec<_>>();
+                let input = (0..cols)
+                    .map(|index| ((index * 29 % 127) as f32 - 63.0) / 131.0)
+                    .collect::<Vec<_>>();
+                let matrix = MxFp8Matrix::from_packed(
+                    rows,
+                    cols,
+                    block_rows,
+                    block_cols,
+                    values.clone(),
+                    scales.clone(),
+                )
+                .unwrap();
+                let actual = matrix.matvec_rows(1, rows - 2, &input).unwrap();
+                for (row, actual) in (1..rows - 1).zip(actual) {
+                    let mut expected = 0.0f64;
+                    for column in 0..cols {
+                        let weight = decode_e4m3fn(values[row * cols + column])
+                            * decode_e8m0(
+                                scales[row / block_rows * scale_cols + column / block_cols],
+                            )
+                            .unwrap();
+                        expected += f64::from(weight) * f64::from(input[column]);
+                    }
+                    assert_eq!(actual.to_bits(), (expected as f32).to_bits());
                 }
-                assert_eq!(actual.to_bits(), (expected as f32).to_bits());
             }
         }
     }
@@ -1945,7 +2552,6 @@ mod tests {
             }
         }
     }
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn fp4_ordered_avx2_matches_scalar_for_extreme_scales_and_partial_groups() {
@@ -1978,16 +2584,30 @@ mod tests {
                         let scales = vec![scale; cols.div_ceil(group_size)];
                         let expected =
                             dot_e2m1_e8m0_fp32_ordered(&packed, &scales, &input, group_size);
+                        let expected_f64 =
+                            dot_e2m1_e8m0_f64_ordered(&packed, &scales, &input, group_size);
                         let actual = unsafe {
                             dot_e2m1_e8m0_fp32_ordered_avx2(&packed, &scales, &input, group_size)
+                        };
+                        let actual_f64 = unsafe {
+                            dot_e2m1_e8m0_f64_ordered_avx2(&packed, &scales, &input, group_size)
                         };
                         if expected.is_nan() {
                             assert!(actual.is_nan());
                         } else {
                             assert_eq!(actual.to_bits(), expected.to_bits());
                         }
+                        if expected_f64.is_nan() {
+                            assert!(actual_f64.is_nan());
+                        } else {
+                            assert_eq!(actual_f64.to_bits(), expected_f64.to_bits());
+                        }
                         let matrix =
                             MxFp4Matrix::from_packed(1, cols, group_size, packed, scales).unwrap();
+                        assert_eq!(
+                            matrix.matvec(&input).unwrap()[0].to_bits(),
+                            expected_f64.to_bits()
+                        );
                         if expected.is_finite() {
                             assert_eq!(
                                 matrix.matvec_fp32(&input).unwrap()[0].to_bits(),

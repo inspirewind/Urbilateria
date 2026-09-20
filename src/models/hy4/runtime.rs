@@ -25,7 +25,8 @@ use crate::runtime::cache::LayerLruCache;
 use crate::runtime::{ExpertTelemetry, RuntimeLoadOptions};
 use crate::storage::{
     load_compact_bf16_matrix, load_reference_matrix_row, load_reference_vector, load_weight_matrix,
-    streamed_reference_matvec, SafetensorError, TensorIndex, TensorLoadError, WeightLoadError,
+    streamed_reference_matvec_pipelined, SafetensorError, TensorIndex, TensorLoadError,
+    WeightLoadError,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -592,8 +593,8 @@ impl Hy4RuntimeModel {
             if let Some(lm_head) = &self.lm_head {
                 lm_head.matvec(&hidden)?
             } else {
-                streamed_reference_matvec(
-                    &self.index,
+                streamed_reference_matvec_pipelined(
+                    Arc::clone(&self.index),
                     "lm_head.weight",
                     self.config.vocab_size,
                     self.config.hidden_size,

@@ -38,8 +38,17 @@ impl From<WeightLoadError> for SchemaError {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeepseekV4Requirements {
-    /// Peak decoded non-expert weights while one base layer is streamed.
+    /// Peak decoded non-expert weights for the adjacent-layer double buffer.
     pub resident_bytes: u64,
+    /// Largest decoded non-expert decoder layer.
+    pub streamed_layer_bytes: u64,
+    /// Exact decoded bytes required to retain every non-expert decoder layer.
+    pub decoder_layer_bytes: u64,
+    /// Decoded small vectors pinned once for all decoder layers.
+    pub decoder_vector_cache_bytes: u64,
+    pub decoder_layer_count: usize,
+    /// Resident representation used when the vocabulary projection is pinned.
+    pub lm_head_resident_bytes: u64,
     pub maximum_expert_bytes: u64,
     pub transient_expert_bytes: u64,
     pub expert_cache_bytes: u64,
@@ -59,6 +68,51 @@ pub struct DeepseekV4Requirements {
     pub streamed_lm_head_bytes: u64,
 }
 
+impl DeepseekV4Requirements {
+    /// Number of leading decoder layers that can be retained above the two-layer streaming
+    /// allowance represented by [`Self::resident_bytes`].
+    pub fn cached_decoder_layers_for_resident_budget(&self, resident_budget: u64) -> usize {
+        let cache_budget = resident_budget.saturating_sub(self.resident_bytes);
+        if cache_budget >= self.decoder_layer_bytes {
+            self.decoder_layer_count
+        } else {
+            cache_budget
+                .checked_div(self.streamed_layer_bytes)
+                .unwrap_or(0)
+                .min(self.decoder_layer_count as u64) as usize
+        }
+    }
+
+    /// Splits the decoded-layer residency allowance between persistent layers and bounded
+    /// lookahead. A partially resident model trades up to three leading cached layers for additional
+    /// pending layers, keeping the same conservative count of simultaneously resident largest
+    /// layers while allowing up to four storage reads to run ahead of decode compute.
+    pub fn decoder_layer_pipeline_for_resident_budget(
+        &self,
+        resident_budget: u64,
+    ) -> (usize, usize) {
+        let capacity = self.cached_decoder_layers_for_resident_budget(resident_budget);
+        decoder_layer_pipeline(capacity, self.decoder_layer_count)
+    }
+
+    pub fn caches_lm_head_for_resident_budget(&self, resident_budget: u64) -> bool {
+        resident_budget
+            >= self
+                .resident_bytes
+                .saturating_add(self.decoder_layer_bytes)
+                .saturating_add(self.lm_head_resident_bytes)
+    }
+}
+
+fn decoder_layer_pipeline(capacity: usize, layer_count: usize) -> (usize, usize) {
+    if capacity < layer_count {
+        let prefetch_depth = capacity.saturating_add(1).min(4);
+        (capacity + 1 - prefetch_depth, prefetch_depth)
+    } else {
+        (capacity, 1)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Residency {
     TokenRows,
@@ -72,6 +126,7 @@ struct ManifestBuilder<'a> {
     index: &'a TensorIndex,
     expected: BTreeSet<String>,
     base_layer_bytes: Vec<u64>,
+    base_layer_vector_bytes: u64,
     base_layer_expert_slot_bytes: Vec<u64>,
     current_expert_bytes: u64,
     maximum_expert_bytes: u64,
@@ -88,6 +143,7 @@ impl<'a> ManifestBuilder<'a> {
             index,
             expected: BTreeSet::new(),
             base_layer_bytes: vec![0; layers],
+            base_layer_vector_bytes: 0,
             base_layer_expert_slot_bytes: vec![0; layers],
             current_expert_bytes: 0,
             maximum_expert_bytes: 0,
@@ -141,6 +197,14 @@ impl<'a> ManifestBuilder<'a> {
         let resident = (length as u64)
             .checked_mul(4)
             .ok_or_else(|| SchemaError::Invalid(format!("{name:?} bytes overflow")))?;
+        if matches!(residency, Residency::BaseLayer(_)) {
+            self.base_layer_vector_bytes = self
+                .base_layer_vector_bytes
+                .checked_add(resident)
+                .ok_or_else(|| {
+                    SchemaError::Invalid("decoder vector cache bytes overflow".to_owned())
+                })?;
+        }
         self.charge(residency, resident, length as u64)
     }
 
@@ -271,16 +335,21 @@ pub fn inspect_requirements(
         DType::Bf16,
         Residency::BaseFinal,
     )?;
-    manifest.matrix(
+    let lm_head_layout_bytes = manifest.matrix(
         "head.weight",
         config.vocab_size,
         config.hidden_size,
         Residency::TokenRows,
     )?;
-    manifest.streamed_lm_head_bytes = index
+    let lm_head = index
         .require("head.weight")
-        .map_err(WeightLoadError::from)?
-        .data_len;
+        .map_err(WeightLoadError::from)?;
+    manifest.streamed_lm_head_bytes = lm_head.data_len;
+    let lm_head_resident_bytes = if lm_head.dtype == DType::Bf16 {
+        lm_head.data_len
+    } else {
+        lm_head_layout_bytes
+    };
     inspect_hc_head(&mut manifest, config, "", Residency::BaseFinal)?;
 
     let dspark_stages = config.declared_dspark_stage_count();
@@ -346,13 +415,45 @@ pub fn inspect_requirements(
         .try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
         .and_then(|bytes| bytes.checked_mul(expert_slots_per_layer as u64))
         .ok_or_else(|| SchemaError::Invalid("expert cache bytes overflow".to_owned()))?;
-    let peak_streamed_layer = manifest.base_layer_bytes.iter().copied().max().unwrap_or(0);
-    let resident_bytes = peak_streamed_layer
+    // Decode layer N+1 while layer N executes. Charge the largest adjacent pair rather than two
+    // copies of the largest layer: compression ratios make layer sizes non-uniform, and only
+    // adjacent layers can coexist in the pipeline.
+    let streamed_layer_bytes = manifest.base_layer_bytes.iter().copied().max().unwrap_or(0);
+    let decoder_layer_bytes = manifest
+        .base_layer_bytes
+        .iter()
+        .try_fold(0u64, |sum, &bytes| {
+            sum.checked_add(bytes)
+                .ok_or_else(|| SchemaError::Invalid("decoder layer bytes overflow".to_owned()))
+        })?;
+    let peak_streamed_layers = match manifest.base_layer_bytes.as_slice() {
+        [] => 0,
+        [only] => *only,
+        layers => layers
+            .windows(2)
+            .map(|pair| pair[0].saturating_add(pair[1]))
+            .max()
+            .unwrap_or(0),
+    };
+    // Runtime decoder layers share one immutable Arc-backed copy of every small vector. Keep the
+    // existing per-layer accounting as a conservative pipeline/cache allowance and add the exact
+    // all-layer cache explicitly; the double charge is under 2 MiB for the release and prevents
+    // this optimization from weakening any previous RAM guarantee.
+    let decoder_vector_cache_bytes = manifest.base_layer_vector_bytes;
+    let resident_bytes = peak_streamed_layers
         .checked_add(manifest.base_final_bytes)
-        .ok_or_else(|| SchemaError::Invalid("resident layer + root weights overflow".to_owned()))?;
+        .and_then(|bytes| bytes.checked_add(decoder_vector_cache_bytes))
+        .ok_or_else(|| {
+            SchemaError::Invalid("resident layer pipeline + root weights overflow".to_owned())
+        })?;
     let maximum_expert_bytes = manifest.maximum_expert_bytes;
     Ok(DeepseekV4Requirements {
         resident_bytes,
+        streamed_layer_bytes,
+        decoder_layer_bytes,
+        decoder_vector_cache_bytes,
+        decoder_layer_count: config.num_hidden_layers,
+        lm_head_resident_bytes,
         maximum_expert_bytes,
         transient_expert_bytes: maximum_expert_bytes,
         expert_cache_bytes: persistent_expert_bytes.max(maximum_expert_bytes),
@@ -699,5 +800,15 @@ mod tests {
         let compressors = 21 * 11 + 20 * 4;
         let dspark = 3 * 1565 + 10;
         assert_eq!(base_without_compressors + compressors + dspark, 72_317);
+    }
+
+    #[test]
+    fn partial_layer_residency_trades_cache_slots_for_four_layer_lookahead() {
+        assert_eq!(decoder_layer_pipeline(0, 43), (0, 1));
+        assert_eq!(decoder_layer_pipeline(1, 43), (0, 2));
+        assert_eq!(decoder_layer_pipeline(2, 43), (0, 3));
+        assert_eq!(decoder_layer_pipeline(3, 43), (0, 4));
+        assert_eq!(decoder_layer_pipeline(17, 43), (14, 4));
+        assert_eq!(decoder_layer_pipeline(43, 43), (43, 1));
     }
 }

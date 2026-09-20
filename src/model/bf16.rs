@@ -20,6 +20,28 @@ impl Bf16Matrix {
         cols: usize,
         little_endian_bytes: Vec<u8>,
     ) -> Result<Self, MatrixError> {
+        Self::from_le_bytes_impl(rows, cols, little_endian_bytes, true)
+    }
+
+    /// Constructs a streamed matvec chunk while deferring payload finiteness validation.
+    ///
+    /// The streamed caller validates a finite input and every output row. Any BF16 NaN or infinity
+    /// necessarily makes its row's ordered dot product non-finite, even when multiplied by zero,
+    /// so this removes a redundant full-payload scan without weakening rejection.
+    pub(crate) fn from_le_bytes_deferred_finite_check(
+        rows: usize,
+        cols: usize,
+        little_endian_bytes: Vec<u8>,
+    ) -> Result<Self, MatrixError> {
+        Self::from_le_bytes_impl(rows, cols, little_endian_bytes, false)
+    }
+
+    fn from_le_bytes_impl(
+        rows: usize,
+        cols: usize,
+        little_endian_bytes: Vec<u8>,
+        validate_finite: bool,
+    ) -> Result<Self, MatrixError> {
         if rows == 0 || cols == 0 {
             return Err(MatrixError::InvalidShape(
                 "rows and columns must be non-zero".to_owned(),
@@ -37,9 +59,10 @@ impl Bf16Matrix {
                 little_endian_bytes.len()
             )));
         }
-        if little_endian_bytes
-            .chunks_exact(2)
-            .any(|bytes| !decode_bf16(bytes).is_finite())
+        if validate_finite
+            && little_endian_bytes
+                .chunks_exact(2)
+                .any(|bytes| !decode_bf16(bytes).is_finite())
         {
             return Err(MatrixError::NonFinite);
         }
@@ -60,6 +83,10 @@ impl Bf16Matrix {
 
     pub fn resident_bytes(&self) -> usize {
         self.little_endian_bytes.len()
+    }
+
+    pub(crate) fn into_le_bytes(self) -> Vec<u8> {
+        self.little_endian_bytes
     }
 
     pub fn write_row(&self, row: usize, output: &mut [f32]) -> Result<(), MatrixError> {

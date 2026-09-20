@@ -4,9 +4,10 @@ mod load;
 mod safetensors;
 mod weight;
 
+pub(crate) use load::streamed_reference_matvec_pipelined;
 pub use load::{
     load_i64_matrix_row, load_reference_matrix, load_reference_matrix_row, load_reference_values,
-    load_reference_vector, streamed_reference_matvec, TensorLoadError,
+    load_reference_vector, load_reference_vectors, streamed_reference_matvec, TensorLoadError,
 };
 pub(crate) use safetensors::ReadBuffer;
 pub use safetensors::{DType, SafetensorError, ShardInfo, TensorIndex, TensorInfo};

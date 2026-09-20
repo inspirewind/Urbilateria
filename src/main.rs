@@ -9,7 +9,9 @@ use urbilateria::analysis::{
     build_hy4_resource_plan, build_kimi_k3_resource_plan, build_resource_plan, probe_tensor,
     CheckpointReport, ProbeReport, ResourcePlan,
 };
-use urbilateria::execution::{configure_threads, worker_threads};
+use urbilateria::execution::{
+    configure_threads, enable_streamed_weight_allocation_reuse, worker_threads,
+};
 use urbilateria::generation::{
     try_generate_with_state, GenerationConfig, GenerationError, StopReason,
 };
@@ -715,7 +717,7 @@ Commands:\n  \
 `--raw-prompt` accepts an already-rendered model-native prompt, not bare user text.\n\
 For ordinary text omit it; add `--no-thinking` for non-reasoning chat.\n\n\
 Large matrix output rows run on one persistent CPU pool. `--threads 1` is the serial baseline;\n\
-without `--threads`, the pool uses the platform's available parallelism. Profile text goes to\n\
+without `--threads`, the pool uses one worker per available physical core. Profile text goes to\n\
 stderr and profile JSON to the requested file, never to streamed stdout.\n\n\
 The public `generate` path currently drives GLM, DeepSeek-V4, Kimi-K3, Qwen3.8, and Hy4 (Hy4 is
 exact through 2,048 total tokens, where DSA top-k selects the complete causal history). Qwen3.8
@@ -1842,12 +1844,20 @@ fn run_generate_deepseek<W: Write>(
     }
     let expert_slots = usize::try_from(plan.expert_slots_per_sparse_layer)
         .map_err(|_| "planned expert slots do not fit usize")?;
+    let (cached_layers, layer_prefetch_depth) =
+        requirements.decoder_layer_pipeline_for_resident_budget(plan.resident_core_bytes);
+    if cached_layers < config.num_hidden_layers {
+        enable_streamed_weight_allocation_reuse();
+    }
     eprintln!(
-        "preflight: DeepSeek-V4 prompt={} tokens, context={}, RAM={}, streamed-layer peak={}, KV={}, expert slots/layer={}, suppressed LM-head rows={}, CPU workers={} (correctness runtime; DSpark disabled)",
+        "preflight: DeepSeek-V4 prompt={} tokens, context={}, RAM={}, resident core={} (cached layers={}/{}, read lookahead={}), KV={}, expert slots/layer={}, suppressed LM-head rows={}, CPU workers={} (correctness runtime; DSpark disabled)",
         prompt_tokens.len(),
         required_context,
         human_bytes(effective_ram),
         human_bytes(plan.resident_core_bytes),
+        cached_layers,
+        config.num_hidden_layers,
+        layer_prefetch_depth,
         human_bytes(plan.kv_cache_bytes),
         expert_slots,
         suppressed_rows,

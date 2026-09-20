@@ -9,11 +9,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let threads = environment_usize("URB_BENCH_THREADS")?.unwrap_or(20);
     let rows = environment_usize("URB_BENCH_ROWS")?.unwrap_or(2_048);
     let columns = environment_usize("URB_BENCH_COLS")?.unwrap_or(6_144);
+    let block_rows = environment_usize("URB_BENCH_BLOCK_ROWS")?.unwrap_or(1);
+    let block_columns = environment_usize("URB_BENCH_BLOCK_COLS")?.unwrap_or(32);
     let iterations = environment_usize("URB_BENCH_ITERATIONS")?.unwrap_or(20);
     let batch = environment_usize("URB_BENCH_BATCH")?.unwrap_or(1);
     let batch_kernel = environment_usize("URB_BENCH_BATCH_KERNEL")?.unwrap_or(0) != 0;
     let exponent_zero_period = environment_usize("URB_BENCH_EXPONENT_ZERO_PERIOD")?;
-    if rows == 0 || columns == 0 || iterations == 0 || batch == 0 {
+    if rows == 0
+        || columns == 0
+        || block_rows == 0
+        || block_columns == 0
+        || iterations == 0
+        || batch == 0
+    {
         return Err("benchmark dimensions and iterations must be non-zero".into());
     }
     configure_threads(threads)?;
@@ -35,14 +43,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|index| codes[index.wrapping_mul(17) % codes.len()])
             .collect::<Vec<_>>()
     };
-    let scale_columns = columns.div_ceil(32);
-    let scales = (0..rows * scale_columns)
+    let scale_columns = columns.div_ceil(block_columns);
+    let scales = (0..rows.div_ceil(block_rows) * scale_columns)
         .map(|index| 119 + (index.wrapping_mul(13) % 17) as u8)
         .collect::<Vec<_>>();
     let input = (0..batch * columns)
         .map(|index| ((index.wrapping_mul(29) % 127) as f32 - 63.0) / 128.0)
         .collect::<Vec<_>>();
-    let matrix = MxFp8Matrix::from_packed(rows, columns, 1, 32, values, scales)?;
+    let matrix =
+        MxFp8Matrix::from_packed(rows, columns, block_rows, block_columns, values, scales)?;
 
     let run = || -> Result<Vec<f32>, Box<dyn Error>> {
         if batch_kernel {
@@ -70,10 +79,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let elapsed = started.elapsed();
     let work = rows as f64 * columns as f64 * batch as f64 * iterations as f64;
     println!(
-        "threads={} rows={} columns={} batch={} batch_kernel={} iterations={} elapsed_ms={:.3} gmac_s={:.3} checksum={checksum}",
+        "threads={} rows={} columns={} block={}x{} batch={} batch_kernel={} iterations={} elapsed_ms={:.3} gmac_s={:.3} checksum={checksum}",
         worker_threads(),
         rows,
         columns,
+        block_rows,
+        block_columns,
         batch,
         batch_kernel,
         iterations,

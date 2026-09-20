@@ -113,6 +113,31 @@ fn limit_glibc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn limit_glibc_arenas() {}
 
+/// Keeps streamed weight allocations in glibc arenas so same-shaped decoder layers can reuse
+/// already-faulted pages instead of cycling anonymous mmap regions.
+///
+/// Callers opt in only when their RAM plan streams decoder layers. Fully resident plans gain no
+/// reuse but can retain several GiB of otherwise free expert/prefill scratch, so they deliberately
+/// keep glibc's default large-allocation policy. The 64 MiB ceiling covers V4's 32 MiB projection
+/// payloads and remains below the planner's existing 512 MiB allocator-fragmentation reserve.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn enable_streamed_weight_allocation_reuse() {
+    static CONFIGURED: OnceLock<()> = OnceLock::new();
+    CONFIGURED.get_or_init(|| {
+        const M_MMAP_THRESHOLD: i32 = -3;
+        const REUSABLE_WEIGHT_ALLOCATION_MAX: i32 = 64 * 1024 * 1024;
+        unsafe extern "C" {
+            fn mallopt(parameter: i32, value: i32) -> i32;
+        }
+        // SAFETY: `mallopt` takes two integers and mutates only glibc's process allocator policy.
+        // Failure is harmless and intentionally ignored so compatible runtimes fail open.
+        let _ = unsafe { mallopt(M_MMAP_THRESHOLD, REUSABLE_WEIGHT_ALLOCATION_MAX) };
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn enable_streamed_weight_allocation_reuse() {}
+
 /// Returns the effective worker count, lazily creating the default pool when needed.
 pub fn worker_threads() -> usize {
     pool().current_num_threads()
@@ -210,6 +235,7 @@ fn pool() -> &'static ThreadPool {
         let affinity = Arc::new(physical_core_first_cpu_order());
         let worker_affinity = Arc::clone(&affinity);
         ThreadPoolBuilder::new()
+            .num_threads(recommended_worker_threads())
             .thread_name(|index| format!("urb-cpu-{index}"))
             .start_handler(move |index| {
                 if let Some(&cpu) = worker_affinity.get(index) {
@@ -221,11 +247,29 @@ fn pool() -> &'static ThreadPool {
     })
 }
 
+/// Default compute width: one worker per available physical core, falling back to the platform's
+/// logical parallelism when topology is unavailable. Explicit `--threads` still overrides this.
+pub fn recommended_worker_threads() -> usize {
+    let physical = physical_core_count();
+    if physical != 0 {
+        physical
+    } else {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    }
+}
+
 /// Orders available logical CPUs so every physical core receives one worker before SMT siblings.
 /// Hybrid Intel parts expose P-core siblings first in CPU-number order and E-cores as singleton
 /// cores, which gives `--threads 20` one worker on each physical core of a 14700K.
 #[cfg(target_os = "linux")]
 fn physical_core_first_cpu_order() -> Vec<usize> {
+    physical_core_first(&available_cpu_topology())
+}
+
+#[cfg(target_os = "linux")]
+fn available_cpu_topology() -> Vec<(usize, usize, usize)> {
     let allowed = fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -264,32 +308,14 @@ fn physical_core_first_cpu_order() -> Vec<usize> {
         })
         .collect::<Vec<_>>();
     topology.sort_unstable();
-    physical_core_first(&topology)
+    topology
 }
 
 #[cfg(target_os = "linux")]
 fn physical_core_count() -> usize {
-    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            name.to_str()?.strip_prefix("cpu")?.parse::<usize>().ok()?;
-            let path = entry.path().join("topology");
-            let package = fs::read_to_string(path.join("physical_package_id"))
-                .ok()?
-                .trim()
-                .parse::<usize>()
-                .ok()?;
-            let core = fs::read_to_string(path.join("core_id"))
-                .ok()?
-                .trim()
-                .parse::<usize>()
-                .ok()?;
-            Some((package, core))
-        })
+    available_cpu_topology()
+        .into_iter()
+        .map(|(_, package, core)| (package, core))
         .collect::<HashSet<_>>()
         .len()
 }

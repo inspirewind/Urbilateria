@@ -471,9 +471,9 @@ pub fn build_resource_plan(
     }
 }
 
-/// Plans the streaming DeepSeek-V4 correctness runtime. Unlike the GLM path, embedding,
-/// LM-head, and non-expert block weights are row/layer streamed, so checkpoint payload size is
-/// not treated as resident memory.
+/// Plans the memory-adaptive DeepSeek-V4 correctness runtime. Embedding rows remain streamed;
+/// decoder layers and the LM head are retained when the requested RAM budget can still preserve
+/// one complete routed-expert stripe, otherwise they fall back to bounded streaming.
 pub fn build_deepseek_resource_plan(
     config: &DeepseekV4Config,
     report: &CheckpointReport,
@@ -492,19 +492,46 @@ pub fn build_deepseek_resource_plan(
     let maximum_expert = requirements.maximum_expert_bytes.max(average_expert);
     let routed_resident_upper_bound = maximum_expert.saturating_mul(expert_count);
     let transient_expert = if expert_count > 0 { maximum_expert } else { 0 };
-    let resident_core = requirements.resident_bytes;
+    let base_resident = requirements.resident_bytes;
     let safety = (ram_budget_bytes / 10).max(512 * MIB);
     let scratch = 512 * MIB;
     let context_usize = usize::try_from(context_tokens).unwrap_or(usize::MAX);
     let kv_bytes = deepseek_kv_bytes(config, context_usize, kv_state_bytes).unwrap_or(u64::MAX);
     let fixed = safety
-        .saturating_add(resident_core)
+        .saturating_add(base_resident)
         .saturating_add(kv_bytes)
         .saturating_add(scratch);
-    let raw_expert_budget = ram_budget_bytes.saturating_sub(fixed);
-    let expert_budget = raw_expert_budget.min(routed_resident_upper_bound);
-    let unused_after_full_residency = raw_expert_budget.saturating_sub(expert_budget);
-    let slots_total = raw_expert_budget
+    let working = ram_budget_bytes.saturating_sub(fixed);
+    let discretionary = working.saturating_sub(transient_expert);
+    let expert_bytes_per_slot = maximum_expert.saturating_mul(sparse_layers);
+    let minimum_expert_slots =
+        (config.num_experts_per_tok as u64).min(config.n_routed_experts as u64);
+    let minimum_expert_cache = expert_bytes_per_slot.saturating_mul(minimum_expert_slots);
+    let available_layer_cache = discretionary.saturating_sub(minimum_expert_cache);
+    let layer_cache_bytes = if available_layer_cache >= requirements.decoder_layer_bytes {
+        requirements.decoder_layer_bytes
+    } else {
+        available_layer_cache
+            .checked_div(requirements.streamed_layer_bytes)
+            .unwrap_or(0)
+            .saturating_mul(requirements.streamed_layer_bytes)
+    };
+    let remaining_after_layers = discretionary.saturating_sub(layer_cache_bytes);
+    let lm_head_cache_bytes = if layer_cache_bytes == requirements.decoder_layer_bytes
+        && remaining_after_layers
+            >= minimum_expert_cache.saturating_add(requirements.lm_head_resident_bytes)
+    {
+        requirements.lm_head_resident_bytes
+    } else {
+        0
+    };
+    let resident_core = base_resident
+        .saturating_add(layer_cache_bytes)
+        .saturating_add(lm_head_cache_bytes);
+    let expert_working = remaining_after_layers.saturating_sub(lm_head_cache_bytes);
+    let expert_budget = expert_working.min(routed_resident_upper_bound);
+    let unused_after_full_residency = expert_working.saturating_sub(expert_budget);
+    let slots_total = expert_budget
         .checked_div(maximum_expert)
         .unwrap_or(0)
         .min(expert_count);
@@ -512,7 +539,7 @@ pub fn build_deepseek_resource_plan(
     let capacity_fraction = (slots_per_layer as f64 / config.n_routed_experts as f64).min(1.0);
     let before_kv = ram_budget_bytes
         .saturating_sub(safety)
-        .saturating_sub(resident_core)
+        .saturating_sub(base_resident)
         .saturating_sub(scratch)
         .saturating_sub(transient_expert);
     let maximum_context = deepseek_context_under_budget(config, before_kv, kv_state_bytes);
@@ -522,7 +549,7 @@ pub fn build_deepseek_resource_plan(
     let within_context = context_tokens > 0
         && context_tokens <= config.max_position_embeddings as u64
         && context_usize != usize::MAX;
-    let transient_expert_fits = expert_count == 0 || raw_expert_budget >= transient_expert;
+    let transient_expert_fits = expert_count == 0 || working >= transient_expert;
     let feasible = ram_budget_bytes >= fixed
         && transient_expert_fits
         && context_tokens <= maximum_context
@@ -558,10 +585,17 @@ pub fn build_deepseek_resource_plan(
                 .to_owned(),
         );
     }
-    notes.push(
-        "DeepSeek-V4 planning assumes layer-streamed non-expert weights and row-streamed embedding/LM head"
-            .to_owned(),
-    );
+    let (cached_layers, layer_prefetch_depth) =
+        requirements.decoder_layer_pipeline_for_resident_budget(resident_core);
+    notes.push(format!(
+        "DeepSeek-V4 pins {cached_layers} of {} decoder layers, uses {layer_prefetch_depth}-layer read lookahead, {} the LM head, and row-streams embedding rows",
+        config.num_hidden_layers,
+        if requirements.caches_lm_head_for_resident_budget(resident_core) {
+            "caches"
+        } else {
+            "streams"
+        }
+    ));
     notes.push(
         "DSpark weights are validated but excluded from the base-model correctness runtime working set"
             .to_owned(),

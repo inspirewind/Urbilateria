@@ -129,6 +129,34 @@ impl<T> LayerLruCache<T> {
         self.layers[layer].iter().any(|entry| entry.key == key)
     }
 
+    /// Returns whether a layer has no resident entries.
+    ///
+    /// A layer-major prefill backend can use this to select a grouped streaming path whose
+    /// access order is chosen up front. Starting from an empty layer makes it possible to retain
+    /// exactly the same final LRU hot set by processing distinct keys in last-use order.
+    pub(crate) fn layer_is_empty(&self, layer: usize) -> bool {
+        self.layers[layer].is_empty()
+    }
+
+    pub(crate) fn layer_capacity(&self, layer: usize) -> usize {
+        self.layer_capacities[layer]
+    }
+
+    /// Evicts every resident entry from one layer without changing its configured capacity.
+    ///
+    /// This supports bounded chunk scheduling: a caller can finish all work that references one
+    /// expert chunk, recycle its backing buffers, and use the same slots for the next chunk.
+    pub(crate) fn drain_layer(&mut self, telemetry: &mut ExpertTelemetry, layer: usize) -> Vec<T> {
+        let entries = std::mem::take(&mut self.layers[layer]);
+        telemetry.evictions = telemetry.evictions.saturating_add(entries.len() as u64);
+        telemetry.resident_experts = telemetry.resident_experts.saturating_sub(entries.len());
+        let bytes = entries
+            .iter()
+            .fold(0u64, |sum, entry| sum.saturating_add(entry.bytes));
+        telemetry.resident_bytes = telemetry.resident_bytes.saturating_sub(bytes);
+        entries.into_iter().map(|entry| entry.value).collect()
+    }
+
     /// Borrows a resident value without changing recency or telemetry. Callers can use this to
     /// stage independent work, then replay the logical access through [`Self::access`] once an
     /// associated fallible batch has succeeded.
@@ -154,6 +182,82 @@ impl<T> LayerLruCache<T> {
             }
         }
         self.layers[layer].len().saturating_add(missing.len()) <= layer_capacity
+    }
+
+    /// Makes an ordered, duplicate-free batch safe to preload concurrently while preserving the
+    /// exact hit/miss and final-LRU behavior of replaying its accesses one by one.
+    ///
+    /// We first simulate the ordered accesses against the current recencies, then remove only the
+    /// original entries that the serial execution would evict. A duplicate-free batch no larger
+    /// than the cache cannot evict a value inserted earlier in that same batch: every insertion has
+    /// a newer timestamp than an as-yet untouched original victim. Replaying the real accesses can
+    /// therefore fill the resulting holes without eviction, including reloading an initially
+    /// resident key when an earlier miss would have displaced it before its turn.
+    pub(crate) fn prepare_ordered_batch(
+        &mut self,
+        telemetry: &mut ExpertTelemetry,
+        layer: usize,
+        keys: &[usize],
+    ) -> Option<Vec<T>> {
+        let layer_capacity = self.layer_capacities[layer];
+        if layer_capacity == 0
+            || keys.is_empty()
+            || keys.len() > layer_capacity
+            || keys
+                .iter()
+                .enumerate()
+                .any(|(index, key)| keys[..index].contains(key))
+        {
+            return None;
+        }
+
+        let mut simulated = self.layers[layer]
+            .iter()
+            .map(|entry| (entry.key, entry.last_used))
+            .collect::<Vec<_>>();
+        let mut clock = self.clock;
+        let mut evicted_keys = Vec::new();
+        for &key in keys {
+            clock = clock.saturating_add(1);
+            if let Some(position) = simulated
+                .iter()
+                .position(|&(resident_key, _)| resident_key == key)
+            {
+                simulated[position].1 = clock;
+                continue;
+            }
+            if simulated.len() == layer_capacity {
+                let position = simulated
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, &(resident_key, last_used))| (last_used, resident_key))
+                    .map(|(position, _)| position)
+                    .expect("a full non-zero simulated cache contains an entry");
+                evicted_keys.push(simulated.remove(position).0);
+            }
+            simulated.push((key, clock));
+        }
+        if evicted_keys
+            .iter()
+            .any(|key| !self.layers[layer].iter().any(|entry| entry.key == *key))
+        {
+            return None;
+        }
+
+        let mut evicted = Vec::with_capacity(evicted_keys.len());
+        for key in evicted_keys {
+            let position = self.layers[layer]
+                .iter()
+                .position(|entry| entry.key == key)
+                .expect("every simulated eviction refers to an original entry");
+            let entry = self.layers[layer].remove(position);
+            telemetry.evictions = telemetry.evictions.saturating_add(1);
+            telemetry.resident_experts = telemetry.resident_experts.saturating_sub(1);
+            telemetry.resident_bytes = telemetry.resident_bytes.saturating_sub(entry.bytes);
+            evicted.push(entry.value);
+        }
+        debug_assert!(self.can_insert_without_eviction(layer, keys));
+        Some(evicted)
     }
 
     /// Temporarily lends a layer every globally budgeted slot not currently occupied by another
@@ -298,6 +402,63 @@ mod tests {
     }
 
     #[test]
+    fn ordered_batch_preparation_matches_serial_lru_and_telemetry() {
+        fn seeded_cache() -> (LayerLruCache<usize>, ExpertTelemetry) {
+            let mut cache = LayerLruCache::new(1, 4);
+            let mut telemetry = ExpertTelemetry::default();
+            for key in [1, 2, 3, 4] {
+                cache
+                    .access(
+                        &mut telemetry,
+                        0,
+                        key,
+                        || Ok::<_, ()>((key * 10, 4, 3)),
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            }
+            (cache, telemetry)
+        }
+
+        let accesses = [5, 1, 6];
+        let (mut serial, mut serial_telemetry) = seeded_cache();
+        for &key in &accesses {
+            serial
+                .access(
+                    &mut serial_telemetry,
+                    0,
+                    key,
+                    || Ok::<_, ()>((key * 10, 4, 3)),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+
+        let (mut prepared, mut prepared_telemetry) = seeded_cache();
+        assert_eq!(
+            prepared.prepare_ordered_batch(&mut prepared_telemetry, 0, &accesses),
+            Some(vec![10, 20, 30])
+        );
+        assert!(prepared.can_insert_without_eviction(0, &accesses));
+        for &key in &accesses {
+            prepared
+                .access(
+                    &mut prepared_telemetry,
+                    0,
+                    key,
+                    || Ok::<_, ()>((key * 10, 4, 3)),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(prepared_telemetry, serial_telemetry);
+        for key in 1..=6 {
+            assert_eq!(prepared.contains(0, key), serial.contains(0, key));
+        }
+    }
+
+    #[test]
     fn peek_does_not_change_recency_or_telemetry() {
         let mut cache = LayerLruCache::new(1, 2);
         let mut telemetry = ExpertTelemetry::default();
@@ -319,6 +480,43 @@ mod tests {
             .access(&mut telemetry, 0, 3, || Ok::<_, ()>((30, 4, 3)), |_| Ok(()))
             .unwrap();
         assert!(!cache.contains(0, 1));
+    }
+
+    #[test]
+    fn layer_empty_state_tracks_residency() {
+        let mut cache = LayerLruCache::new(2, 1);
+        let mut telemetry = ExpertTelemetry::default();
+        assert!(cache.layer_is_empty(0));
+        assert!(cache.layer_is_empty(1));
+        cache
+            .access(&mut telemetry, 1, 7, || Ok::<_, ()>((70, 4, 3)), |_| Ok(()))
+            .unwrap();
+        assert!(cache.layer_is_empty(0));
+        assert!(!cache.layer_is_empty(1));
+    }
+
+    #[test]
+    fn draining_a_layer_preserves_capacity_and_updates_residency() {
+        let mut cache = LayerLruCache::new(1, 2);
+        let mut telemetry = ExpertTelemetry::default();
+        for key in [7, 8] {
+            cache
+                .access(
+                    &mut telemetry,
+                    0,
+                    key,
+                    || Ok::<_, ()>((key * 10, 4, 3)),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+        assert_eq!(cache.layer_capacity(0), 2);
+        assert_eq!(cache.drain_layer(&mut telemetry, 0), [70, 80]);
+        assert!(cache.layer_is_empty(0));
+        assert_eq!(cache.layer_capacity(0), 2);
+        assert_eq!(telemetry.evictions, 2);
+        assert_eq!(telemetry.resident_experts, 0);
+        assert_eq!(telemetry.resident_bytes, 0);
     }
 
     #[test]

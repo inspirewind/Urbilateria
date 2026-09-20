@@ -133,6 +133,43 @@ flowchart LR
 Qwen3.8 库运行时按层摄取提示词：一个解码器层为整个提示词加载一次，只有最后一个
 提示 token 会进入词表大小的 LM head。DeepSeek-V4.1 当前在提示词预填充与 decode
 中都使用精确的逐 token 路径。
+需要流式读取 BF16 词表 head 的适配器会使用固定常驻量、感知队列深度的流水线：最多
+8 个 I/O worker 读取相邻子块，同时 CPU 池计算当前子块；全部原始缓冲合计仍处于原先
+单块预算内，并随窗口推进持续复用。
+
+DeepSeek-V4 会在生成前利用已授权的剩余内存驻留解码器层和紧凑 BF16 LM head，同时至少保留
+一整条 routed-expert 缓存带；预算较小时会使用流式词表 head，并让解码器层读取与计算形成流水线。
+在部分层可驻留时，会用最多三个长期驻留层槽位换取四层预读窗口，让存储可以进一步提前读取，同时
+保持保守峰值 RAM 预算不变；层全部驻留和最低内存配置维持原有行为。
+在 GNU/Linux 上，只要 RAM 规划仍需流式加载 decoder layer，运行时还会让不超过 64 MiB 的
+权重分配留在受限的 glibc arena 中，使后续同形层复用已经触发过缺页的内存，而不再反复执行匿名
+`mmap`/`munmap`；层全部常驻时不会修改这个阈值，以免保留无法复用的 prefill 暂存页。
+除这个 allocator 提示外，执行完的流式层还会把原生 MXFP8/MXFP4 payload 与 scale 缓冲直接交给
+下一项形状兼容的预读任务，按 shard 物理顺序原地覆盖，同时保持既有预读深度和 RAM 规划不变。
+目标层的全部 payload 首次校验成功后，后续 decode 重载仍会执行完整形状检查，但不再线性扫描同一份
+不可变的量化字节。Decoder 的归一化、bias、sink 和 hyper-connection 小向量会按 shard 物理顺序
+一次性读取，并通过不可变 `Arc` 供每次重载共享；规划器会显式计入这份不足 2 MiB 的缓存。
+全驻留层不会进入这两条复用路径。
+能够同时驻留的 routed experts 会并行计算并共享一次激活量化。对于不超过逐层缓存容量的
+单 token 有序路由批次，运行时会先模拟串行 LRU，提前精确淘汰必然被替换的旧项，再并发加载和
+计算整批 expert，最后按原顺序重放逻辑访问。更大的批次仍使用有界回退路径：利用规划中预留的
+一个 transient expert，让下一个专家的存储读取与当前专家计算重叠而不突破 RAM 预算。
+被淘汰的原生 MXFP4 专家会把 payload 缓冲交给下一次 miss 复用，其六段 scale/payload
+按 shard 中的物理顺序读取。逐层 prefill 时，当前层会临时借用全局尚未使用的 expert
+槽位，并把最多 24 个路由 token 按 expert 合并；超过 12 个输入的精确 MXFP4 kernel 会在
+内部安全分块。随后
+仍按 token/expert 顺序重放逻辑缓存访问，再归还借用容量。批次 miss 会预先提交到有界 I/O
+线程池，使阻塞读取能与已命中专家的 MXFP4 计算重叠，而不占用 Rayon 计算线程。窗口的唯一
+expert 总数超过当前层可用槽位时，不再让整层退回逐 token 执行；运行时会按最后使用位置排序，
+并用缓存容量大小的并行分块反复复用同一组缓冲，在固定 RAM 上保留跨 token 合批以及
+token-major LRU 的最终热集。同一条 prefill 路径还会批量执行相互独立的 Q/KV 和输出投影，
+再按 token 顺序重放因果注意力；数值
+精确的多输入 AVX2 内核同时覆盖 ModelOpt 1×32 和 block-quantized 128×128 MXFP8，包括
+grouped output row range 与 compressor/indexer 投影。流式 BF16 matvec 会把 payload 有限性
+检查延后到必需的逐行结果检查，在继续拒绝 NaN/Inf 的同时，避免各模型的大型词表 head
+再做一次完整扫描。默认 CPU 池为每个可用物理核分配一个 worker；仍可用 `--threads`
+显式覆盖，从而避免 SMT 引起的缓存与内存带宽退化。Decode 回滚和稀疏注意力使用
+增量、零拷贝 KV 视图，其复制成本不会随压缩历史增长。
 
 ## 模型覆盖
 

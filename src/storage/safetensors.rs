@@ -1027,6 +1027,82 @@ impl TensorIndex {
         Ok(output)
     }
 
+    /// Overwrites caller-owned tensor buffers in physical shard order and returns them in caller
+    /// order. This combines the seek-friendly ordering of [`Self::read_tensors_bounded`] with the
+    /// allocation and page reuse needed by repeatedly evicted expert caches.
+    pub(crate) fn read_tensors_bounded_reusing(
+        &self,
+        names: &[&str],
+        mut reuse: Vec<Vec<u8>>,
+        maximum_bytes: u64,
+    ) -> Result<Vec<Vec<u8>>, SafetensorError> {
+        if names.len() != reuse.len() {
+            return Err(SafetensorError::Invalid {
+                path: self.model_dir.clone(),
+                reason: format!(
+                    "received {} reusable buffers for {} tensors",
+                    reuse.len(),
+                    names.len()
+                ),
+            });
+        }
+
+        let mut total = 0u64;
+        let mut tensors = Vec::with_capacity(names.len());
+        let mut lengths = Vec::with_capacity(names.len());
+        for &name in names {
+            let tensor = self.require(name)?;
+            total = total.checked_add(tensor.data_len).ok_or_else(|| {
+                SafetensorError::AllocationTooLarge {
+                    name: "reusable tensor batch".to_owned(),
+                    requested: u64::MAX,
+                    maximum: maximum_bytes,
+                }
+            })?;
+            let length = usize::try_from(tensor.data_len).map_err(|_| {
+                SafetensorError::AllocationTooLarge {
+                    name: name.to_owned(),
+                    requested: tensor.data_len,
+                    maximum: maximum_bytes,
+                }
+            })?;
+            tensors.push(tensor);
+            lengths.push(length);
+        }
+        if total > maximum_bytes {
+            return Err(SafetensorError::AllocationTooLarge {
+                name: "reusable tensor batch".to_owned(),
+                requested: total,
+                maximum: maximum_bytes,
+            });
+        }
+
+        let mut physical_order = (0..tensors.len()).collect::<Vec<_>>();
+        physical_order.sort_by(|&left, &right| {
+            tensors[left]
+                .shard
+                .cmp(&tensors[right].shard)
+                .then_with(|| tensors[left].data_offset.cmp(&tensors[right].data_offset))
+        });
+        let mut output = (0..tensors.len()).map(|_| None).collect::<Vec<_>>();
+        for index in physical_order {
+            let tensor = tensors[index];
+            let length = lengths[index];
+            let mut buffer = std::mem::take(&mut reuse[index]);
+            if buffer.len() == length {
+                self.read_exact_at(tensor, tensor.data_offset, &mut buffer)?;
+                output[index] = Some(buffer);
+            } else {
+                output[index] =
+                    Some(self.read_owned_exact_at(tensor, tensor.data_offset, length)?);
+            }
+        }
+        Ok(output
+            .into_iter()
+            .map(|buffer| buffer.expect("every reusable batch entry was read"))
+            .collect())
+    }
+
     fn read_exact_at(
         &self,
         tensor: &TensorInfo,
@@ -1509,6 +1585,23 @@ mod tests {
                 ..
             })
         ));
+
+        let b_buffer = vec![0xaau8; 3];
+        let a_buffer = vec![0xbbu8; 8];
+        let pointers = [b_buffer.as_ptr(), a_buffer.as_ptr()];
+        let tensors = index
+            .read_tensors_bounded_reusing(&["b", "a"], vec![b_buffer, a_buffer], 11)
+            .unwrap();
+        assert_eq!(tensors[0], vec![7, 8, 9]);
+        assert_eq!(
+            tensors[1],
+            [1.0f32, -2.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(tensors[0].as_ptr(), pointers[0]);
+        assert_eq!(tensors[1].as_ptr(), pointers[1]);
         fs::remove_dir_all(dir).unwrap();
     }
 

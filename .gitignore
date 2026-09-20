@@ -27,6 +27,7 @@ __pycache__/
 *.urb-cache
 
 # Local profiler output produced by README examples and performance runs.
+profiles/
 /profile*.json
 
 # Local secrets and machine-specific configuration.

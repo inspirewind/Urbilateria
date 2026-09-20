@@ -129,10 +129,76 @@ impl WeightMatrix {
             }
             return Ok(output);
         }
+        if let Self::MxFp4(matrix) = self {
+            let chunks = batch.div_ceil(12);
+            let base_batch = batch / chunks;
+            let larger_chunks = batch % chunks;
+            let mut output = Vec::with_capacity(batch.saturating_mul(matrix.rows()));
+            let mut token = 0usize;
+            for chunk in 0..chunks {
+                let chunk_batch = base_batch + usize::from(chunk < larger_chunks);
+                let start = token.saturating_mul(matrix.cols());
+                let end = start.saturating_add(chunk_batch.saturating_mul(matrix.cols()));
+                output.extend(matrix.matmul_rows(&input[start..end], chunk_batch)?);
+                token += chunk_batch;
+            }
+            return Ok(output);
+        }
         let mut output = Vec::with_capacity(batch.saturating_mul(self.rows()));
         for token in input.chunks_exact(self.cols()) {
             output.extend(self.matvec(token)?);
         }
+        Ok(output)
+    }
+
+    /// Applies a contiguous output-row range to consecutive input rows `[batch, cols]`.
+    pub fn matmul_row_range(
+        &self,
+        start: usize,
+        count: usize,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, WeightError> {
+        let expected = batch
+            .checked_mul(self.cols())
+            .ok_or_else(|| MatrixError::InvalidShape("batch * cols overflows usize".to_owned()))?;
+        let end = start
+            .checked_add(count)
+            .filter(|&end| end <= self.rows())
+            .ok_or_else(|| MatrixError::InvalidShape("output row range is invalid".to_owned()))?;
+        if batch == 0 || input.len() != expected {
+            return Err(MatrixError::InputLength {
+                expected,
+                got: input.len(),
+            }
+            .into());
+        }
+        if let Self::MxFp8(matrix) = self {
+            let chunks = batch.div_ceil(12);
+            let base_batch = batch / chunks;
+            let larger_chunks = batch % chunks;
+            let mut output = Vec::with_capacity(batch.saturating_mul(count));
+            let mut token = 0usize;
+            for chunk in 0..chunks {
+                let chunk_batch = base_batch + usize::from(chunk < larger_chunks);
+                let input_start = token.saturating_mul(matrix.cols());
+                let input_end =
+                    input_start.saturating_add(chunk_batch.saturating_mul(matrix.cols()));
+                output.extend(matrix.matmul_row_range(
+                    start,
+                    count,
+                    &input[input_start..input_end],
+                    chunk_batch,
+                )?);
+                token += chunk_batch;
+            }
+            return Ok(output);
+        }
+        let mut output = Vec::with_capacity(batch.saturating_mul(count));
+        for token in input.chunks_exact(self.cols()) {
+            output.extend(self.matvec_rows(start, count, token)?);
+        }
+        debug_assert_eq!(end, start + count);
         Ok(output)
     }
 
@@ -304,6 +370,36 @@ mod tests {
             );
             assert_eq!(matrix.matvec_rows(1, 1, &[0.5, 2.0]).unwrap(), vec![-6.5]);
         }
+    }
+
+    #[test]
+    fn mxfp4_weight_batches_split_without_changing_token_order() {
+        let matrix = WeightMatrix::MxFp4(
+            MxFp4Matrix::from_packed(
+                2,
+                8,
+                8,
+                vec![0x21, 0x43, 0x65, 0x87, 0x12, 0x34, 0x56, 0x78],
+                vec![127, 126],
+            )
+            .unwrap(),
+        );
+        let batch = 25usize;
+        let input = (0..batch * matrix.cols())
+            .map(|index| ((index * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect::<Vec<_>>();
+        let expected = input
+            .chunks_exact(matrix.cols())
+            .flat_map(|input| matrix.matvec(input).unwrap())
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        let actual = matrix
+            .matmul_rows(&input, batch)
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

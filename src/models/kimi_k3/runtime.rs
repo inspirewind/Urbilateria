@@ -29,7 +29,7 @@ use crate::model::{WeightError, WeightMatrix};
 use crate::runtime::{ExpertTelemetry, RuntimeLoadOptions};
 use crate::storage::{
     load_reference_matrix_row, load_reference_values, load_reference_vector,
-    streamed_reference_matvec, SafetensorError, TensorIndex, TensorLoadError,
+    streamed_reference_matvec_pipelined, SafetensorError, TensorIndex, TensorLoadError,
 };
 use std::fmt;
 use std::path::Path;
@@ -561,8 +561,8 @@ impl KimiK3RuntimeModel {
             &self.final_norm,
             self.config.text_config.rms_norm_eps as f32,
         )?;
-        let logits = streamed_reference_matvec(
-            &self.index,
+        let logits = streamed_reference_matvec_pipelined(
+            Arc::clone(&self.index),
             LM_HEAD,
             self.config.text_config.vocab_size,
             self.config.text_config.hidden_size,

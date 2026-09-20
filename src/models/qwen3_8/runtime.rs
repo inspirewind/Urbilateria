@@ -18,8 +18,8 @@ use crate::config::ConfigError;
 use crate::generation::CausalDecoder;
 use crate::runtime::{ExpertTelemetry, RuntimeLoadOptions};
 use crate::storage::{
-    load_reference_matrix_row, load_reference_vector, streamed_reference_matvec, SafetensorError,
-    TensorIndex, TensorLoadError,
+    load_reference_matrix_row, load_reference_vector, streamed_reference_matvec_pipelined,
+    SafetensorError, TensorIndex, TensorLoadError,
 };
 use serde::Serialize;
 use std::fmt;
@@ -540,8 +540,8 @@ impl Qwen38RuntimeModel {
         let mut hidden =
             zero_centered_rms_norm(hidden, &self.final_norm, self.config.rms_norm_eps as f32)?;
         round_runtime_bf16(&mut hidden, "final RMSNorm")?;
-        let mut logits = streamed_reference_matvec(
-            &self.index,
+        let mut logits = streamed_reference_matvec_pipelined(
+            Arc::clone(&self.index),
             LM_HEAD,
             self.config.vocab_size,
             self.config.hidden_size,

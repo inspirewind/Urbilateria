@@ -1,9 +1,11 @@
 use super::{DType, SafetensorError, TensorIndex};
-use crate::execution::{install, should_parallelize};
+use crate::execution::{install, should_parallelize, spawn_io, worker_threads, IoTask};
 use crate::model::{Bf16Matrix, DenseMatrix, MatrixError};
-use crate::profiling::{span_with_metrics, span_with_work, ProfileStage};
+use crate::profiling::{capture_context, span_with_metrics, span_with_work, ProfileStage};
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum TensorLoadError {
@@ -124,6 +126,42 @@ pub fn load_reference_vector(
     load_reference_values(index, name)
 }
 
+/// Loads related resident vectors in physical shard order and returns them in caller order.
+///
+/// Decoder layers contain several small normalization, bias, and hyper-connection vectors. A
+/// single metadata preflight plus physical-order batch avoids alternating between distant ranges
+/// while retaining the exact scalar F32 representation of [`load_reference_vector`].
+pub fn load_reference_vectors(
+    index: &TensorIndex,
+    vectors: &[(&str, usize)],
+) -> Result<Vec<Vec<f32>>, TensorLoadError> {
+    let mut total_bytes = 0u64;
+    let mut tensors = Vec::with_capacity(vectors.len());
+    for &(name, length) in vectors {
+        let tensor = index.require(name)?;
+        if tensor.shape != [length as u64] {
+            return Err(TensorLoadError::InvalidShape(format!(
+                "tensor {name:?} must declare [{length}], got {:?}",
+                tensor.shape
+            )));
+        }
+        total_bytes = total_bytes.checked_add(tensor.data_len).ok_or_else(|| {
+            TensorLoadError::InvalidShape("reference-vector byte count overflows".to_owned())
+        })?;
+        tensors.push(tensor);
+    }
+    let names = vectors.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let payloads = index.read_tensors_bounded(&names, total_bytes)?;
+    vectors
+        .iter()
+        .zip(tensors)
+        .zip(payloads)
+        .map(|((&(name, _), tensor), payload)| {
+            decode_reference_values(name, &tensor.dtype, &payload)
+        })
+        .collect()
+}
+
 /// Loads one row from a plain floating matrix without allocating or reading the other rows.
 pub fn load_reference_matrix_row(
     index: &TensorIndex,
@@ -211,7 +249,7 @@ pub fn streamed_reference_matvec(
             let matrix = {
                 let _profile =
                     span_with_metrics(ProfileStage::StreamedMatrixReadDecode, 0, byte_count);
-                Bf16Matrix::from_le_bytes(
+                Bf16Matrix::from_le_bytes_deferred_finite_check(
                     count,
                     columns,
                     index.read_range(name, offset, byte_count)?,
@@ -262,6 +300,181 @@ pub fn streamed_reference_matvec(
         output.extend(chunk_output);
     }
     Ok(output)
+}
+
+#[derive(Clone, Copy)]
+struct StreamedMatrixChunk {
+    count: usize,
+    offset: u64,
+    byte_count: usize,
+    work: usize,
+}
+
+/// BF16 streamed matvec with bounded read/compute overlap.
+///
+/// Between two and nine subdivisions are kept in flight so their aggregate raw-byte residency does
+/// not exceed the single full chunk used by [`streamed_reference_matvec`]. Non-BF16 and one-row
+/// chunks retain the reference path.
+pub(crate) fn streamed_reference_matvec_pipelined(
+    index: Arc<TensorIndex>,
+    name: &str,
+    rows: usize,
+    columns: usize,
+    input: &[f32],
+    rows_per_chunk: usize,
+) -> Result<Vec<f32>, TensorLoadError> {
+    let tensor = index.require(name)?;
+    if tensor.dtype != DType::Bf16 {
+        return streamed_reference_matvec(&index, name, rows, columns, input, rows_per_chunk);
+    }
+    if tensor.shape != [rows as u64, columns as u64]
+        || columns == 0
+        || input.len() != columns
+        || rows_per_chunk == 0
+    {
+        return Err(TensorLoadError::InvalidShape(format!(
+            "streamed matvec {name:?} needs [{rows},{columns}], {} inputs, and non-zero chunks",
+            input.len()
+        )));
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(TensorLoadError::NonFinite(name.to_owned()));
+    }
+    let row_bytes = columns
+        .checked_mul(2)
+        .ok_or_else(|| TensorLoadError::InvalidShape("matrix row bytes overflow".to_owned()))?;
+    let maximum_rows = (64 * 1024 * 1024 / row_bytes).max(1);
+    let full_chunk_rows = rows_per_chunk.min(maximum_rows);
+    if full_chunk_rows < 2 {
+        return streamed_reference_matvec(&index, name, rows, columns, input, rows_per_chunk);
+    }
+    const MIN_PIPELINE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    let full_chunk_bytes = full_chunk_rows.saturating_mul(row_bytes);
+    let maximum_buffers = worker_threads().clamp(1, 8) + 1;
+    let buffer_count = (full_chunk_bytes / MIN_PIPELINE_CHUNK_BYTES)
+        .max(2)
+        .min(maximum_buffers)
+        .min(full_chunk_rows);
+    // Flooring keeps `buffer_count * chunk_rows` within the original one-chunk byte budget.
+    let chunk_rows = full_chunk_rows / buffer_count;
+    let queue_depth = buffer_count - 1;
+    let mut chunks = Vec::with_capacity(rows.div_ceil(chunk_rows));
+    for start in (0..rows).step_by(chunk_rows) {
+        let count = chunk_rows.min(rows - start);
+        let byte_count = count.checked_mul(row_bytes).ok_or_else(|| {
+            TensorLoadError::InvalidShape("matrix chunk bytes overflow".to_owned())
+        })?;
+        let offset = start
+            .checked_mul(row_bytes)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                TensorLoadError::InvalidShape("matrix chunk offset overflows".to_owned())
+            })?;
+        chunks.push(StreamedMatrixChunk {
+            count,
+            offset,
+            byte_count,
+            work: count.saturating_mul(columns),
+        });
+    }
+
+    let Some(&first) = chunks.first() else {
+        return Ok(Vec::new());
+    };
+    let mut current = read_bf16_stream_chunk(&index, name, columns, first, Vec::new())?;
+    let mut next_chunk = 1usize;
+    let mut pending = VecDeque::with_capacity(queue_depth);
+    while pending.len() < queue_depth && next_chunk < chunks.len() {
+        pending.push_back(spawn_bf16_stream_chunk(
+            Arc::clone(&index),
+            name.to_owned(),
+            columns,
+            chunks[next_chunk],
+            Vec::new(),
+        ));
+        next_chunk += 1;
+    }
+    let mut output = Vec::with_capacity(rows);
+    for &chunk in &chunks {
+        let chunk_output = {
+            let _profile = span_with_work(ProfileStage::StreamedMatrixCompute, chunk.work);
+            current.matvec(input).map_err(|error| match error {
+                MatrixError::NonFinite => TensorLoadError::NonFinite(name.to_owned()),
+                error => TensorLoadError::Matrix(error),
+            })
+        };
+        let chunk_output = match chunk_output {
+            Ok(output) => output,
+            Err(error) => {
+                drain_bf16_stream_tasks(pending);
+                return Err(error);
+            }
+        };
+        if chunk_output.iter().any(|value| !value.is_finite()) {
+            drain_bf16_stream_tasks(pending);
+            return Err(TensorLoadError::NonFinite(name.to_owned()));
+        }
+        output.extend(chunk_output);
+        let reusable = current.into_le_bytes();
+        let Some(next) = pending.pop_front() else {
+            debug_assert_eq!(next_chunk, chunks.len());
+            break;
+        };
+        current = match next.join() {
+            Ok(matrix) => matrix,
+            Err(error) => {
+                drain_bf16_stream_tasks(pending);
+                return Err(error);
+            }
+        };
+        if next_chunk < chunks.len() {
+            pending.push_back(spawn_bf16_stream_chunk(
+                Arc::clone(&index),
+                name.to_owned(),
+                columns,
+                chunks[next_chunk],
+                reusable,
+            ));
+            next_chunk += 1;
+        }
+    }
+    Ok(output)
+}
+
+fn drain_bf16_stream_tasks(pending: VecDeque<IoTask<Result<Bf16Matrix, TensorLoadError>>>) {
+    for task in pending {
+        let _ = task.join();
+    }
+}
+
+fn read_bf16_stream_chunk(
+    index: &TensorIndex,
+    name: &str,
+    columns: usize,
+    chunk: StreamedMatrixChunk,
+    reuse: Vec<u8>,
+) -> Result<Bf16Matrix, TensorLoadError> {
+    let _profile = span_with_metrics(ProfileStage::StreamedMatrixReadDecode, 0, chunk.byte_count);
+    let bytes = index.read_range_reusing(name, chunk.offset, chunk.byte_count, reuse)?;
+    Bf16Matrix::from_le_bytes_deferred_finite_check(chunk.count, columns, bytes).map_err(|error| {
+        match error {
+            MatrixError::NonFinite => TensorLoadError::NonFinite(name.to_owned()),
+            error => TensorLoadError::Matrix(error),
+        }
+    })
+}
+
+fn spawn_bf16_stream_chunk(
+    index: Arc<TensorIndex>,
+    name: String,
+    columns: usize,
+    chunk: StreamedMatrixChunk,
+    reuse: Vec<u8>,
+) -> IoTask<Result<Bf16Matrix, TensorLoadError>> {
+    let profile_context = capture_context();
+    spawn_io(move || {
+        profile_context.enter(|| read_bf16_stream_chunk(&index, &name, columns, chunk, reuse))
+    })
 }
 
 /// Reads one row from an I64 routing table and converts it to platform-sized indices.
@@ -602,6 +815,33 @@ mod tests {
             .unwrap();
         assert_eq!(reads.calls, 3);
         assert_eq!(reads.logical_bytes, (rows * columns * 2) as u64);
+
+        let profile = ProfileSession::start();
+        let actual = streamed_reference_matvec_pipelined(
+            Arc::new(TensorIndex::open(&dir).unwrap()),
+            "bf16",
+            rows,
+            columns,
+            &input,
+            65,
+        )
+        .unwrap();
+        let report = profile.finish();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let compute = report.stage(ProfileStage::StreamedMatrixCompute).unwrap();
+        assert_eq!(compute.calls, 5);
+        assert_eq!(compute.work_items, (rows * columns) as u64);
+        let reads = report
+            .stage(ProfileStage::StreamedMatrixReadDecode)
+            .unwrap();
+        assert_eq!(reads.calls, 5);
+        assert_eq!(reads.logical_bytes, (rows * columns * 2) as u64);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -636,6 +876,25 @@ mod tests {
                 Err(TensorLoadError::NonFinite(name)) if name == "bf16"
             ));
         }
+        write_bf16_stream_fixture(
+            &path,
+            4,
+            2,
+            &[
+                0x3f80, 0x4000, 0x4040, 0x4080, 0x3f80, 0x4000, 0x4040, 0x7f80,
+            ],
+        );
+        assert!(matches!(
+            streamed_reference_matvec_pipelined(
+                Arc::new(TensorIndex::open(&dir).unwrap()),
+                "bf16",
+                4,
+                2,
+                &[1.0, 1.0],
+                4,
+            ),
+            Err(TensorLoadError::NonFinite(name)) if name == "bf16"
+        ));
         write_bf16_stream_fixture(&path, 2, 2, &[0x3f80, 0x4000, 0x4040, 0x4080]);
         let index = TensorIndex::open(&dir).unwrap();
         for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

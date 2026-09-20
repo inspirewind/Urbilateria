@@ -3,38 +3,74 @@
 //! This is intentionally not a throughput backend. It exists as the executable specification
 //! against which later SIMD/GPU kernels can be checked.
 
-use super::compressor::{CompressorError, CompressorState, CompressorWeights};
+use super::compressor::{
+    CompressorCheckpoint, CompressorError, CompressorState, CompressorWeights, PreparedCompressor,
+};
 use super::math::{
     bounded_swiglu, hyper_connection_head, hyper_connection_post, hyper_connection_pre, linear,
-    paired_rope, round_to_bf16_in_place, route_sqrt_softplus, sparse_attention_with_sink,
+    linear_with_mx_activation, linear_with_mx_activation_batch, paired_rope, prepare_mx_activation,
+    round_to_bf16_in_place, route_sqrt_softplus, sparse_attention_with_sink,
     unit_rms_norm_in_place, DeepseekMathError, HyperConnectionMix,
 };
 use super::schema::{self, DeepseekV4Requirements, SchemaError};
 use super::DeepseekV4Config;
 use crate::config::ConfigError;
-use crate::execution::install;
+use crate::execution::{install, spawn_io, IoTask};
 use crate::generation::CausalDecoder;
 use crate::math::{
     normalized_hadamard, rms_norm, simulate_e2m1_activation, simulate_e4m3_activation, MathError,
-    RouteChoice,
+    MxFp4Matrix, MxFp8Matrix, RouteChoice,
 };
 use crate::model::{WeightError, WeightMatrix};
-use crate::profiling::{capture_context, span, ProfileStage};
+use crate::profiling::{capture_context, span, ProfileSpan, ProfileStage};
 use crate::runtime::cache::LayerLruCache;
 use crate::runtime::{ExpertTelemetry, RuntimeLoadOptions};
 use crate::storage::{
-    inspect_weight_matrix, load_i64_matrix_row, load_reference_matrix_row, load_reference_vector,
-    load_weight_matrices, load_weight_matrix, streamed_reference_matvec, SafetensorError,
-    TensorIndex, TensorLoadError, WeightLoadError,
+    inspect_weight_matrix, load_compact_bf16_matrix, load_i64_matrix_row,
+    load_reference_matrix_row, load_reference_vector, load_reference_vectors, load_weight_matrices,
+    load_weight_matrix, streamed_reference_matvec_pipelined, DType, ReadBuffer, SafetensorError,
+    TensorIndex, TensorLoadError, WeightFormat, WeightLoadError,
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 static NEXT_DEEPSEEK_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+const PREFILL_ROUTE_WINDOW: usize = 24;
+type PendingDecoderLayer = (
+    usize,
+    IoTask<Result<Arc<DecoderLayer>, DeepseekRuntimeError>>,
+);
+
+#[derive(Debug, Default)]
+struct DecoderLayerBuffers(Vec<(ReadBuffer, ReadBuffer)>);
+
+impl DecoderLayerBuffers {
+    fn push_weight(&mut self, weight: WeightMatrix) {
+        let buffers = match weight {
+            WeightMatrix::MxFp8(matrix) => matrix.into_e8m0_buffers(),
+            WeightMatrix::MxFp4(matrix) => Some(matrix.into_e2m1_buffers()),
+            _ => None,
+        };
+        if let Some(buffers) = buffers {
+            self.0.push(buffers);
+        }
+    }
+
+    fn take_matching(
+        &mut self,
+        values_len: usize,
+        scales_len: usize,
+    ) -> Option<(ReadBuffer, ReadBuffer)> {
+        let index = self.0.iter().position(|(values, scales)| {
+            values.len() == values_len && scales.len() == scales_len
+        })?;
+        Some(self.0.swap_remove(index))
+    }
+}
 
 #[derive(Debug)]
 pub enum DeepseekRuntimeError {
@@ -130,11 +166,15 @@ pub struct DeepseekRuntimeModel {
     instance_id: u64,
     config: DeepseekV4Config,
     index: Arc<TensorIndex>,
+    decoder_vectors: Arc<[DecoderLayerVectors]>,
     final_norm: Vec<f32>,
     head_hc: HcHeadWeights,
     context_limit: usize,
     expert_slots_per_layer: usize,
     maximum_expert_bytes: u64,
+    cached_decoder_layers: usize,
+    decoder_layer_prefetch_depth: usize,
+    lm_head: Option<WeightMatrix>,
 }
 
 impl DeepseekRuntimeModel {
@@ -176,7 +216,7 @@ impl DeepseekRuntimeModel {
         )?;
         for (component, required, maximum) in [
             (
-                "streamed resident layer peak",
+                "resident layer pipeline",
                 requirements.resident_bytes,
                 options.resident_budget_bytes,
             ),
@@ -211,17 +251,49 @@ impl DeepseekRuntimeModel {
             )));
         }
         let index = Arc::new(index);
+        let (cached_decoder_layers, decoder_layer_prefetch_depth) =
+            requirements.decoder_layer_pipeline_for_resident_budget(options.resident_budget_bytes);
+        let decoder_vectors = (0..config.num_hidden_layers)
+            .map(|layer| DecoderLayerVectors::load(&index, &config, layer))
+            .collect::<Result<Vec<_>, _>>()?
+            .into();
         let final_norm = load_reference_vector(&index, "norm.weight", config.hidden_size)?;
         let head_hc = HcHeadWeights::load(&index, &config, "")?;
+        let lm_head = requirements
+            .caches_lm_head_for_resident_budget(options.resident_budget_bytes)
+            .then(|| {
+                if index.require("head.weight")?.dtype == DType::Bf16 {
+                    load_compact_bf16_matrix(
+                        &index,
+                        "head.weight",
+                        config.vocab_size,
+                        config.hidden_size,
+                        requirements.lm_head_resident_bytes,
+                    )
+                } else {
+                    load_weight_matrix(
+                        &index,
+                        "head.weight",
+                        config.vocab_size,
+                        config.hidden_size,
+                        requirements.lm_head_resident_bytes,
+                    )
+                }
+            })
+            .transpose()?;
         Ok(Self {
             instance_id: NEXT_DEEPSEEK_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
             config,
             index,
+            decoder_vectors,
             final_norm,
             head_hc,
             context_limit: options.context_limit,
             expert_slots_per_layer: options.expert_slots_per_layer,
             maximum_expert_bytes: options.maximum_expert_bytes,
+            cached_decoder_layers,
+            decoder_layer_prefetch_depth,
+            lm_head,
         })
     }
 
@@ -243,6 +315,8 @@ impl DeepseekRuntimeModel {
                 self.expert_slots_per_layer,
                 self.maximum_expert_bytes,
             )?,
+            cached_layers: (0..self.config.num_hidden_layers).map(|_| None).collect(),
+            validated_layers: vec![false; self.config.num_hidden_layers],
         })
     }
 
@@ -272,10 +346,14 @@ impl DeepseekRuntimeModel {
         }
         let position = state.position;
         profile.set_token(position, token_index);
-        let checkpoint = {
+        let checkpoints = {
             let mut profile = span(ProfileStage::DeepseekStateCheckpoint);
             profile.set_token(position, token_index);
-            state.attention.clone()
+            state
+                .attention
+                .iter_mut()
+                .map(AttentionState::checkpoint_next_token)
+                .collect::<Vec<_>>()
         };
         let result = self.forward_token_inner(token_index, position, state);
         match result {
@@ -284,7 +362,9 @@ impl DeepseekRuntimeModel {
                 Ok(step)
             }
             Err(error) => {
-                state.attention = checkpoint;
+                for (attention, checkpoint) in state.attention.iter_mut().zip(checkpoints) {
+                    attention.restore(checkpoint);
+                }
                 Err(error)
             }
         }
@@ -358,17 +438,33 @@ impl DeepseekRuntimeModel {
     ) -> Result<DeepseekRuntimeStep, DeepseekRuntimeError> {
         let mut hidden = self.load_hidden(token, position)?;
         let mut routes_by_layer = Vec::with_capacity(self.config.num_hidden_layers);
+        let mut layer = self.cached_or_load_decoder_layer(
+            state,
+            LayerTraceContext {
+                layer: 0,
+                position,
+                token,
+                batch_tokens: 1,
+            },
+        )?;
+        let mut pending_layers = VecDeque::new();
+        let mut reusable_layer = None;
         for layer_id in 0..self.config.num_hidden_layers {
             let flow_id = layer_flow_id(position, layer_id);
-            let layer = {
-                let mut profile = span(ProfileStage::DeepseekLayerLoad);
-                profile.set_token(position, token);
-                profile.set_layer_id(layer_id);
-                profile.set_flow_id(flow_id);
-                profile.set_batch_tokens(1);
-                DecoderLayer::load(&self.index, &self.config, layer_id)?
-            };
-            let (next, routes) = layer.forward(
+            let next_layer_id = layer_id + 1;
+            self.fill_decoder_layer_prefetch(
+                state,
+                layer_id,
+                LayerTraceContext {
+                    layer: layer_id,
+                    position,
+                    token,
+                    batch_tokens: 1,
+                },
+                &mut pending_layers,
+                &mut reusable_layer,
+            );
+            let forward = layer.forward(
                 &hidden,
                 token,
                 position,
@@ -376,10 +472,37 @@ impl DeepseekRuntimeModel {
                 &mut state.experts,
                 &self.config,
                 flow_id,
-            )?;
+            );
+            let next_layer =
+                match self.take_prefetched_decoder_layer(state, next_layer_id, &mut pending_layers)
+                {
+                    Ok(layer) => layer,
+                    Err(error) => {
+                        self.drain_decoder_layer_prefetch(&mut pending_layers);
+                        return Err(error);
+                    }
+                };
+            // Always drain every queued loader before propagating a compute error. A failed token
+            // must not leave background reads or additional layer allocations alive during retry.
+            let (next, routes) = match forward {
+                Ok(result) => result,
+                Err(error) => {
+                    self.drain_decoder_layer_prefetch(&mut pending_layers);
+                    return Err(error);
+                }
+            };
             hidden = next;
             routes_by_layer.push(routes);
+            if let Some(next_layer) = next_layer {
+                let retired = std::mem::replace(&mut layer, next_layer);
+                if reusable_layer.is_none() {
+                    reusable_layer = Arc::try_unwrap(retired)
+                        .ok()
+                        .map(DecoderLayer::into_native_buffers);
+                }
+            }
         }
+        debug_assert!(pending_layers.is_empty());
         self.finish_step(hidden, routes_by_layer, position, token)
     }
 
@@ -396,34 +519,98 @@ impl DeepseekRuntimeModel {
             .collect::<Result<Vec<_>, _>>()?;
         let final_offset = tokens.len() - 1;
         let mut routes_by_layer = Vec::with_capacity(self.config.num_hidden_layers);
+        let mut layer = self.cached_or_load_decoder_layer(
+            state,
+            LayerTraceContext {
+                layer: 0,
+                position: start_position,
+                token: tokens[0],
+                batch_tokens: tokens.len(),
+            },
+        )?;
+        let mut pending_layers = VecDeque::new();
+        let mut reusable_layer = None;
         for layer_id in 0..self.config.num_hidden_layers {
+            let steady_expert_capacity = state.experts.begin_prefill_layer(layer_id);
             let flow_id = layer_flow_id(start_position, layer_id);
-            let layer = {
-                let mut profile = span(ProfileStage::DeepseekLayerLoad);
-                profile.set_token_position(start_position);
-                profile.set_layer_id(layer_id);
-                profile.set_flow_id(flow_id);
-                profile.set_batch_tokens(tokens.len());
-                DecoderLayer::load(&self.index, &self.config, layer_id)?
-            };
+            let next_layer_id = layer_id + 1;
+            self.fill_decoder_layer_prefetch(
+                state,
+                layer_id,
+                LayerTraceContext {
+                    layer: layer_id,
+                    position: start_position,
+                    token: tokens[0],
+                    batch_tokens: tokens.len(),
+                },
+                &mut pending_layers,
+                &mut reusable_layer,
+            );
             let attention = &mut state.attention[layer_id];
-            for (offset, hidden) in hidden_by_token.iter_mut().enumerate() {
-                let current = std::mem::take(hidden);
-                let (next, routes) = layer.forward(
-                    &current,
-                    tokens[offset],
-                    start_position + offset,
+            let forward = (|| {
+                let inputs = std::mem::take(&mut hidden_by_token);
+                let prepared = layer.prepare_feed_forward_batch(
+                    inputs,
+                    tokens,
+                    start_position,
                     attention,
-                    &mut state.experts,
                     &self.config,
                     flow_id,
                 )?;
-                *hidden = next;
-                if offset == final_offset {
-                    routes_by_layer.push(routes);
+                let mut outputs = Vec::with_capacity(prepared.len());
+                let mut final_routes = Vec::new();
+                let mut prepared = prepared.into_iter();
+                loop {
+                    let batch = prepared
+                        .by_ref()
+                        .take(PREFILL_ROUTE_WINDOW)
+                        .collect::<Vec<_>>();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for (next, routes) in layer.finish_feed_forward_batch(
+                        batch,
+                        &mut state.experts,
+                        &self.config,
+                        flow_id,
+                    )? {
+                        outputs.push(next);
+                        final_routes = routes;
+                    }
+                }
+                hidden_by_token = outputs;
+                Ok::<_, DeepseekRuntimeError>(final_routes)
+            })();
+            let next_layer =
+                self.take_prefetched_decoder_layer(state, next_layer_id, &mut pending_layers);
+            state
+                .experts
+                .finish_prefill_layer(layer_id, steady_expert_capacity);
+            let next_layer = match next_layer {
+                Ok(layer) => layer,
+                Err(error) => {
+                    self.drain_decoder_layer_prefetch(&mut pending_layers);
+                    return Err(error);
+                }
+            };
+            let final_routes = match forward {
+                Ok(routes) => routes,
+                Err(error) => {
+                    self.drain_decoder_layer_prefetch(&mut pending_layers);
+                    return Err(error);
+                }
+            };
+            routes_by_layer.push(final_routes);
+            if let Some(next_layer) = next_layer {
+                let retired = std::mem::replace(&mut layer, next_layer);
+                if reusable_layer.is_none() {
+                    reusable_layer = Arc::try_unwrap(retired)
+                        .ok()
+                        .map(DecoderLayer::into_native_buffers);
                 }
             }
         }
+        debug_assert!(pending_layers.is_empty());
         let hidden = hidden_by_token
             .pop()
             .expect("a non-empty prefill has a final hidden state");
@@ -433,6 +620,131 @@ impl DeepseekRuntimeModel {
             start_position + final_offset,
             tokens[final_offset],
         )
+    }
+
+    fn fill_decoder_layer_prefetch(
+        &self,
+        state: &DeepseekRuntimeState,
+        current_layer: usize,
+        trace: LayerTraceContext,
+        pending: &mut VecDeque<PendingDecoderLayer>,
+        reusable_layer: &mut Option<DecoderLayerBuffers>,
+    ) {
+        let end = current_layer
+            .saturating_add(self.decoder_layer_prefetch_depth)
+            .min(self.config.num_hidden_layers.saturating_sub(1));
+        for layer in current_layer.saturating_add(1)..=end {
+            if state.cached_layers[layer].is_some()
+                || pending
+                    .iter()
+                    .any(|(pending_layer, _)| *pending_layer == layer)
+            {
+                continue;
+            }
+            if let Some(task) = self.prefetch_decoder_layer(
+                LayerTraceContext { layer, ..trace },
+                reusable_layer.take(),
+                state.validated_layers[layer],
+            ) {
+                pending.push_back((layer, task));
+            }
+        }
+    }
+
+    fn take_prefetched_decoder_layer(
+        &self,
+        state: &mut DeepseekRuntimeState,
+        layer: usize,
+        pending: &mut VecDeque<PendingDecoderLayer>,
+    ) -> Result<Option<Arc<DecoderLayer>>, DeepseekRuntimeError> {
+        if layer >= self.config.num_hidden_layers {
+            return Ok(None);
+        }
+        if let Some(cached) = &state.cached_layers[layer] {
+            return Ok(Some(Arc::clone(cached)));
+        }
+        let position = pending
+            .iter()
+            .position(|(pending_layer, _)| *pending_layer == layer)
+            .ok_or_else(|| {
+                DeepseekRuntimeError::Invalid(format!(
+                    "decoder layer {layer} was neither cached nor queued"
+                ))
+            })?;
+        debug_assert_eq!(position, 0);
+        let (_, task) = pending
+            .remove(position)
+            .expect("a located decoder-layer task remains queued");
+        let loaded = task.join()?;
+        state.validated_layers[layer] = true;
+        self.retain_decoder_layer(state, layer, &loaded);
+        Ok(Some(loaded))
+    }
+
+    fn drain_decoder_layer_prefetch(&self, pending: &mut VecDeque<PendingDecoderLayer>) {
+        while let Some((_, task)) = pending.pop_front() {
+            let _ = task.join();
+        }
+    }
+
+    fn prefetch_decoder_layer(
+        &self,
+        trace: LayerTraceContext,
+        reusable_layer: Option<DecoderLayerBuffers>,
+        prevalidated: bool,
+    ) -> Option<IoTask<Result<Arc<DecoderLayer>, DeepseekRuntimeError>>> {
+        if trace.layer >= self.config.num_hidden_layers {
+            return None;
+        }
+        let index = Arc::clone(&self.index);
+        let decoder_vectors = Arc::clone(&self.decoder_vectors);
+        let config = self.config.clone();
+        let profile_context = capture_context();
+        Some(spawn_io(move || {
+            profile_context.enter(|| {
+                load_decoder_layer_reusing(
+                    &index,
+                    &config,
+                    trace,
+                    &decoder_vectors[trace.layer],
+                    reusable_layer,
+                    prevalidated,
+                )
+                .map(Arc::new)
+            })
+        }))
+    }
+
+    fn cached_or_load_decoder_layer(
+        &self,
+        state: &mut DeepseekRuntimeState,
+        trace: LayerTraceContext,
+    ) -> Result<Arc<DecoderLayer>, DeepseekRuntimeError> {
+        if let Some(layer) = &state.cached_layers[trace.layer] {
+            return Ok(Arc::clone(layer));
+        }
+        let loaded = Arc::new(load_decoder_layer_reusing(
+            &self.index,
+            &self.config,
+            trace,
+            &self.decoder_vectors[trace.layer],
+            None,
+            state.validated_layers[trace.layer],
+        )?);
+        state.validated_layers[trace.layer] = true;
+        self.retain_decoder_layer(state, trace.layer, &loaded);
+        Ok(loaded)
+    }
+
+    fn retain_decoder_layer(
+        &self,
+        state: &mut DeepseekRuntimeState,
+        layer: usize,
+        loaded: &Arc<DecoderLayer>,
+    ) {
+        if layer < self.cached_decoder_layers && state.cached_layers[layer].is_none() {
+            state.cached_layers[layer] = Some(Arc::clone(loaded));
+        }
     }
 
     fn load_hidden(&self, token: usize, position: usize) -> Result<Vec<f32>, DeepseekRuntimeError> {
@@ -479,14 +791,18 @@ impl DeepseekRuntimeModel {
         let logits = {
             let mut profile = span(ProfileStage::DeepseekLmHead);
             profile.set_token(position, token);
-            streamed_reference_matvec(
-                &self.index,
-                "head.weight",
-                self.config.vocab_size,
-                self.config.hidden_size,
-                &hidden,
-                4096,
-            )?
+            if let Some(head) = &self.lm_head {
+                linear(head, &hidden)?
+            } else {
+                streamed_reference_matvec_pipelined(
+                    Arc::clone(&self.index),
+                    "head.weight",
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    &hidden,
+                    4096,
+                )?
+            }
         };
         Ok(DeepseekRuntimeStep {
             logits,
@@ -523,6 +839,10 @@ pub struct DeepseekRuntimeState {
     position: usize,
     attention: Vec<AttentionState>,
     experts: DeepExpertStore,
+    cached_layers: Vec<Option<Arc<DecoderLayer>>>,
+    /// Once a complete layer load succeeds, subsequent reads of the same immutable checkpoint
+    /// ranges need shape checks but not another linear native-payload validation scan.
+    validated_layers: Vec<bool>,
 }
 
 impl DeepseekRuntimeState {
@@ -542,11 +862,122 @@ impl DeepseekRuntimeState {
     }
 }
 
+#[derive(Debug)]
+struct HcVectorWeights {
+    base: Arc<[f32]>,
+    scale: Arc<[f32]>,
+}
+
+#[derive(Debug)]
+struct AttentionVectorWeights {
+    sink: Arc<[f32]>,
+    q_norm: Arc<[f32]>,
+    kv_norm: Arc<[f32]>,
+    compressor_norm: Option<Arc<[f32]>>,
+    indexer_compressor_norm: Option<Arc<[f32]>>,
+}
+
+#[derive(Debug)]
+struct DecoderLayerVectors {
+    attn_hc: HcVectorWeights,
+    ffn_hc: HcVectorWeights,
+    attn_norm: Arc<[f32]>,
+    ffn_norm: Arc<[f32]>,
+    attention: AttentionVectorWeights,
+    correction_bias: Option<Arc<[f32]>>,
+}
+
+impl DecoderLayerVectors {
+    fn load(
+        index: &TensorIndex,
+        config: &DeepseekV4Config,
+        layer: usize,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        let prefix = format!("layers.{layer}");
+        let attn_prefix = format!("{prefix}.attn");
+        let ffn_prefix = format!("{prefix}.ffn");
+        let hc_count = (2 + config.hc_mult) * config.hc_mult;
+        let ratio = config.base_compress_ratio(layer).unwrap_or(0);
+        let mut specifications = vec![
+            (format!("{prefix}.hc_attn_base"), hc_count),
+            (format!("{prefix}.hc_attn_scale"), 3),
+            (format!("{prefix}.hc_ffn_base"), hc_count),
+            (format!("{prefix}.hc_ffn_scale"), 3),
+            (format!("{prefix}.attn_norm.weight"), config.hidden_size),
+            (format!("{prefix}.ffn_norm.weight"), config.hidden_size),
+            (
+                format!("{attn_prefix}.attn_sink"),
+                config.num_attention_heads,
+            ),
+            (format!("{attn_prefix}.q_norm.weight"), config.q_lora_rank),
+            (format!("{attn_prefix}.kv_norm.weight"), config.head_dim),
+        ];
+        if ratio > 0 {
+            specifications.push((
+                format!("{attn_prefix}.compressor.norm.weight"),
+                config.head_dim,
+            ));
+        }
+        if ratio == 4 {
+            specifications.push((
+                format!("{attn_prefix}.indexer.compressor.norm.weight"),
+                config.index_head_dim,
+            ));
+        }
+        if layer >= config.num_hash_layers {
+            specifications.push((format!("{ffn_prefix}.gate.bias"), config.n_routed_experts));
+        }
+        let references = specifications
+            .iter()
+            .map(|(name, length)| (name.as_str(), *length))
+            .collect::<Vec<_>>();
+        let mut values = load_reference_vectors(index, &references)?.into_iter();
+        let mut next = || {
+            Arc::<[f32]>::from(
+                values
+                    .next()
+                    .expect("each decoder vector specification has one payload"),
+            )
+        };
+        let attn_hc = HcVectorWeights {
+            base: next(),
+            scale: next(),
+        };
+        let ffn_hc = HcVectorWeights {
+            base: next(),
+            scale: next(),
+        };
+        let attn_norm = next();
+        let ffn_norm = next();
+        let sink = next();
+        let q_norm = next();
+        let kv_norm = next();
+        let compressor_norm = (ratio > 0).then(&mut next);
+        let indexer_compressor_norm = (ratio == 4).then(&mut next);
+        let correction_bias = (layer >= config.num_hash_layers).then(&mut next);
+        debug_assert!(values.next().is_none());
+        Ok(Self {
+            attn_hc,
+            ffn_hc,
+            attn_norm,
+            ffn_norm,
+            attention: AttentionVectorWeights {
+                sink,
+                q_norm,
+                kv_norm,
+                compressor_norm,
+                indexer_compressor_norm,
+            },
+            correction_bias,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HcWeights {
     function: WeightMatrix,
-    base: Vec<f32>,
-    scale: Vec<f32>,
+    base: Arc<[f32]>,
+    scale: Arc<[f32]>,
 }
 
 impl HcWeights {
@@ -555,6 +986,7 @@ impl HcWeights {
         config: &DeepseekV4Config,
         prefix: &str,
         sublayer: &str,
+        vectors: &HcVectorWeights,
     ) -> Result<Self, DeepseekRuntimeError> {
         let count = (2 + config.hc_mult) * config.hc_mult;
         Ok(Self {
@@ -564,8 +996,32 @@ impl HcWeights {
                 count,
                 config.hc_mult * config.hidden_size,
             )?,
-            base: load_reference_vector(index, &format!("{prefix}.hc_{sublayer}_base"), count)?,
-            scale: load_reference_vector(index, &format!("{prefix}.hc_{sublayer}_scale"), 3)?,
+            base: Arc::clone(&vectors.base),
+            scale: Arc::clone(&vectors.scale),
+        })
+    }
+
+    fn load_reusing(
+        index: &TensorIndex,
+        config: &DeepseekV4Config,
+        prefix: &str,
+        sublayer: &str,
+        vectors: &HcVectorWeights,
+        reuse: &mut DecoderLayerBuffers,
+        prevalidated: bool,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        let count = (2 + config.hc_mult) * config.hc_mult;
+        Ok(Self {
+            function: matrix_reusing(
+                index,
+                &format!("{prefix}.hc_{sublayer}_fn"),
+                count,
+                config.hc_mult * config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            base: Arc::clone(&vectors.base),
+            scale: Arc::clone(&vectors.scale),
         })
     }
 
@@ -616,41 +1072,158 @@ impl HcHeadWeights {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LayerTraceContext {
+    layer: usize,
+    position: usize,
+    token: usize,
+    batch_tokens: usize,
+}
+
+fn load_decoder_layer_reusing(
+    index: &TensorIndex,
+    config: &DeepseekV4Config,
+    trace: LayerTraceContext,
+    vectors: &DecoderLayerVectors,
+    reusable_layer: Option<DecoderLayerBuffers>,
+    prevalidated: bool,
+) -> Result<DecoderLayer, DeepseekRuntimeError> {
+    let mut profile = span(ProfileStage::DeepseekLayerLoad);
+    if trace.batch_tokens == 1 {
+        profile.set_token(trace.position, trace.token);
+    } else {
+        profile.set_token_position(trace.position);
+    }
+    profile.set_layer_id(trace.layer);
+    profile.set_flow_id(layer_flow_id(trace.position, trace.layer));
+    profile.set_batch_tokens(trace.batch_tokens);
+    match reusable_layer {
+        Some(mut buffers) => DecoderLayer::load_reusing(
+            index,
+            config,
+            trace.layer,
+            vectors,
+            &mut buffers,
+            prevalidated,
+        ),
+        None if prevalidated => DecoderLayer::load_reusing(
+            index,
+            config,
+            trace.layer,
+            vectors,
+            &mut DecoderLayerBuffers::default(),
+            true,
+        ),
+        None => DecoderLayer::load(index, config, trace.layer, vectors),
+    }
+}
+
 #[derive(Debug)]
 struct DecoderLayer {
     layer: usize,
     attn_hc: HcWeights,
     ffn_hc: HcWeights,
-    attn_norm: Vec<f32>,
-    ffn_norm: Vec<f32>,
+    attn_norm: Arc<[f32]>,
+    ffn_norm: Arc<[f32]>,
     attention: AttentionWeights,
     moe: MoeWeights,
 }
+
+struct PreparedDeepFeedForward {
+    residual: Vec<f32>,
+    normalized: Vec<f32>,
+    mix: HyperConnectionMix,
+    position: usize,
+    token: usize,
+    _layer_profile: ProfileSpan,
+}
+
+type DeepHiddenWithRoutes = (Vec<f32>, Vec<RouteChoice>);
+type DeepHiddenBatchWithRoutes = Vec<DeepHiddenWithRoutes>;
 
 impl DecoderLayer {
     fn load(
         index: &TensorIndex,
         config: &DeepseekV4Config,
         layer: usize,
+        vectors: &DecoderLayerVectors,
     ) -> Result<Self, DeepseekRuntimeError> {
         let prefix = format!("layers.{layer}");
         Ok(Self {
             layer,
-            attn_hc: HcWeights::load(index, config, &prefix, "attn")?,
-            ffn_hc: HcWeights::load(index, config, &prefix, "ffn")?,
-            attn_norm: load_reference_vector(
-                index,
-                &format!("{prefix}.attn_norm.weight"),
-                config.hidden_size,
-            )?,
-            ffn_norm: load_reference_vector(
-                index,
-                &format!("{prefix}.ffn_norm.weight"),
-                config.hidden_size,
-            )?,
-            attention: AttentionWeights::load(index, config, layer)?,
-            moe: MoeWeights::load(index, config, layer)?,
+            attn_hc: HcWeights::load(index, config, &prefix, "attn", &vectors.attn_hc)?,
+            ffn_hc: HcWeights::load(index, config, &prefix, "ffn", &vectors.ffn_hc)?,
+            attn_norm: Arc::clone(&vectors.attn_norm),
+            ffn_norm: Arc::clone(&vectors.ffn_norm),
+            attention: AttentionWeights::load(index, config, layer, &vectors.attention)?,
+            moe: MoeWeights::load(index, config, layer, vectors.correction_bias.as_ref())?,
         })
+    }
+
+    fn load_reusing(
+        index: &TensorIndex,
+        config: &DeepseekV4Config,
+        layer: usize,
+        vectors: &DecoderLayerVectors,
+        reuse: &mut DecoderLayerBuffers,
+        prevalidated: bool,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        let prefix = format!("layers.{layer}");
+        Ok(Self {
+            layer,
+            attn_hc: HcWeights::load_reusing(
+                index,
+                config,
+                &prefix,
+                "attn",
+                &vectors.attn_hc,
+                reuse,
+                prevalidated,
+            )?,
+            ffn_hc: HcWeights::load_reusing(
+                index,
+                config,
+                &prefix,
+                "ffn",
+                &vectors.ffn_hc,
+                reuse,
+                prevalidated,
+            )?,
+            attn_norm: Arc::clone(&vectors.attn_norm),
+            ffn_norm: Arc::clone(&vectors.ffn_norm),
+            attention: AttentionWeights::load_reusing(
+                index,
+                config,
+                layer,
+                &vectors.attention,
+                reuse,
+                prevalidated,
+            )?,
+            moe: MoeWeights::load_reusing(
+                index,
+                config,
+                layer,
+                vectors.correction_bias.as_ref(),
+                reuse,
+                prevalidated,
+            )?,
+        })
+    }
+
+    fn into_native_buffers(self) -> DecoderLayerBuffers {
+        let Self {
+            attn_hc,
+            ffn_hc,
+            attention,
+            moe,
+            ..
+        } = self;
+        let mut buffers = DecoderLayerBuffers::default();
+        buffers.push_weight(attn_hc.function);
+        buffers.push_weight(ffn_hc.function);
+        attention.append_native_buffers(&mut buffers);
+        moe.append_native_buffers(&mut buffers);
+        buffers
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -697,16 +1270,276 @@ impl DecoderLayer {
             routes,
         ))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_feed_forward(
+        &self,
+        hidden: Vec<f32>,
+        token: usize,
+        position: usize,
+        attention_state: &mut AttentionState,
+        config: &DeepseekV4Config,
+        flow_id: u64,
+    ) -> Result<PreparedDeepFeedForward, DeepseekRuntimeError> {
+        let mut layer_profile = span(ProfileStage::DeepseekLayer);
+        layer_profile.set_token(position, token);
+        layer_profile.set_layer_id(self.layer);
+        layer_profile.set_flow_id(flow_id);
+        let (collapsed, attention_mix) = self.attn_hc.pre(&hidden, config)?;
+        let normalized = bf16_rms_norm(&collapsed, &self.attn_norm, config.rms_norm_eps as f32)?;
+        let branch = {
+            let mut profile = span(ProfileStage::DeepseekAttention);
+            profile.set_token(position, token);
+            profile.set_layer_id(self.layer);
+            profile.set_flow_id(flow_id);
+            self.attention
+                .forward(&normalized, position, attention_state, config)?
+        };
+        let residual = hyper_connection_post(&branch, &hidden, config.hidden_size, &attention_mix)?;
+        let (collapsed, mix) = self.ffn_hc.pre(&residual, config)?;
+        let normalized = bf16_rms_norm(&collapsed, &self.ffn_norm, config.rms_norm_eps as f32)?;
+        Ok(PreparedDeepFeedForward {
+            residual,
+            normalized,
+            mix,
+            position,
+            token,
+            _layer_profile: layer_profile,
+        })
+    }
+
+    fn prepare_feed_forward_batch(
+        &self,
+        inputs: Vec<Vec<f32>>,
+        tokens: &[usize],
+        start_position: usize,
+        attention_state: &mut AttentionState,
+        config: &DeepseekV4Config,
+        flow_id: u64,
+    ) -> Result<Vec<PreparedDeepFeedForward>, DeepseekRuntimeError> {
+        if inputs.is_empty() || inputs.len() != tokens.len() {
+            return Err(DeepseekRuntimeError::Invalid(
+                "layer prefill batch has invalid token geometry".to_owned(),
+            ));
+        }
+        if inputs.len() == 1 {
+            return Ok(vec![self.prepare_feed_forward(
+                inputs.into_iter().next().expect("one checked input"),
+                tokens[0],
+                start_position,
+                attention_state,
+                config,
+                flow_id,
+            )?]);
+        }
+
+        let mut intermediates = Vec::with_capacity(inputs.len());
+        let mut normalized_inputs = Vec::with_capacity(inputs.len());
+        for (offset, (hidden, &token)) in inputs.into_iter().zip(tokens).enumerate() {
+            let position = start_position + offset;
+            let mut layer_profile = span(ProfileStage::DeepseekLayer);
+            layer_profile.set_token(position, token);
+            layer_profile.set_layer_id(self.layer);
+            layer_profile.set_flow_id(flow_id);
+            let (collapsed, attention_mix) = self.attn_hc.pre(&hidden, config)?;
+            normalized_inputs.push(bf16_rms_norm(
+                &collapsed,
+                &self.attn_norm,
+                config.rms_norm_eps as f32,
+            )?);
+            intermediates.push((hidden, attention_mix, layer_profile));
+        }
+
+        let attention_inputs = normalized_inputs
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let branches = {
+            let mut profile = span(ProfileStage::DeepseekAttention);
+            profile.set_token(start_position, tokens[0]);
+            profile.set_layer_id(self.layer);
+            profile.set_flow_id(flow_id);
+            profile.set_batch_tokens(tokens.len());
+            let projected = self.attention.prepare_batch(&attention_inputs, config)?;
+            let attention_output = projected
+                .into_iter()
+                .enumerate()
+                .map(|(offset, projected)| {
+                    self.attention.forward_prepared_attention(
+                        projected,
+                        start_position + offset,
+                        attention_state,
+                        config,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let low_rank = self
+                .attention
+                .project_low_rank_batch(&attention_output, config)?;
+            self.attention.project_output_batch(&low_rank, config)?
+        };
+
+        intermediates
+            .into_iter()
+            .zip(branches)
+            .zip(tokens)
+            .enumerate()
+            .map(
+                |(offset, (((hidden, attention_mix, layer_profile), branch), &token))| {
+                    let residual = hyper_connection_post(
+                        &branch,
+                        &hidden,
+                        config.hidden_size,
+                        &attention_mix,
+                    )?;
+                    let (collapsed, mix) = self.ffn_hc.pre(&residual, config)?;
+                    let normalized =
+                        bf16_rms_norm(&collapsed, &self.ffn_norm, config.rms_norm_eps as f32)?;
+                    Ok(PreparedDeepFeedForward {
+                        residual,
+                        normalized,
+                        mix,
+                        position: start_position + offset,
+                        token,
+                        _layer_profile: layer_profile,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    fn finish_feed_forward(
+        &self,
+        prepared: PreparedDeepFeedForward,
+        experts: &mut DeepExpertStore,
+        config: &DeepseekV4Config,
+        flow_id: u64,
+    ) -> Result<(Vec<f32>, Vec<RouteChoice>), DeepseekRuntimeError> {
+        let branch = {
+            let mut profile = span(ProfileStage::DeepseekMoe);
+            profile.set_token(prepared.position, prepared.token);
+            profile.set_layer_id(self.layer);
+            profile.set_flow_id(flow_id);
+            self.moe.forward(
+                &prepared.normalized,
+                prepared.token,
+                prepared.position,
+                flow_id,
+                experts,
+                config,
+            )?
+        };
+        Ok((
+            hyper_connection_post(
+                &branch.0,
+                &prepared.residual,
+                config.hidden_size,
+                &prepared.mix,
+            )?,
+            branch.1,
+        ))
+    }
+
+    fn finish_feed_forward_batch(
+        &self,
+        prepared: Vec<PreparedDeepFeedForward>,
+        experts: &mut DeepExpertStore,
+        config: &DeepseekV4Config,
+        flow_id: u64,
+    ) -> Result<DeepHiddenBatchWithRoutes, DeepseekRuntimeError> {
+        if prepared.len() < 2 {
+            return prepared
+                .into_iter()
+                .map(|prepared| self.finish_feed_forward(prepared, experts, config, flow_id))
+                .collect();
+        }
+        let inputs = prepared
+            .iter()
+            .map(|prepared| prepared.normalized.as_slice())
+            .collect::<Vec<_>>();
+        let tokens = prepared
+            .iter()
+            .map(|prepared| prepared.token)
+            .collect::<Vec<_>>();
+        let positions = prepared
+            .iter()
+            .map(|prepared| prepared.position)
+            .collect::<Vec<_>>();
+        let batched = {
+            let mut profile = span(ProfileStage::DeepseekMoe);
+            profile.set_token_position(positions[0]);
+            profile.set_layer_id(self.layer);
+            profile.set_flow_id(flow_id);
+            profile.set_batch_tokens(prepared.len());
+            self.moe
+                .forward_batch(&inputs, &tokens, &positions, flow_id, experts, config)?
+        };
+        let branches = match batched {
+            DeepBatchForward::Batched(branches) => branches,
+            DeepBatchForward::Fallback(routes_by_token) => {
+                if routes_by_token.len() != prepared.len() {
+                    return Err(DeepseekRuntimeError::Invalid(
+                        "MoE fallback route batch length changed".to_owned(),
+                    ));
+                }
+                return prepared
+                    .into_iter()
+                    .zip(routes_by_token)
+                    .map(|(prepared, routes)| {
+                        let branch = {
+                            let mut profile = span(ProfileStage::DeepseekMoe);
+                            profile.set_token(prepared.position, prepared.token);
+                            profile.set_layer_id(self.layer);
+                            profile.set_flow_id(flow_id);
+                            self.moe.forward_prepared(
+                                &prepared.normalized,
+                                prepared.token,
+                                prepared.position,
+                                flow_id,
+                                routes,
+                                experts,
+                                config,
+                            )?
+                        };
+                        Ok((
+                            hyper_connection_post(
+                                &branch.0,
+                                &prepared.residual,
+                                config.hidden_size,
+                                &prepared.mix,
+                            )?,
+                            branch.1,
+                        ))
+                    })
+                    .collect();
+            }
+        };
+        prepared
+            .into_iter()
+            .zip(branches)
+            .map(|(prepared, (branch, routes))| {
+                Ok((
+                    hyper_connection_post(
+                        &branch,
+                        &prepared.residual,
+                        config.hidden_size,
+                        &prepared.mix,
+                    )?,
+                    routes,
+                ))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
 struct AttentionWeights {
-    sink: Vec<f32>,
+    sink: Arc<[f32]>,
     wq_a: WeightMatrix,
-    q_norm: Vec<f32>,
+    q_norm: Arc<[f32]>,
     wq_b: WeightMatrix,
     wkv: WeightMatrix,
-    kv_norm: Vec<f32>,
+    kv_norm: Arc<[f32]>,
     wo_a: WeightMatrix,
     wo_b: WeightMatrix,
     compressor: Option<CompressorWeights>,
@@ -714,11 +1547,19 @@ struct AttentionWeights {
     ratio: usize,
 }
 
+struct PreparedAttention {
+    query: Vec<f32>,
+    local_kv: Vec<f32>,
+    compressor: Option<PreparedCompressor>,
+    indexer: Option<PreparedIndexer>,
+}
+
 impl AttentionWeights {
     fn load(
         index: &TensorIndex,
         config: &DeepseekV4Config,
         layer: usize,
+        vectors: &AttentionVectorWeights,
     ) -> Result<Self, DeepseekRuntimeError> {
         let prefix = format!("layers.{layer}.attn");
         let ratio = config.base_compress_ratio(layer).unwrap_or(0);
@@ -731,29 +1572,35 @@ impl AttentionWeights {
                     ratio,
                     config.head_dim,
                     false,
+                    vectors
+                        .compressor_norm
+                        .as_ref()
+                        .expect("compressed attention has a resident norm"),
                 )
             })
             .transpose()?;
         let indexer = (ratio == 4)
-            .then(|| IndexerWeights::load(index, config, &format!("{prefix}.indexer")))
+            .then(|| {
+                IndexerWeights::load(
+                    index,
+                    config,
+                    &format!("{prefix}.indexer"),
+                    vectors
+                        .indexer_compressor_norm
+                        .as_ref()
+                        .expect("ratio-4 attention has a resident indexer norm"),
+                )
+            })
             .transpose()?;
         Ok(Self {
-            sink: load_reference_vector(
-                index,
-                &format!("{prefix}.attn_sink"),
-                config.num_attention_heads,
-            )?,
+            sink: Arc::clone(&vectors.sink),
             wq_a: matrix(
                 index,
                 &format!("{prefix}.wq_a.weight"),
                 config.q_lora_rank,
                 config.hidden_size,
             )?,
-            q_norm: load_reference_vector(
-                index,
-                &format!("{prefix}.q_norm.weight"),
-                config.q_lora_rank,
-            )?,
+            q_norm: Arc::clone(&vectors.q_norm),
             wq_b: matrix(
                 index,
                 &format!("{prefix}.wq_b.weight"),
@@ -766,11 +1613,7 @@ impl AttentionWeights {
                 config.head_dim,
                 config.hidden_size,
             )?,
-            kv_norm: load_reference_vector(
-                index,
-                &format!("{prefix}.kv_norm.weight"),
-                config.head_dim,
-            )?,
+            kv_norm: Arc::clone(&vectors.kv_norm),
             wo_a: matrix(
                 index,
                 &format!("{prefix}.wo_a.weight"),
@@ -789,9 +1632,227 @@ impl AttentionWeights {
         })
     }
 
+    fn load_reusing(
+        index: &TensorIndex,
+        config: &DeepseekV4Config,
+        layer: usize,
+        vectors: &AttentionVectorWeights,
+        reuse: &mut DecoderLayerBuffers,
+        prevalidated: bool,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        let prefix = format!("layers.{layer}.attn");
+        let ratio = config.base_compress_ratio(layer).unwrap_or(0);
+        let compressor = (ratio > 0)
+            .then(|| {
+                load_compressor_reusing(
+                    index,
+                    config,
+                    &format!("{prefix}.compressor"),
+                    ratio,
+                    config.head_dim,
+                    false,
+                    vectors
+                        .compressor_norm
+                        .as_ref()
+                        .expect("compressed attention has a resident norm"),
+                    reuse,
+                    prevalidated,
+                )
+            })
+            .transpose()?;
+        let indexer = (ratio == 4)
+            .then(|| {
+                IndexerWeights::load_reusing(
+                    index,
+                    config,
+                    &format!("{prefix}.indexer"),
+                    vectors
+                        .indexer_compressor_norm
+                        .as_ref()
+                        .expect("ratio-4 attention has a resident indexer norm"),
+                    reuse,
+                    prevalidated,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            sink: Arc::clone(&vectors.sink),
+            wq_a: matrix_reusing(
+                index,
+                &format!("{prefix}.wq_a.weight"),
+                config.q_lora_rank,
+                config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            q_norm: Arc::clone(&vectors.q_norm),
+            wq_b: matrix_reusing(
+                index,
+                &format!("{prefix}.wq_b.weight"),
+                config.num_attention_heads * config.head_dim,
+                config.q_lora_rank,
+                reuse,
+                prevalidated,
+            )?,
+            wkv: matrix_reusing(
+                index,
+                &format!("{prefix}.wkv.weight"),
+                config.head_dim,
+                config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            kv_norm: Arc::clone(&vectors.kv_norm),
+            wo_a: matrix_reusing(
+                index,
+                &format!("{prefix}.wo_a.weight"),
+                config.o_groups * config.o_lora_rank,
+                config.num_attention_heads * config.head_dim / config.o_groups,
+                reuse,
+                prevalidated,
+            )?,
+            wo_b: matrix_reusing(
+                index,
+                &format!("{prefix}.wo_b.weight"),
+                config.hidden_size,
+                config.o_groups * config.o_lora_rank,
+                reuse,
+                prevalidated,
+            )?,
+            compressor,
+            indexer,
+            ratio,
+        })
+    }
+
+    fn append_native_buffers(self, buffers: &mut DecoderLayerBuffers) {
+        let Self {
+            wq_a,
+            wq_b,
+            wkv,
+            wo_a,
+            wo_b,
+            compressor,
+            indexer,
+            ..
+        } = self;
+        for weight in [wq_a, wq_b, wkv, wo_a, wo_b] {
+            buffers.push_weight(weight);
+        }
+        if let Some(compressor) = compressor {
+            for weight in compressor.into_weight_matrices() {
+                buffers.push_weight(weight);
+            }
+        }
+        if let Some(indexer) = indexer {
+            indexer.append_native_buffers(buffers);
+        }
+    }
+
     fn forward(
         &self,
         input: &[f32],
+        position: usize,
+        state: &mut AttentionState,
+        config: &DeepseekV4Config,
+    ) -> Result<Vec<f32>, DeepseekRuntimeError> {
+        let prepared = self
+            .prepare_batch(&[input], config)?
+            .pop()
+            .expect("one attention input produces one prepared projection");
+        let attention_output =
+            self.forward_prepared_attention(prepared, position, state, config)?;
+        let low_rank = self
+            .project_low_rank_batch(&[attention_output], config)?
+            .pop()
+            .expect("one attention output produces one low-rank projection");
+        Ok(linear(&self.wo_b, &low_rank)?)
+    }
+
+    fn prepare_batch(
+        &self,
+        inputs: &[&[f32]],
+        config: &DeepseekV4Config,
+    ) -> Result<Vec<PreparedAttention>, DeepseekRuntimeError> {
+        if inputs.is_empty() || inputs.iter().any(|input| input.len() != config.hidden_size) {
+            return Err(DeepseekRuntimeError::Invalid(
+                "attention projection batch has invalid input geometry".to_owned(),
+            ));
+        }
+        let batch = inputs.len();
+        let mut input = Vec::with_capacity(batch.saturating_mul(config.hidden_size));
+        let uses_input_mx = self.wq_a.uses_mx_activation_quantization()
+            || self.wkv.uses_mx_activation_quantization();
+        let mut mx_input = Vec::with_capacity(if uses_input_mx { input.capacity() } else { 0 });
+        for &token in inputs {
+            input.extend_from_slice(token);
+            if uses_input_mx {
+                mx_input.extend(prepare_mx_activation(token)?);
+            }
+        }
+
+        let projected_qr = linear_with_mx_activation_batch(&self.wq_a, &input, &mx_input, batch)?;
+        let projected_kv = linear_with_mx_activation_batch(&self.wkv, &input, &mx_input, batch)?;
+        let mut normalized_qr = Vec::with_capacity(projected_qr.len());
+        for qr in projected_qr.chunks_exact(config.q_lora_rank) {
+            normalized_qr.extend(bf16_rms_norm(qr, &self.q_norm, config.rms_norm_eps as f32)?);
+        }
+        let uses_qr_mx = self.wq_b.uses_mx_activation_quantization();
+        let mut mx_qr = Vec::with_capacity(if uses_qr_mx {
+            normalized_qr.capacity()
+        } else {
+            0
+        });
+        if uses_qr_mx {
+            for qr in normalized_qr.chunks_exact(config.q_lora_rank) {
+                mx_qr.extend(prepare_mx_activation(qr)?);
+            }
+        }
+        let mut projected_query =
+            linear_with_mx_activation_batch(&self.wq_b, &normalized_qr, &mx_qr, batch)?;
+        for query in projected_query.chunks_exact_mut(config.num_attention_heads * config.head_dim)
+        {
+            unit_rms_norm_in_place(query, config.head_dim, config.rms_norm_eps as f32)?;
+        }
+
+        let mut compressor = self
+            .compressor
+            .as_ref()
+            .map(|compressor| compressor.prepare_batch(inputs))
+            .transpose()?
+            .map(Vec::into_iter);
+        let qr_inputs = normalized_qr
+            .chunks_exact(config.q_lora_rank)
+            .collect::<Vec<_>>();
+        let mut indexer = self
+            .indexer
+            .as_ref()
+            .map(|indexer| indexer.prepare_batch(inputs, &qr_inputs, config))
+            .transpose()?
+            .map(Vec::into_iter);
+
+        normalized_qr
+            .chunks_exact(config.q_lora_rank)
+            .zip(projected_query.chunks_exact(config.num_attention_heads * config.head_dim))
+            .zip(projected_kv.chunks_exact(config.head_dim))
+            .map(|((_qr, query), local_kv)| {
+                Ok(PreparedAttention {
+                    query: query.to_vec(),
+                    local_kv: bf16_rms_norm(local_kv, &self.kv_norm, config.rms_norm_eps as f32)?,
+                    compressor: compressor
+                        .as_mut()
+                        .map(|prepared| prepared.next().expect("aligned compressor batch")),
+                    indexer: indexer
+                        .as_mut()
+                        .map(|prepared| prepared.next().expect("aligned indexer batch")),
+                })
+            })
+            .collect()
+    }
+
+    fn forward_prepared_attention(
+        &self,
+        prepared: PreparedAttention,
         position: usize,
         state: &mut AttentionState,
         config: &DeepseekV4Config,
@@ -801,6 +1862,12 @@ impl AttentionWeights {
                 "attention state position/ratio mismatch".to_owned(),
             ));
         }
+        let PreparedAttention {
+            mut query,
+            mut local_kv,
+            compressor,
+            indexer,
+        } = prepared;
         let rope_original =
             (self.ratio > 0).then_some(config.rope_scaling.original_max_position_embeddings);
         let rope_base = if self.ratio > 0 {
@@ -813,10 +1880,6 @@ impl AttentionWeights {
         } else {
             1.0
         };
-        let mut qr = linear(&self.wq_a, input)?;
-        qr = bf16_rms_norm(&qr, &self.q_norm, config.rms_norm_eps as f32)?;
-        let mut query = linear(&self.wq_b, &qr)?;
-        unit_rms_norm_in_place(&mut query, config.head_dim, config.rms_norm_eps as f32)?;
         for head in query.chunks_mut(config.head_dim) {
             paired_rope(
                 &mut head[config.head_dim - config.qk_rope_head_dim..],
@@ -829,9 +1892,6 @@ impl AttentionWeights {
                 false,
             )?;
         }
-
-        let mut local_kv = linear(&self.wkv, input)?;
-        local_kv = bf16_rms_norm(&local_kv, &self.kv_norm, config.rms_norm_eps as f32)?;
         paired_rope(
             &mut local_kv[config.head_dim - config.qk_rope_head_dim..],
             position,
@@ -850,25 +1910,36 @@ impl AttentionWeights {
         }
         state.local[position % config.sliding_window] = Some(local_kv);
 
-        let compressed_selection =
-            if let (Some(indexer), Some(indexer_state)) = (&self.indexer, &mut state.indexer) {
-                indexer.forward(input, &qr, position, indexer_state, config)?
-            } else {
-                Vec::new()
-            };
-        if let (Some(compressor), Some(compressor_state)) =
-            (&self.compressor, &mut state.compressor)
-        {
-            let _ = compressor.forward_token(
-                input,
-                position,
-                compressor_state,
-                rope_base,
-                rope_original,
-                factor,
-                config.rope_scaling.beta_fast,
-                config.rope_scaling.beta_slow,
-            )?;
+        let compressed_selection = match (&self.indexer, &mut state.indexer, indexer) {
+            (Some(indexer), Some(indexer_state), Some(prepared)) => {
+                indexer.forward_prepared(prepared, position, indexer_state, config)?
+            }
+            (None, None, None) => Vec::new(),
+            _ => {
+                return Err(DeepseekRuntimeError::Invalid(
+                    "indexer weights, state, and prepared projection disagree".to_owned(),
+                ));
+            }
+        };
+        match (&self.compressor, &mut state.compressor, compressor) {
+            (Some(compressor), Some(compressor_state), Some(prepared)) => {
+                let _ = compressor.forward_prepared(
+                    prepared,
+                    position,
+                    compressor_state,
+                    rope_base,
+                    rope_original,
+                    factor,
+                    config.rope_scaling.beta_fast,
+                    config.rope_scaling.beta_slow,
+                )?;
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(DeepseekRuntimeError::Invalid(
+                    "compressor weights, state, and prepared projection disagree".to_owned(),
+                ));
+            }
         }
 
         let mut selected = window_indices(position, config.sliding_window);
@@ -878,13 +1949,14 @@ impl AttentionWeights {
             let count = (position + 1) / self.ratio;
             selected.extend((0..count).map(|index| config.sliding_window + index));
         }
+        let zero = vec![0.0; config.head_dim];
         let mut cache = state
             .local
             .iter()
-            .map(|entry| entry.clone().unwrap_or_else(|| vec![0.0; config.head_dim]))
+            .map(|entry| entry.as_deref().unwrap_or(&zero))
             .collect::<Vec<_>>();
         if let Some(compressor) = &state.compressor {
-            cache.extend(compressor.compressed().iter().cloned());
+            cache.extend(compressor.compressed().iter().map(Vec::as_slice));
         }
         let mut output = sparse_attention_with_sink(
             &query,
@@ -907,22 +1979,85 @@ impl AttentionWeights {
                 true,
             )?;
         }
+        state.next_position += 1;
+        Ok(output)
+    }
+
+    fn project_low_rank_batch(
+        &self,
+        attention_output: &[Vec<f32>],
+        config: &DeepseekV4Config,
+    ) -> Result<Vec<Vec<f32>>, DeepseekRuntimeError> {
+        let attention_width = config.num_attention_heads * config.head_dim;
+        if attention_output.is_empty()
+            || attention_output
+                .iter()
+                .any(|output| output.len() != attention_width)
+        {
+            return Err(DeepseekRuntimeError::Invalid(
+                "attention output batch has invalid head geometry".to_owned(),
+            ));
+        }
+        let batch = attention_output.len();
         let heads_per_group = config.num_attention_heads / config.o_groups;
         let group_width = heads_per_group * config.head_dim;
-        let mut low_rank = Vec::with_capacity(config.o_groups * config.o_lora_rank);
+        let mut low_rank = (0..batch)
+            .map(|_| Vec::with_capacity(config.o_groups * config.o_lora_rank))
+            .collect::<Vec<_>>();
         for group in 0..config.o_groups {
+            let mut input = Vec::with_capacity(batch.saturating_mul(group_width));
+            for output in attention_output {
+                input.extend_from_slice(&output[group * group_width..(group + 1) * group_width]);
+            }
             // The official reference explicitly dequantizes `wo_a` and applies this grouped
             // einsum without activation-side FP8 simulation.
-            let mut group_output = self.wo_a.matvec_rows(
+            let mut projected = self.wo_a.matmul_row_range(
                 group * config.o_lora_rank,
                 config.o_lora_rank,
-                &output[group * group_width..(group + 1) * group_width],
+                &input,
+                batch,
             )?;
-            round_to_bf16_in_place(&mut group_output)?;
-            low_rank.extend(group_output);
+            round_to_bf16_in_place(&mut projected)?;
+            for (token, values) in low_rank
+                .iter_mut()
+                .zip(projected.chunks_exact(config.o_lora_rank))
+            {
+                token.extend_from_slice(values);
+            }
         }
-        state.next_position += 1;
-        Ok(linear(&self.wo_b, &low_rank)?)
+        Ok(low_rank)
+    }
+
+    fn project_output_batch(
+        &self,
+        low_rank: &[Vec<f32>],
+        config: &DeepseekV4Config,
+    ) -> Result<Vec<Vec<f32>>, DeepseekRuntimeError> {
+        if low_rank.is_empty() || low_rank.iter().any(|input| input.len() != self.wo_b.cols()) {
+            return Err(DeepseekRuntimeError::Invalid(
+                "attention output batch has invalid low-rank geometry".to_owned(),
+            ));
+        }
+        let batch = low_rank.len();
+        let mut input = Vec::with_capacity(batch.saturating_mul(self.wo_b.cols()));
+        let uses_mx = self.wo_b.uses_mx_activation_quantization();
+        let mut mx_input = Vec::with_capacity(if uses_mx { input.capacity() } else { 0 });
+        for token in low_rank {
+            input.extend_from_slice(token);
+            if uses_mx {
+                mx_input.extend(prepare_mx_activation(token)?);
+            }
+        }
+        let output = linear_with_mx_activation_batch(&self.wo_b, &input, &mx_input, batch)?;
+        if output.len() != batch.saturating_mul(config.hidden_size) {
+            return Err(DeepseekRuntimeError::Invalid(
+                "attention output batch returned invalid geometry".to_owned(),
+            ));
+        }
+        Ok(output
+            .chunks_exact(config.hidden_size)
+            .map(<[f32]>::to_vec)
+            .collect())
     }
 }
 
@@ -933,6 +2068,15 @@ struct AttentionState {
     local: Vec<Option<Vec<f32>>>,
     compressor: Option<CompressorState>,
     indexer: Option<CompressorState>,
+}
+
+#[derive(Debug)]
+struct AttentionStateCheckpoint {
+    next_position: usize,
+    local_slot: usize,
+    previous_local: Option<Vec<f32>>,
+    compressor: Option<CompressorCheckpoint>,
+    indexer: Option<CompressorCheckpoint>,
 }
 
 impl AttentionState {
@@ -967,6 +2111,28 @@ impl AttentionState {
                 .map(CompressorState::stored_f32_elements)
                 .unwrap_or(0)
     }
+
+    fn checkpoint_next_token(&mut self) -> AttentionStateCheckpoint {
+        let local_slot = self.next_position % self.local.len();
+        AttentionStateCheckpoint {
+            next_position: self.next_position,
+            local_slot,
+            previous_local: self.local[local_slot].take(),
+            compressor: self.compressor.as_ref().map(CompressorState::checkpoint),
+            indexer: self.indexer.as_ref().map(CompressorState::checkpoint),
+        }
+    }
+
+    fn restore(&mut self, checkpoint: AttentionStateCheckpoint) {
+        self.next_position = checkpoint.next_position;
+        self.local[checkpoint.local_slot] = checkpoint.previous_local;
+        if let (Some(state), Some(checkpoint)) = (&mut self.compressor, checkpoint.compressor) {
+            state.restore(checkpoint);
+        }
+        if let (Some(state), Some(checkpoint)) = (&mut self.indexer, checkpoint.indexer) {
+            state.restore(checkpoint);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -976,11 +2142,18 @@ struct IndexerWeights {
     compressor: CompressorWeights,
 }
 
+struct PreparedIndexer {
+    query: Vec<f32>,
+    weights: Vec<f32>,
+    compressor: PreparedCompressor,
+}
+
 impl IndexerWeights {
     fn load(
         index: &TensorIndex,
         config: &DeepseekV4Config,
         prefix: &str,
+        compressor_norm: &Arc<[f32]>,
     ) -> Result<Self, DeepseekRuntimeError> {
         Ok(Self {
             wq_b: matrix(
@@ -1002,19 +2175,129 @@ impl IndexerWeights {
                 4,
                 config.index_head_dim,
                 true,
+                compressor_norm,
             )?,
         })
     }
 
-    fn forward(
+    fn load_reusing(
+        index: &TensorIndex,
+        config: &DeepseekV4Config,
+        prefix: &str,
+        compressor_norm: &Arc<[f32]>,
+        reuse: &mut DecoderLayerBuffers,
+        prevalidated: bool,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        Ok(Self {
+            wq_b: matrix_reusing(
+                index,
+                &format!("{prefix}.wq_b.weight"),
+                config.index_n_heads * config.index_head_dim,
+                config.q_lora_rank,
+                reuse,
+                prevalidated,
+            )?,
+            weights_proj: matrix_reusing(
+                index,
+                &format!("{prefix}.weights_proj.weight"),
+                config.index_n_heads,
+                config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            compressor: load_compressor_reusing(
+                index,
+                config,
+                &format!("{prefix}.compressor"),
+                4,
+                config.index_head_dim,
+                true,
+                compressor_norm,
+                reuse,
+                prevalidated,
+            )?,
+        })
+    }
+
+    fn append_native_buffers(self, buffers: &mut DecoderLayerBuffers) {
+        buffers.push_weight(self.wq_b);
+        buffers.push_weight(self.weights_proj);
+        for weight in self.compressor.into_weight_matrices() {
+            buffers.push_weight(weight);
+        }
+    }
+
+    fn prepare_batch(
         &self,
-        input: &[f32],
-        qr: &[f32],
+        inputs: &[&[f32]],
+        qrs: &[&[f32]],
+        config: &DeepseekV4Config,
+    ) -> Result<Vec<PreparedIndexer>, DeepseekRuntimeError> {
+        if inputs.is_empty()
+            || inputs.len() != qrs.len()
+            || inputs.iter().any(|input| input.len() != config.hidden_size)
+            || qrs.iter().any(|qr| qr.len() != config.q_lora_rank)
+        {
+            return Err(DeepseekRuntimeError::Invalid(
+                "indexer projection batch has invalid input geometry".to_owned(),
+            ));
+        }
+        let batch = inputs.len();
+        let mut input = Vec::with_capacity(batch.saturating_mul(config.hidden_size));
+        let input_uses_mx = self.weights_proj.uses_mx_activation_quantization();
+        let mut mx_input = Vec::with_capacity(if input_uses_mx { input.capacity() } else { 0 });
+        for &token in inputs {
+            input.extend_from_slice(token);
+            if input_uses_mx {
+                mx_input.extend(prepare_mx_activation(token)?);
+            }
+        }
+        let mut qr = Vec::with_capacity(batch.saturating_mul(config.q_lora_rank));
+        let qr_uses_mx = self.wq_b.uses_mx_activation_quantization();
+        let mut mx_qr = Vec::with_capacity(if qr_uses_mx { qr.capacity() } else { 0 });
+        for &token in qrs {
+            qr.extend_from_slice(token);
+            if qr_uses_mx {
+                mx_qr.extend(prepare_mx_activation(token)?);
+            }
+        }
+        let query = linear_with_mx_activation_batch(&self.wq_b, &qr, &mx_qr, batch)?;
+        let mut weights =
+            linear_with_mx_activation_batch(&self.weights_proj, &input, &mx_input, batch)?;
+        let weight_scale = (config.index_head_dim as f32).sqrt().recip()
+            * (config.index_n_heads as f32).sqrt().recip();
+        for token in weights.chunks_exact_mut(config.index_n_heads) {
+            round_to_bf16_in_place(token)?;
+            for value in token.iter_mut() {
+                *value *= weight_scale;
+            }
+            round_to_bf16_in_place(token)?;
+        }
+        let compressor = self.compressor.prepare_batch(inputs)?;
+        Ok(query
+            .chunks_exact(config.index_n_heads * config.index_head_dim)
+            .zip(weights.chunks_exact(config.index_n_heads))
+            .zip(compressor)
+            .map(|((query, weights), compressor)| PreparedIndexer {
+                query: query.to_vec(),
+                weights: weights.to_vec(),
+                compressor,
+            })
+            .collect())
+    }
+
+    fn forward_prepared(
+        &self,
+        prepared: PreparedIndexer,
         position: usize,
         state: &mut CompressorState,
         config: &DeepseekV4Config,
     ) -> Result<Vec<usize>, DeepseekRuntimeError> {
-        let mut query = linear(&self.wq_b, qr)?;
+        let PreparedIndexer {
+            mut query,
+            weights,
+            compressor,
+        } = prepared;
         for head in query.chunks_mut(config.index_head_dim) {
             paired_rope(
                 &mut head[config.index_head_dim - config.qk_rope_head_dim..],
@@ -1033,8 +2316,8 @@ impl IndexerWeights {
                 .map_err(|error| DeepseekRuntimeError::Invalid(error.to_string()))?;
             head.copy_from_slice(&quantized);
         }
-        let _ = self.compressor.forward_token(
-            input,
+        let _ = self.compressor.forward_prepared(
+            compressor,
             position,
             state,
             config.compress_rope_theta as f32,
@@ -1043,14 +2326,6 @@ impl IndexerWeights {
             config.rope_scaling.beta_fast,
             config.rope_scaling.beta_slow,
         )?;
-        let weight_scale = (config.index_head_dim as f32).sqrt().recip()
-            * (config.index_n_heads as f32).sqrt().recip();
-        let mut weights = linear(&self.weights_proj, input)?;
-        round_to_bf16_in_place(&mut weights)?;
-        for value in &mut weights {
-            *value *= weight_scale;
-        }
-        round_to_bf16_in_place(&mut weights)?;
         let mut scores = Vec::with_capacity(state.compressed().len());
         for key in state.compressed() {
             let mut score = 0.0f32;
@@ -1080,8 +2355,20 @@ impl IndexerWeights {
 struct MoeWeights {
     layer: usize,
     router: WeightMatrix,
-    correction_bias: Option<Vec<f32>>,
+    correction_bias: Option<Arc<[f32]>>,
     shared: DeepExpert,
+}
+
+struct PreparedDeepRoutes {
+    routes: Vec<RouteChoice>,
+    execution_order: Vec<(usize, f32)>,
+    expert_ids: Vec<usize>,
+    mx_input: Vec<f32>,
+}
+
+enum DeepBatchForward {
+    Batched(DeepHiddenBatchWithRoutes),
+    Fallback(Vec<PreparedDeepRoutes>),
 }
 
 impl MoeWeights {
@@ -1089,6 +2376,7 @@ impl MoeWeights {
         index: &TensorIndex,
         config: &DeepseekV4Config,
         layer: usize,
+        correction_bias: Option<&Arc<[f32]>>,
     ) -> Result<Self, DeepseekRuntimeError> {
         let prefix = format!("layers.{layer}.ffn");
         Ok(Self {
@@ -1099,18 +2387,45 @@ impl MoeWeights {
                 config.n_routed_experts,
                 config.hidden_size,
             )?,
-            correction_bias: (layer >= config.num_hash_layers)
-                .then(|| {
-                    load_reference_vector(
-                        index,
-                        &format!("{prefix}.gate.bias"),
-                        config.n_routed_experts,
-                    )
-                })
-                .transpose()?,
+            correction_bias: correction_bias.map(Arc::clone),
             shared: DeepExpert::load(index, &format!("{prefix}.shared_experts"), config, u64::MAX)?
                 .0,
         })
+    }
+
+    fn load_reusing(
+        index: &TensorIndex,
+        config: &DeepseekV4Config,
+        layer: usize,
+        correction_bias: Option<&Arc<[f32]>>,
+        reuse: &mut DecoderLayerBuffers,
+        prevalidated: bool,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        let prefix = format!("layers.{layer}.ffn");
+        Ok(Self {
+            layer,
+            router: matrix_reusing(
+                index,
+                &format!("{prefix}.gate.weight"),
+                config.n_routed_experts,
+                config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            correction_bias: correction_bias.map(Arc::clone),
+            shared: DeepExpert::load_layer_reusing(
+                index,
+                &format!("{prefix}.shared_experts"),
+                config,
+                reuse,
+                prevalidated,
+            )?,
+        })
+    }
+
+    fn append_native_buffers(self, buffers: &mut DecoderLayerBuffers) {
+        buffers.push_weight(self.router);
+        self.shared.append_native_buffers(buffers);
     }
 
     fn forward(
@@ -1122,6 +2437,176 @@ impl MoeWeights {
         experts: &mut DeepExpertStore,
         config: &DeepseekV4Config,
     ) -> Result<(Vec<f32>, Vec<RouteChoice>), DeepseekRuntimeError> {
+        let prepared = self.prepare_routes(input, token, experts, config)?;
+        self.forward_prepared(input, token, position, flow_id, prepared, experts, config)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prepared(
+        &self,
+        input: &[f32],
+        token: usize,
+        position: usize,
+        flow_id: u64,
+        prepared: PreparedDeepRoutes,
+        experts: &mut DeepExpertStore,
+        config: &DeepseekV4Config,
+    ) -> Result<DeepHiddenWithRoutes, DeepseekRuntimeError> {
+        let PreparedDeepRoutes {
+            routes,
+            execution_order,
+            expert_ids,
+            mx_input,
+        } = prepared;
+        let mut output = vec![0.0f32; config.hidden_size];
+        let trace_context = ExpertTraceContext {
+            position,
+            token,
+            flow_id,
+        };
+        let can_run_parallel = experts.can_acquire_batch(self.layer, &expert_ids)
+            || experts.prepare_ordered_batch(self.layer, &expert_ids);
+        let shared = if can_run_parallel {
+            let cache_hits = expert_ids
+                .iter()
+                .map(|&expert| experts.contains(self.layer, expert))
+                .collect::<Vec<_>>();
+            // Shared weights are resident and independent of routed expert I/O. Compute them on
+            // the caller while bounded I/O workers fetch/decode cache misses.
+            let (loaded, shared) =
+                experts.acquire_batch_while(self.layer, &expert_ids, trace_context, || {
+                    self.shared.forward_with_mx_input(input, &mx_input, None)
+                })?;
+            // All handles fit simultaneously, so expose the independent routed experts to the
+            // Rayon pool together. Their inner row-parallel matvecs may still steal work across
+            // experts, avoiding six consecutive small synchronization waves. Indexed collection
+            // retains ascending expert-ID order; accumulation below therefore stays bit exact.
+            let profile_context = capture_context();
+            let computed = install(|| {
+                loaded
+                    .par_iter()
+                    .zip(execution_order.par_iter())
+                    .zip(cache_hits.par_iter())
+                    .map(|((expert, &(expert_id, route_weight)), &cache_hit)| {
+                        profile_context.enter(|| {
+                            compute_routed_expert(
+                                expert,
+                                input,
+                                &mx_input,
+                                route_weight,
+                                expert_id,
+                                cache_hit,
+                                self.layer,
+                                trace_context,
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            for computed in computed {
+                accumulate_routed_output(&mut output, computed);
+            }
+            shared
+        } else if experts.slots_per_layer > 0 {
+            // The planner reserves one transient expert beyond the cache. Use it as a one-stage
+            // pipeline: shared compute hides the first miss, then expert N compute hides the read
+            // for N+1. Installation remains in sorted route order, and the current Arc is dropped
+            // before the next insertion can evict it, so physical residency stays bounded.
+            let (mut current_id, mut current_weight) = execution_order[0];
+            let mut current_hit = experts.contains(self.layer, current_id);
+            let mut current_load =
+                (!current_hit).then(|| experts.preload(self.layer, current_id, trace_context));
+            let shared = match self.shared.forward_with_mx_input(input, &mx_input, None) {
+                Ok(shared) => shared,
+                Err(error) => {
+                    if let Some(load) = current_load {
+                        let _ = load.join();
+                    }
+                    return Err(error);
+                }
+            };
+
+            for next_index in 1..=execution_order.len() {
+                let expert = if current_hit {
+                    experts.acquire(self.layer, current_id, trace_context)?
+                } else {
+                    let loaded = current_load
+                        .take()
+                        .expect("a cache miss has one pending load")
+                        .join()?;
+                    experts.install_preloaded(self.layer, current_id, loaded)?
+                };
+                let next = execution_order.get(next_index).copied();
+                let mut next_hit = false;
+                let mut next_load = None;
+                if let Some((next_id, _)) = next {
+                    next_hit = experts.contains(self.layer, next_id);
+                    if !next_hit {
+                        next_load = Some(experts.preload(self.layer, next_id, trace_context));
+                    }
+                }
+                let computed = accumulate_routed_expert(
+                    &mut output,
+                    &expert,
+                    input,
+                    &mx_input,
+                    current_weight,
+                    current_id,
+                    current_hit,
+                    self.layer,
+                    trace_context,
+                );
+                drop(expert);
+                if let Err(error) = computed {
+                    if let Some(load) = next_load {
+                        let _ = load.join();
+                    }
+                    return Err(error);
+                }
+                if let Some((next_id, next_weight)) = next {
+                    current_id = next_id;
+                    current_weight = next_weight;
+                    current_hit = next_hit;
+                    current_load = next_load;
+                }
+            }
+            shared
+        } else {
+            // A zero-slot test/runtime has no cache allocation beyond the single transient expert,
+            // so it must load and release each route synchronously.
+            for (expert_id, route_weight) in execution_order.iter().copied() {
+                let cache_hit = experts.contains(self.layer, expert_id);
+                let expert = experts.acquire(self.layer, expert_id, trace_context)?;
+                accumulate_routed_expert(
+                    &mut output,
+                    &expert,
+                    input,
+                    &mx_input,
+                    route_weight,
+                    expert_id,
+                    cache_hit,
+                    self.layer,
+                    trace_context,
+                )?;
+            }
+            self.shared.forward_with_mx_input(input, &mx_input, None)?
+        };
+        // The official path accumulates routed experts in FP32, adds the shared expert last,
+        // and only then casts the combined MoE output back to BF16.
+        for (output, shared) in output.iter_mut().zip(shared) {
+            *output += shared;
+        }
+        round_to_bf16_in_place(&mut output)?;
+        Ok((output, routes))
+    }
+
+    fn prepare_routes(
+        &self,
+        input: &[f32],
+        token: usize,
+        experts: &DeepExpertStore,
+        config: &DeepseekV4Config,
+    ) -> Result<PreparedDeepRoutes, DeepseekRuntimeError> {
         let logits = linear(&self.router, input)?;
         let hash = if self.layer < config.num_hash_layers {
             Some(load_i64_matrix_row(
@@ -1141,7 +2626,6 @@ impl MoeWeights {
             config.num_experts_per_tok,
             config.routed_scaling_factor as f32,
         )?;
-        let mut output = vec![0.0f32; config.hidden_size];
         // The standalone reference executes local experts in ascending expert-ID order after
         // routing. Keep the public route order intact, but match that FP32 accumulation order.
         let mut execution_order = routes
@@ -1153,40 +2637,193 @@ impl MoeWeights {
             .iter()
             .map(|&(expert, _)| expert)
             .collect::<Vec<_>>();
-        let cache_hits = expert_ids
-            .iter()
-            .map(|&expert| experts.contains(self.layer, expert))
-            .collect::<Vec<_>>();
-        let trace_context = ExpertTraceContext {
-            position,
-            token,
-            flow_id,
-        };
-        let loaded = experts.acquire_batch(self.layer, &expert_ids, trace_context)?;
-        for (((expert_id, route_weight), expert), cache_hit) in
-            execution_order.into_iter().zip(loaded).zip(cache_hits)
+        // Every release expert applies the same E4M3 activation transform to this source vector.
+        // Share one materialization across six routed experts plus the resident shared expert.
+        let mx_input = prepare_mx_activation(input)?;
+        Ok(PreparedDeepRoutes {
+            routes,
+            execution_order,
+            expert_ids,
+            mx_input,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch(
+        &self,
+        inputs: &[&[f32]],
+        tokens: &[usize],
+        positions: &[usize],
+        flow_id: u64,
+        experts: &mut DeepExpertStore,
+        config: &DeepseekV4Config,
+    ) -> Result<DeepBatchForward, DeepseekRuntimeError> {
+        let batch = inputs.len();
+        if !(2..=PREFILL_ROUTE_WINDOW).contains(&batch)
+            || tokens.len() != batch
+            || positions.len() != batch
         {
-            let computed = {
-                let mut profile = span(ProfileStage::DeepseekExpertCompute);
-                profile.set_token(position, token);
-                profile.set_layer_id(self.layer);
-                profile.set_expert_id(expert_id);
-                profile.set_cache_hit(cache_hit);
-                profile.set_flow_id(flow_id);
-                expert.forward(input, Some(route_weight))?
-            };
-            for (output, expert) in output.iter_mut().zip(computed) {
-                *output += expert;
-            }
+            return Err(DeepseekRuntimeError::Invalid(format!(
+                "MoE prefill batch must contain two through {PREFILL_ROUTE_WINDOW} aligned tokens"
+            )));
         }
-        // The official path accumulates routed experts in FP32, adds the shared expert last,
-        // and only then casts the combined MoE output back to BF16.
-        let shared = self.shared.forward(input, None)?;
-        for (output, shared) in output.iter_mut().zip(shared) {
-            *output += shared;
+        let prepared = inputs
+            .iter()
+            .zip(tokens)
+            .map(|(&input, &token)| self.prepare_routes(input, token, experts, config))
+            .collect::<Result<Vec<_>, _>>()?;
+        let flattened = prepared
+            .iter()
+            .flat_map(|prepared| prepared.expert_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let union_fits = experts.can_acquire_batch(self.layer, &flattened);
+        let stream_grouped = !union_fits && experts.can_stream_grouped_batch(self.layer);
+        if !union_fits && !stream_grouped {
+            return Ok(DeepBatchForward::Fallback(prepared));
         }
-        round_to_bf16_in_place(&mut output)?;
-        Ok((output, routes))
+
+        let expert_ids = prepared
+            .iter()
+            .map(|prepared| prepared.expert_ids.clone())
+            .collect::<Vec<_>>();
+        let route_weights = prepared
+            .iter()
+            .map(|prepared| {
+                prepared
+                    .execution_order
+                    .iter()
+                    .map(|&(_, weight)| weight)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mx_inputs = prepared
+            .iter()
+            .map(|prepared| prepared.mx_input.as_slice())
+            .collect::<Vec<_>>();
+        let traces = positions
+            .iter()
+            .zip(tokens)
+            .map(|(&position, &token)| ExpertTraceContext {
+                position,
+                token,
+                flow_id,
+            })
+            .collect::<Vec<_>>();
+        let mut shared_input = Vec::with_capacity(batch.saturating_mul(config.hidden_size));
+        let mut shared_mx_input = Vec::with_capacity(shared_input.capacity());
+        for (&input, &mx_input) in inputs.iter().zip(&mx_inputs) {
+            shared_input.extend_from_slice(input);
+            shared_mx_input.extend_from_slice(mx_input);
+        }
+        let profile_context = capture_context();
+        let (computed, shared) = install(|| {
+            rayon::join(
+                || {
+                    profile_context.enter(|| {
+                        if stream_grouped {
+                            experts.acquire_and_forward_token_batch_streamed(
+                                self.layer,
+                                &expert_ids,
+                                &route_weights,
+                                inputs,
+                                &mx_inputs,
+                                &traces,
+                            )
+                        } else {
+                            experts.acquire_and_forward_token_batch(
+                                self.layer,
+                                &expert_ids,
+                                &route_weights,
+                                inputs,
+                                &mx_inputs,
+                                &traces,
+                            )
+                        }
+                    })
+                },
+                || {
+                    profile_context.enter(|| {
+                        self.shared.forward_with_mx_input_batch(
+                            &shared_input,
+                            &shared_mx_input,
+                            None,
+                            batch,
+                        )
+                    })
+                },
+            )
+        });
+        let computed = computed?;
+        let shared = shared?;
+        prepared
+            .into_iter()
+            .zip(computed)
+            .zip(shared)
+            .map(|((prepared, computed), shared)| {
+                let mut output = vec![0.0f32; config.hidden_size];
+                for computed in computed {
+                    accumulate_routed_output(&mut output, computed);
+                }
+                for (output, shared) in output.iter_mut().zip(shared) {
+                    *output += shared;
+                }
+                round_to_bf16_in_place(&mut output)?;
+                Ok((output, prepared.routes))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(DeepBatchForward::Batched)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_routed_expert(
+    output: &mut [f32],
+    expert: &DeepExpert,
+    input: &[f32],
+    mx_input: &[f32],
+    route_weight: f32,
+    expert_id: usize,
+    cache_hit: bool,
+    layer: usize,
+    trace: ExpertTraceContext,
+) -> Result<(), DeepseekRuntimeError> {
+    let computed = compute_routed_expert(
+        expert,
+        input,
+        mx_input,
+        route_weight,
+        expert_id,
+        cache_hit,
+        layer,
+        trace,
+    )?;
+    accumulate_routed_output(output, computed);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_routed_expert(
+    expert: &DeepExpert,
+    input: &[f32],
+    mx_input: &[f32],
+    route_weight: f32,
+    expert_id: usize,
+    cache_hit: bool,
+    layer: usize,
+    trace: ExpertTraceContext,
+) -> Result<Vec<f32>, DeepseekRuntimeError> {
+    let mut profile = span(ProfileStage::DeepseekExpertCompute);
+    profile.set_token(trace.position, trace.token);
+    profile.set_layer_id(layer);
+    profile.set_expert_id(expert_id);
+    profile.set_cache_hit(cache_hit);
+    profile.set_flow_id(trace.flow_id);
+    expert.forward_with_mx_input(input, mx_input, Some(route_weight))
+}
+
+fn accumulate_routed_output(output: &mut [f32], computed: Vec<f32>) {
+    for (output, expert) in output.iter_mut().zip(computed) {
+        *output += expert;
     }
 }
 
@@ -1197,6 +2834,9 @@ struct DeepExpert {
     w3: WeightMatrix,
     limit: f32,
 }
+
+#[derive(Debug)]
+struct DeepExpertBuffers(Vec<(ReadBuffer, ReadBuffer)>);
 
 impl DeepExpert {
     fn load(
@@ -1258,13 +2898,141 @@ impl DeepExpert {
         ))
     }
 
-    fn forward(
+    fn load_reusing(
+        index: &TensorIndex,
+        prefix: &str,
+        config: &DeepseekV4Config,
+        maximum_bytes: u64,
+        reuse: Option<DeepExpertBuffers>,
+    ) -> Result<(Self, u64, u64), DeepseekRuntimeError> {
+        let Some(DeepExpertBuffers(reuse)) = reuse else {
+            return Self::load(index, prefix, config, maximum_bytes);
+        };
+        let specifications = [
+            (
+                format!("{prefix}.w1.weight"),
+                config.moe_intermediate_size,
+                config.hidden_size,
+            ),
+            (
+                format!("{prefix}.w2.weight"),
+                config.hidden_size,
+                config.moe_intermediate_size,
+            ),
+            (
+                format!("{prefix}.w3.weight"),
+                config.moe_intermediate_size,
+                config.hidden_size,
+            ),
+        ];
+        if reuse.len() != specifications.len()
+            || specifications.iter().any(|(name, rows, cols)| {
+                !matches!(
+                    inspect_weight_matrix(index, name, *rows, *cols),
+                    Ok(layout)
+                        if layout.format == (WeightFormat::MxFp4E2M1 { group_size: 32 })
+                )
+            })
+        {
+            return Self::load(index, prefix, config, maximum_bytes);
+        }
+        let bytes = specifications
+            .iter()
+            .try_fold(0u64, |sum, (name, rows, cols)| {
+                sum.checked_add(inspect_weight_matrix(index, name, *rows, *cols)?.resident_bytes)
+                    .ok_or_else(|| {
+                        DeepseekRuntimeError::Invalid("expert byte count overflows".to_owned())
+                    })
+            })?;
+        if bytes > maximum_bytes {
+            return Err(DeepseekRuntimeError::Budget {
+                component: "routed expert",
+                required: bytes,
+                maximum: maximum_bytes,
+            });
+        }
+        let read_bytes = specifications.iter().try_fold(0u64, |sum, (name, _, _)| {
+            sum.checked_add(weight_storage_bytes(index, name)?)
+                .ok_or_else(|| {
+                    DeepseekRuntimeError::Invalid("expert payload byte count overflows".to_owned())
+                })
+        })?;
+        let mut matrices =
+            load_mxfp4_matrices_reusing(index, &specifications, reuse, read_bytes)?.into_iter();
+        Ok((
+            Self {
+                w1: matrices.next().expect("three reused expert matrices"),
+                w2: matrices.next().expect("three reused expert matrices"),
+                w3: matrices.next().expect("three reused expert matrices"),
+                limit: config.swiglu_limit as f32,
+            },
+            bytes,
+            read_bytes,
+        ))
+    }
+
+    fn load_layer_reusing(
+        index: &TensorIndex,
+        prefix: &str,
+        config: &DeepseekV4Config,
+        reuse: &mut DecoderLayerBuffers,
+        prevalidated: bool,
+    ) -> Result<Self, DeepseekRuntimeError> {
+        Ok(Self {
+            w1: matrix_reusing(
+                index,
+                &format!("{prefix}.w1.weight"),
+                config.moe_intermediate_size,
+                config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            w2: matrix_reusing(
+                index,
+                &format!("{prefix}.w2.weight"),
+                config.hidden_size,
+                config.moe_intermediate_size,
+                reuse,
+                prevalidated,
+            )?,
+            w3: matrix_reusing(
+                index,
+                &format!("{prefix}.w3.weight"),
+                config.moe_intermediate_size,
+                config.hidden_size,
+                reuse,
+                prevalidated,
+            )?,
+            limit: config.swiglu_limit as f32,
+        })
+    }
+
+    fn append_native_buffers(self, buffers: &mut DecoderLayerBuffers) {
+        for weight in [self.w1, self.w2, self.w3] {
+            buffers.push_weight(weight);
+        }
+    }
+
+    fn into_mxfp4_buffers(self) -> Option<DeepExpertBuffers> {
+        let Self { w1, w2, w3, .. } = self;
+        [w1, w2, w3]
+            .into_iter()
+            .map(|weight| match weight {
+                WeightMatrix::MxFp4(matrix) => Some(matrix.into_e2m1_buffers()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(DeepExpertBuffers)
+    }
+
+    fn forward_with_mx_input(
         &self,
         input: &[f32],
+        mx_input: &[f32],
         route_weight: Option<f32>,
     ) -> Result<Vec<f32>, DeepseekRuntimeError> {
-        let gate = linear(&self.w1, input)?;
-        let up = linear(&self.w3, input)?;
+        let gate = linear_with_mx_activation(&self.w1, input, mx_input)?;
+        let up = linear_with_mx_activation(&self.w3, input, mx_input)?;
         let mut activated = bounded_swiglu(&gate, &up, self.limit)?;
         if let Some(weight) = route_weight {
             if !weight.is_finite() || weight < 0.0 {
@@ -1281,6 +3049,66 @@ impl DeepExpert {
         round_to_bf16_in_place(&mut activated)?;
         Ok(linear(&self.w2, &activated)?)
     }
+
+    fn forward_with_mx_input_batch(
+        &self,
+        input: &[f32],
+        mx_input: &[f32],
+        route_weights: Option<&[f32]>,
+        batch: usize,
+    ) -> Result<Vec<Vec<f32>>, DeepseekRuntimeError> {
+        if batch == 0
+            || input.len() != batch.saturating_mul(self.w1.cols())
+            || mx_input.len() != input.len()
+            || route_weights.is_some_and(|weights| weights.len() != batch)
+        {
+            return Err(DeepseekRuntimeError::Invalid(
+                "expert batch has invalid input or route-weight geometry".to_owned(),
+            ));
+        }
+        let gate = linear_with_mx_activation_batch(&self.w1, input, mx_input, batch)?;
+        let up = linear_with_mx_activation_batch(&self.w3, input, mx_input, batch)?;
+        let intermediate = self.w1.rows();
+        let mut activated = Vec::with_capacity(batch.saturating_mul(intermediate));
+        for token in 0..batch {
+            let start = token * intermediate;
+            let end = start + intermediate;
+            let mut token_activated =
+                bounded_swiglu(&gate[start..end], &up[start..end], self.limit)?;
+            if let Some(route_weights) = route_weights {
+                let weight = route_weights[token];
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(DeepseekRuntimeError::Invalid(
+                        "routed expert weight must be finite and non-negative".to_owned(),
+                    ));
+                }
+                for value in &mut token_activated {
+                    *value *= weight;
+                }
+            }
+            round_to_bf16_in_place(&mut token_activated)?;
+            activated.extend(token_activated);
+        }
+        let mut activated_mx = Vec::with_capacity(activated.len());
+        for token in activated.chunks_exact(intermediate) {
+            activated_mx.extend(prepare_mx_activation(token)?);
+        }
+        let output = linear_with_mx_activation_batch(&self.w2, &activated, &activated_mx, batch)?;
+        Ok(output
+            .chunks_exact(self.w2.rows())
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
+
+    #[cfg(test)]
+    fn forward(
+        &self,
+        input: &[f32],
+        route_weight: Option<f32>,
+    ) -> Result<Vec<f32>, DeepseekRuntimeError> {
+        let mx_input = prepare_mx_activation(input)?;
+        self.forward_with_mx_input(input, &mx_input, route_weight)
+    }
 }
 
 #[derive(Debug)]
@@ -1288,7 +3116,12 @@ struct DeepExpertStore {
     index: Arc<TensorIndex>,
     config: DeepseekV4Config,
     maximum_bytes: u64,
+    slots_per_layer: usize,
     cache: LayerLruCache<Arc<DeepExpert>>,
+    // Layer-major prefill temporarily lends globally unused cache slots to the active layer.
+    // Buffers trimmed when the steady-state capacity is restored remain inside that same global
+    // slot budget and are consumed by later-layer misses before new allocations are made.
+    recycled: Vec<DeepExpertBuffers>,
     telemetry: ExpertTelemetry,
 }
 
@@ -1298,6 +3131,8 @@ struct ExpertTraceContext {
     token: usize,
     flow_id: u64,
 }
+
+type LoadedDeepExpert = (Arc<DeepExpert>, u64, u64);
 
 impl DeepExpertStore {
     fn new(
@@ -1315,7 +3150,9 @@ impl DeepExpertStore {
             index,
             config: config.clone(),
             maximum_bytes,
+            slots_per_layer,
             cache: LayerLruCache::new(config.num_hidden_layers, slots_per_layer),
+            recycled: Vec::new(),
             telemetry: ExpertTelemetry::default(),
         })
     }
@@ -1334,7 +3171,7 @@ impl DeepExpertStore {
         let index = Arc::clone(&self.index);
         let config = self.config.clone();
         let maximum = self.maximum_bytes;
-        self.cache.access(
+        let (expert, evicted) = self.cache.access_with_evicted(
             &mut self.telemetry,
             layer,
             expert,
@@ -1354,16 +3191,124 @@ impl DeepExpertStore {
                 profile.add_logical_bytes(loaded.2);
                 Ok((Arc::new(loaded.0), loaded.1, loaded.2))
             },
-            |expert| Ok(Arc::clone(expert)),
-        )
+            |expert| Ok::<_, DeepseekRuntimeError>(Arc::clone(expert)),
+        )?;
+        self.recycle_evicted(evicted);
+        Ok(expert)
     }
 
-    fn acquire_batch(
+    /// Starts one cache-miss load without mutating LRU state. The caller installs the completed
+    /// value immediately before its logical access, preserving deterministic eviction order while
+    /// one reserved transient expert overlaps the previous expert's compute.
+    fn preload(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        trace_context: ExpertTraceContext,
+    ) -> IoTask<Result<LoadedDeepExpert, DeepseekRuntimeError>> {
+        let index = Arc::clone(&self.index);
+        let config = self.config.clone();
+        let maximum = self.maximum_bytes;
+        let reuse = self.recycled.pop();
+        let profile_context = capture_context();
+        spawn_io(move || {
+            profile_context.enter(|| {
+                let mut profile = span(ProfileStage::DeepseekExpertLoad);
+                profile.set_token(trace_context.position, trace_context.token);
+                profile.set_layer_id(layer);
+                profile.set_expert_id(expert);
+                profile.set_cache_hit(false);
+                profile.set_flow_id(trace_context.flow_id);
+                let loaded = DeepExpert::load_reusing(
+                    &index,
+                    &format!("layers.{layer}.ffn.experts.{expert}"),
+                    &config,
+                    maximum,
+                    reuse,
+                );
+                if let Ok((_, _, read_bytes)) = &loaded {
+                    profile.add_logical_bytes(*read_bytes);
+                }
+                loaded.map(|(value, bytes, read_bytes)| (Arc::new(value), bytes, read_bytes))
+            })
+        })
+    }
+
+    fn install_preloaded(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        loaded: LoadedDeepExpert,
+    ) -> Result<Arc<DeepExpert>, DeepseekRuntimeError> {
+        let mut loaded = Some(loaded);
+        let (expert, evicted) = self.cache.access_with_evicted(
+            &mut self.telemetry,
+            layer,
+            expert,
+            || {
+                loaded.take().ok_or_else(|| {
+                    DeepseekRuntimeError::Invalid(
+                        "a prefetched expert was consumed before cache insertion".to_owned(),
+                    )
+                })
+            },
+            |expert| Ok::<_, DeepseekRuntimeError>(Arc::clone(expert)),
+        )?;
+        self.recycle_evicted(evicted);
+        Ok(expert)
+    }
+
+    fn recycle_evicted(&mut self, evicted: Option<Arc<DeepExpert>>) {
+        if let Some(evicted) = evicted {
+            if let Ok(evicted) = Arc::try_unwrap(evicted) {
+                if let Some(buffers) = evicted.into_mxfp4_buffers() {
+                    self.recycled.push(buffers);
+                }
+            }
+        }
+    }
+
+    fn begin_prefill_layer(&mut self, layer: usize) -> usize {
+        self.cache
+            .lend_unused_capacity(layer, self.config.n_routed_experts)
+    }
+
+    fn finish_prefill_layer(&mut self, layer: usize, steady_capacity: usize) {
+        let evicted =
+            self.cache
+                .restore_layer_capacity(&mut self.telemetry, layer, steady_capacity);
+        for expert in evicted {
+            self.recycle_evicted(Some(expert));
+        }
+    }
+
+    fn can_acquire_batch(&self, layer: usize, experts: &[usize]) -> bool {
+        self.cache.can_insert_without_eviction(layer, experts)
+    }
+
+    /// Simulate the ordered route accesses and evict their inevitable victims up front, exposing
+    /// every miss to the bounded I/O pool together. Logical accesses are still replayed in route
+    /// order by `acquire_batch_while`, retaining exact telemetry and LRU state.
+    fn prepare_ordered_batch(&mut self, layer: usize, experts: &[usize]) -> bool {
+        let Some(evicted) = self
+            .cache
+            .prepare_ordered_batch(&mut self.telemetry, layer, experts)
+        else {
+            return false;
+        };
+        for expert in evicted {
+            self.recycle_evicted(Some(expert));
+        }
+        true
+    }
+
+    fn acquire_batch_while<R>(
         &mut self,
         layer: usize,
         experts: &[usize],
         trace_context: ExpertTraceContext,
-    ) -> Result<Vec<Arc<DeepExpert>>, DeepseekRuntimeError> {
+        while_loading: impl FnOnce() -> Result<R, DeepseekRuntimeError>,
+    ) -> Result<(Vec<Arc<DeepExpert>>, R), DeepseekRuntimeError> {
         if layer >= self.config.num_hidden_layers
             || experts
                 .iter()
@@ -1374,10 +3319,9 @@ impl DeepExpertStore {
             ));
         }
         if !self.cache.can_insert_without_eviction(layer, experts) {
-            return experts
-                .iter()
-                .map(|&expert| self.acquire(layer, expert, trace_context))
-                .collect();
+            return Err(DeepseekRuntimeError::Invalid(
+                "expert batch requires free cache slots; use sequential execution".to_owned(),
+            ));
         }
 
         let mut missing = Vec::new();
@@ -1386,14 +3330,19 @@ impl DeepExpertStore {
                 missing.push(expert);
             }
         }
-        let index = Arc::clone(&self.index);
-        let config = self.config.clone();
         let maximum = self.maximum_bytes;
+        let reuse = (0..missing.len())
+            .map(|_| self.recycled.pop())
+            .collect::<Vec<_>>();
         let profile_context = capture_context();
-        let loaded = install(|| {
-            missing
-                .par_iter()
-                .map(|&expert| {
+        let pending = missing
+            .into_iter()
+            .zip(reuse)
+            .map(|(expert, reuse)| {
+                let index = Arc::clone(&self.index);
+                let config = self.config.clone();
+                let profile_context = profile_context.clone();
+                spawn_io(move || {
                     profile_context.enter(|| {
                         let mut profile = span(ProfileStage::DeepseekExpertLoad);
                         profile.set_token(trace_context.position, trace_context.token);
@@ -1401,11 +3350,12 @@ impl DeepExpertStore {
                         profile.set_expert_id(expert);
                         profile.set_cache_hit(false);
                         profile.set_flow_id(trace_context.flow_id);
-                        let loaded = DeepExpert::load(
+                        let loaded = DeepExpert::load_reusing(
                             &index,
                             &format!("layers.{layer}.ffn.experts.{expert}"),
                             &config,
                             maximum,
+                            reuse,
                         );
                         if let Ok((_, _, read_bytes)) = &loaded {
                             profile.add_logical_bytes(*read_bytes);
@@ -1415,15 +3365,20 @@ impl DeepExpertStore {
                         })
                     })
                 })
-                .collect::<Vec<_>>()
-        });
+            })
+            .collect::<Vec<_>>();
+        let computed = while_loading();
+        // Drain every I/O task before propagating either error so token rollback cannot race with
+        // outstanding reads and allocations.
+        let loaded = pending.into_iter().map(IoTask::join).collect::<Vec<_>>();
+        let computed = computed?;
         let mut preloaded = HashMap::with_capacity(loaded.len());
         for loaded in loaded {
             let (expert, value) = loaded?;
             preloaded.insert(expert, value);
         }
 
-        experts
+        let experts = experts
             .iter()
             .map(|&expert| {
                 self.cache.access(
@@ -1440,11 +3395,412 @@ impl DeepExpertStore {
                     |expert| Ok(Arc::clone(expert)),
                 )
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((experts, computed))
     }
 
     fn contains(&self, layer: usize, expert: usize) -> bool {
         self.cache.contains(layer, expert)
+    }
+
+    /// A fresh layer can group an oversized prefill window by expert without keeping the entire
+    /// union resident. Processing bounded chunks in last-use order leaves the same final LRU hot
+    /// set as token-major execution while repeatedly recycling the same cache-sized buffer set.
+    fn can_stream_grouped_batch(&self, layer: usize) -> bool {
+        self.slots_per_layer > 0 && self.cache.layer_is_empty(layer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_and_forward_token_batch_streamed(
+        &mut self,
+        layer: usize,
+        expert_ids_by_token: &[Vec<usize>],
+        route_weights_by_token: &[Vec<f32>],
+        inputs: &[&[f32]],
+        mx_inputs: &[&[f32]],
+        traces: &[ExpertTraceContext],
+    ) -> Result<Vec<Vec<Vec<f32>>>, DeepseekRuntimeError> {
+        let batch = expert_ids_by_token.len();
+        if !(2..=PREFILL_ROUTE_WINDOW).contains(&batch)
+            || route_weights_by_token.len() != batch
+            || inputs.len() != batch
+            || mx_inputs.len() != batch
+            || traces.len() != batch
+            || layer >= self.config.num_hidden_layers
+            || !self.can_stream_grouped_batch(layer)
+            || expert_ids_by_token
+                .iter()
+                .zip(route_weights_by_token)
+                .any(|(experts, weights)| experts.is_empty() || experts.len() != weights.len())
+            || expert_ids_by_token
+                .iter()
+                .flatten()
+                .any(|&expert| expert >= self.config.n_routed_experts)
+            || inputs.iter().chain(mx_inputs).any(|input| {
+                input.len() != self.config.hidden_size
+                    || input.iter().any(|value| !value.is_finite())
+            })
+        {
+            return Err(DeepseekRuntimeError::Invalid(
+                "streamed expert token batch has invalid geometry, state, or activation values"
+                    .to_owned(),
+            ));
+        }
+
+        let mut group_indices = HashMap::new();
+        let mut groups = Vec::<(usize, Vec<(usize, usize)>)>::new();
+        for (token, experts) in expert_ids_by_token.iter().enumerate() {
+            for (route, &expert) in experts.iter().enumerate() {
+                let group = match group_indices.get(&expert) {
+                    Some(&group) => group,
+                    None => {
+                        let group = groups.len();
+                        groups.push((expert, Vec::new()));
+                        group_indices.insert(expert, group);
+                        group
+                    }
+                };
+                groups[group].1.push((token, route));
+            }
+        }
+        // Starting from an empty layer, one insertion per distinct expert in ascending last-use
+        // order produces exactly the final hot-key set and recency order of token-major LRU. It
+        // also lets every repeated route reuse the one loaded value even if the full union is
+        // larger than the cache.
+        groups.sort_by_key(|&(expert, ref positions)| {
+            let &(token, route) = positions
+                .last()
+                .expect("every grouped expert has at least one route");
+            (token, route, expert)
+        });
+
+        let mut computed = expert_ids_by_token
+            .iter()
+            .map(|experts| (0..experts.len()).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let capacity = self.cache.layer_capacity(layer);
+        if capacity == 0 || groups.is_empty() {
+            return Err(DeepseekRuntimeError::Invalid(
+                "streamed expert batch requires a non-empty cache and route set".to_owned(),
+            ));
+        }
+        // Make the final chunk exactly one cacheful (unless the entire union is smaller, which is
+        // handled by the regular batch path). The cache therefore finishes with the last C
+        // distinct experts in last-use order, exactly matching token-major LRU.
+        let first_chunk = match groups.len() % capacity {
+            0 => capacity,
+            remainder => remainder,
+        };
+        let mut start = 0;
+        let mut chunk_len = first_chunk;
+        while start < groups.len() {
+            let end = (start + chunk_len).min(groups.len());
+            let chunk = &groups[start..end];
+            let expert_ids = chunk.iter().map(|(expert, _)| *expert).collect::<Vec<_>>();
+            let trace = traces[chunk[0].1[0].0];
+            let (loaded, ()) = self.acquire_batch_while(layer, &expert_ids, trace, || Ok(()))?;
+            let config = &self.config;
+            let profile_context = capture_context();
+            let completed = install(|| {
+                loaded
+                    .par_iter()
+                    .zip(chunk.par_iter())
+                    .map(|(expert, &(expert_id, ref positions))| {
+                        let mut input =
+                            Vec::with_capacity(positions.len().saturating_mul(config.hidden_size));
+                        let mut mx_input = Vec::with_capacity(input.capacity());
+                        let mut route_weights = Vec::with_capacity(positions.len());
+                        for &(token, route) in positions {
+                            input.extend_from_slice(inputs[token]);
+                            mx_input.extend_from_slice(mx_inputs[token]);
+                            route_weights.push(route_weights_by_token[token][route]);
+                        }
+                        let trace = traces[positions[0].0];
+                        profile_context.enter(|| {
+                            let mut profile = span(ProfileStage::DeepseekExpertCompute);
+                            profile.set_token_position(trace.position);
+                            profile.set_layer_id(layer);
+                            profile.set_expert_id(expert_id);
+                            profile.set_cache_hit(false);
+                            profile.set_flow_id(trace.flow_id);
+                            profile.set_batch_tokens(positions.len());
+                            expert
+                                .forward_with_mx_input_batch(
+                                    &input,
+                                    &mx_input,
+                                    Some(&route_weights),
+                                    positions.len(),
+                                )
+                                .map(|values| (positions.clone(), values))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            drop(loaded);
+            for result in completed {
+                let (positions, values) = result?;
+                if values.len() != positions.len() {
+                    return Err(DeepseekRuntimeError::Invalid(
+                        "streamed expert token batch returned the wrong number of rows".to_owned(),
+                    ));
+                }
+                // The first occurrence caused the physical miss above. Remaining occurrences are
+                // served by the grouped resident value and therefore count as real cache hits.
+                self.telemetry.hits = self
+                    .telemetry
+                    .hits
+                    .saturating_add(positions.len().saturating_sub(1) as u64);
+                for ((token, route), value) in positions.into_iter().zip(values) {
+                    computed[token][route] = Some(value);
+                }
+            }
+            if end < groups.len() {
+                let drained = self.cache.drain_layer(&mut self.telemetry, layer);
+                for expert in drained {
+                    self.recycle_evicted(Some(expert));
+                }
+            }
+            start = end;
+            chunk_len = capacity;
+        }
+
+        Ok(computed
+            .into_iter()
+            .map(|token| {
+                token
+                    .into_iter()
+                    .map(|value| value.expect("every routed expert has one streamed batch result"))
+                    .collect()
+            })
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_and_forward_token_batch(
+        &mut self,
+        layer: usize,
+        expert_ids_by_token: &[Vec<usize>],
+        route_weights_by_token: &[Vec<f32>],
+        inputs: &[&[f32]],
+        mx_inputs: &[&[f32]],
+        traces: &[ExpertTraceContext],
+    ) -> Result<Vec<Vec<Vec<f32>>>, DeepseekRuntimeError> {
+        let batch = expert_ids_by_token.len();
+        if !(2..=PREFILL_ROUTE_WINDOW).contains(&batch)
+            || route_weights_by_token.len() != batch
+            || inputs.len() != batch
+            || mx_inputs.len() != batch
+            || traces.len() != batch
+            || layer >= self.config.num_hidden_layers
+            || expert_ids_by_token
+                .iter()
+                .zip(route_weights_by_token)
+                .any(|(experts, weights)| experts.len() != weights.len())
+            || expert_ids_by_token
+                .iter()
+                .flatten()
+                .any(|&expert| expert >= self.config.n_routed_experts)
+            || inputs.iter().chain(mx_inputs).any(|input| {
+                input.len() != self.config.hidden_size
+                    || input.iter().any(|value| !value.is_finite())
+            })
+        {
+            return Err(DeepseekRuntimeError::Invalid(
+                "expert token batch has invalid geometry or activation values".to_owned(),
+            ));
+        }
+        let flattened = expert_ids_by_token
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        if !self.cache.can_insert_without_eviction(layer, &flattened) {
+            return Err(DeepseekRuntimeError::Invalid(
+                "expert token batch would change cache eviction semantics".to_owned(),
+            ));
+        }
+
+        let mut group_indices = HashMap::new();
+        let mut groups = Vec::<(usize, Vec<(usize, usize)>)>::new();
+        for (token, experts) in expert_ids_by_token.iter().enumerate() {
+            for (route, &expert) in experts.iter().enumerate() {
+                let group = match group_indices.get(&expert) {
+                    Some(&group) => group,
+                    None => {
+                        let group = groups.len();
+                        groups.push((expert, Vec::new()));
+                        group_indices.insert(expert, group);
+                        group
+                    }
+                };
+                groups[group].1.push((token, route));
+            }
+        }
+        let index = Arc::clone(&self.index);
+        let config = self.config.clone();
+        let maximum = self.maximum_bytes;
+        let profile_context = capture_context();
+        let work = groups
+            .into_iter()
+            .map(|(expert, positions)| {
+                let cached = self.cache.peek(layer, expert).map(Arc::clone);
+                let pending = if cached.is_none() {
+                    let index = Arc::clone(&index);
+                    let config = config.clone();
+                    let reuse = self.recycled.pop();
+                    let first_trace = traces[positions[0].0];
+                    let batch_tokens = positions.len();
+                    let profile_context = profile_context.clone();
+                    Some(spawn_io(move || {
+                        profile_context.enter(|| {
+                            let mut profile = span(ProfileStage::DeepseekExpertLoad);
+                            profile.set_token_position(first_trace.position);
+                            profile.set_layer_id(layer);
+                            profile.set_expert_id(expert);
+                            profile.set_cache_hit(false);
+                            profile.set_flow_id(first_trace.flow_id);
+                            profile.set_batch_tokens(batch_tokens);
+                            let loaded = DeepExpert::load_reusing(
+                                &index,
+                                &format!("layers.{layer}.ffn.experts.{expert}"),
+                                &config,
+                                maximum,
+                                reuse,
+                            );
+                            if let Ok((_, _, read_bytes)) = &loaded {
+                                profile.add_logical_bytes(*read_bytes);
+                            }
+                            loaded.map(|(value, resident, read_bytes)| {
+                                (Arc::new(value), resident, read_bytes)
+                            })
+                        })
+                    }))
+                } else {
+                    None
+                };
+                (expert, positions, cached, pending)
+            })
+            .collect::<Vec<_>>();
+        let completed = install(|| {
+            work.into_par_iter()
+                .map(|(expert, positions, cached, pending)| {
+                    let mut input =
+                        Vec::with_capacity(positions.len().saturating_mul(config.hidden_size));
+                    let mut mx_input = Vec::with_capacity(input.capacity());
+                    let mut route_weights = Vec::with_capacity(positions.len());
+                    for &(token, route) in &positions {
+                        input.extend_from_slice(inputs[token]);
+                        mx_input.extend_from_slice(mx_inputs[token]);
+                        route_weights.push(route_weights_by_token[token][route]);
+                    }
+                    let first_trace = traces[positions[0].0];
+                    match cached {
+                        Some(value) => {
+                            let computed = profile_context.enter(|| {
+                                let mut profile = span(ProfileStage::DeepseekExpertCompute);
+                                profile.set_token_position(first_trace.position);
+                                profile.set_layer_id(layer);
+                                profile.set_expert_id(expert);
+                                profile.set_cache_hit(true);
+                                profile.set_flow_id(first_trace.flow_id);
+                                profile.set_batch_tokens(positions.len());
+                                value.forward_with_mx_input_batch(
+                                    &input,
+                                    &mx_input,
+                                    Some(&route_weights),
+                                    positions.len(),
+                                )
+                            });
+                            Ok::<_, DeepseekRuntimeError>((expert, positions, None, computed))
+                        }
+                        None => {
+                            let (value, resident, read_bytes) = pending
+                                .expect("each uncached expert has one pending load")
+                                .join()?;
+                            let computed = profile_context.enter(|| {
+                                let mut compute_profile = span(ProfileStage::DeepseekExpertCompute);
+                                compute_profile.set_token_position(first_trace.position);
+                                compute_profile.set_layer_id(layer);
+                                compute_profile.set_expert_id(expert);
+                                compute_profile.set_cache_hit(false);
+                                compute_profile.set_flow_id(first_trace.flow_id);
+                                compute_profile.set_batch_tokens(positions.len());
+                                value.forward_with_mx_input_batch(
+                                    &input,
+                                    &mx_input,
+                                    Some(&route_weights),
+                                    positions.len(),
+                                )
+                            });
+                            Ok((
+                                expert,
+                                positions,
+                                Some((value, resident, read_bytes)),
+                                computed,
+                            ))
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut preloaded = HashMap::new();
+        let mut computed_groups = Vec::with_capacity(completed.len());
+        for completed in completed {
+            let (expert, positions, loaded, computed) = completed?;
+            if let Some(loaded) = loaded {
+                preloaded.insert(expert, loaded);
+            }
+            computed_groups.push((positions, computed?));
+        }
+
+        // Replay token-major, expert-sorted logical accesses after all fallible work succeeds.
+        // The borrowed capacity guarantees no eviction, preserving LRU and telemetry exactly.
+        for expert_ids in expert_ids_by_token {
+            for &expert in expert_ids {
+                let (_, evicted) = self.cache.access_with_evicted(
+                    &mut self.telemetry,
+                    layer,
+                    expert,
+                    || {
+                        preloaded.remove(&expert).ok_or_else(|| {
+                            DeepseekRuntimeError::Invalid(
+                                "batched expert preload omitted a cache miss".to_owned(),
+                            )
+                        })
+                    },
+                    |_| Ok::<_, DeepseekRuntimeError>(()),
+                )?;
+                debug_assert!(evicted.is_none());
+                if let Some(evicted) = evicted {
+                    self.recycle_evicted(Some(evicted));
+                }
+            }
+        }
+
+        let mut computed = expert_ids_by_token
+            .iter()
+            .map(|experts| (0..experts.len()).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for (positions, values) in computed_groups {
+            if values.len() != positions.len() {
+                return Err(DeepseekRuntimeError::Invalid(
+                    "expert token batch returned the wrong number of rows".to_owned(),
+                ));
+            }
+            for ((token, route), value) in positions.into_iter().zip(values) {
+                computed[token][route] = Some(value);
+            }
+        }
+        Ok(computed
+            .into_iter()
+            .map(|token| {
+                token
+                    .into_iter()
+                    .map(|value| value.expect("every routed expert has one batch result"))
+                    .collect()
+            })
+            .collect())
     }
 }
 
@@ -1465,6 +3821,7 @@ fn load_compressor(
     ratio: usize,
     head_dim: usize,
     rotate: bool,
+    norm: &Arc<[f32]>,
 ) -> Result<CompressorWeights, DeepseekRuntimeError> {
     let coefficient = if ratio == 4 { 2 } else { 1 };
     Ok(CompressorWeights::new(
@@ -1490,7 +3847,54 @@ fn load_compressor(
             coefficient * head_dim,
             config.hidden_size,
         )?,
-        load_reference_vector(index, &format!("{prefix}.norm.weight"), head_dim)?,
+        Arc::clone(norm),
+        config.rms_norm_eps as f32,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_compressor_reusing(
+    index: &TensorIndex,
+    config: &DeepseekV4Config,
+    prefix: &str,
+    ratio: usize,
+    head_dim: usize,
+    rotate: bool,
+    norm: &Arc<[f32]>,
+    reuse: &mut DecoderLayerBuffers,
+    prevalidated: bool,
+) -> Result<CompressorWeights, DeepseekRuntimeError> {
+    let coefficient = if ratio == 4 { 2 } else { 1 };
+    Ok(CompressorWeights::new(
+        ratio,
+        head_dim,
+        config.qk_rope_head_dim,
+        rotate,
+        matrix_reusing(
+            index,
+            &format!("{prefix}.ape"),
+            ratio,
+            coefficient * head_dim,
+            reuse,
+            prevalidated,
+        )?,
+        matrix_reusing(
+            index,
+            &format!("{prefix}.wkv.weight"),
+            coefficient * head_dim,
+            config.hidden_size,
+            reuse,
+            prevalidated,
+        )?,
+        matrix_reusing(
+            index,
+            &format!("{prefix}.wgate.weight"),
+            coefficient * head_dim,
+            config.hidden_size,
+            reuse,
+            prevalidated,
+        )?,
+        Arc::clone(norm),
         config.rms_norm_eps as f32,
     )?)
 }
@@ -1502,6 +3906,161 @@ fn matrix(
     columns: usize,
 ) -> Result<WeightMatrix, DeepseekRuntimeError> {
     Ok(load_weight_matrix(index, name, rows, columns, u64::MAX)?)
+}
+
+fn matrix_reusing(
+    index: &TensorIndex,
+    name: &str,
+    rows: usize,
+    columns: usize,
+    reuse: &mut DecoderLayerBuffers,
+    prevalidated: bool,
+) -> Result<WeightMatrix, DeepseekRuntimeError> {
+    if reuse.0.is_empty() && !prevalidated {
+        return matrix(index, name, rows, columns);
+    }
+    let layout = inspect_weight_matrix(index, name, rows, columns)?;
+    let (block_rows, block_cols, group_size) = match layout.format {
+        WeightFormat::MxFp8E4M3 {
+            block_rows,
+            block_cols,
+        } => (Some(block_rows), Some(block_cols), None),
+        WeightFormat::MxFp4E2M1 { group_size } => (None, None, Some(group_size)),
+        _ => return matrix(index, name, rows, columns),
+    };
+    let scale_name = name
+        .strip_suffix(".weight")
+        .map(|prefix| format!("{prefix}.scale"))
+        .unwrap_or_else(|| format!("{name}.scale"));
+    let values_len = usize::try_from(index.require(name)?.data_len).map_err(|_| {
+        DeepseekRuntimeError::Invalid(format!("weight tensor {name:?} exceeds addressable memory"))
+    })?;
+    let scales_len = usize::try_from(index.require(&scale_name)?.data_len).map_err(|_| {
+        DeepseekRuntimeError::Invalid(format!(
+            "weight scale tensor {scale_name:?} exceeds addressable memory"
+        ))
+    })?;
+    let reusable = reuse.take_matching(values_len, scales_len);
+    if reusable.is_none() && !prevalidated {
+        return matrix(index, name, rows, columns);
+    }
+
+    // Safetensor sidecars are often far from their payloads. Preserve the normal loader's
+    // physical ordering while overwriting the two exact-size allocations in place.
+    let names = [name.to_owned(), scale_name];
+    let tensors = [index.require(&names[0])?, index.require(&names[1])?];
+    let mut inputs = match reusable {
+        Some((values, scales)) => [Some(values.into_vec()), Some(scales.into_vec())],
+        None => [None, None],
+    };
+    let mut outputs = [None, None];
+    let mut order = [0usize, 1usize];
+    order.sort_by(|&left, &right| {
+        tensors[left]
+            .shard
+            .cmp(&tensors[right].shard)
+            .then_with(|| tensors[left].data_offset.cmp(&tensors[right].data_offset))
+    });
+    for index_in_pair in order {
+        let len = usize::try_from(tensors[index_in_pair].data_len).map_err(|_| {
+            DeepseekRuntimeError::Invalid(format!(
+                "weight tensor {:?} exceeds addressable memory",
+                names[index_in_pair]
+            ))
+        })?;
+        outputs[index_in_pair] = Some(match inputs[index_in_pair].take() {
+            Some(reuse) => index.read_range_reusing(&names[index_in_pair], 0, len, reuse)?,
+            None => index.read_range(&names[index_in_pair], 0, len)?,
+        });
+    }
+    let values: ReadBuffer = outputs[0].take().expect("weight payload was read").into();
+    let scales: ReadBuffer = outputs[1].take().expect("weight scale was read").into();
+    match (block_rows, block_cols, group_size) {
+        (Some(block_rows), Some(block_cols), None) => {
+            let matrix = if prevalidated {
+                MxFp8Matrix::from_read_buffers_prevalidated(
+                    rows, columns, block_rows, block_cols, values, scales,
+                )
+            } else {
+                MxFp8Matrix::from_read_buffers(
+                    rows, columns, block_rows, block_cols, values, scales,
+                )
+            };
+            matrix
+                .map(WeightMatrix::MxFp8)
+                .map_err(WeightError::from)
+                .map_err(DeepseekRuntimeError::from)
+        }
+        (None, None, Some(group_size)) => {
+            let matrix = if prevalidated {
+                MxFp4Matrix::from_read_buffers_prevalidated(
+                    rows, columns, group_size, values, scales,
+                )
+            } else {
+                MxFp4Matrix::from_read_buffers(rows, columns, group_size, values, scales)
+            };
+            matrix
+                .map(WeightMatrix::MxFp4)
+                .map_err(WeightError::from)
+                .map_err(DeepseekRuntimeError::from)
+        }
+        _ => unreachable!("native MX layout has one recognized geometry"),
+    }
+}
+
+fn load_mxfp4_matrices_reusing(
+    index: &TensorIndex,
+    specifications: &[(String, usize, usize)],
+    reuse: Vec<(ReadBuffer, ReadBuffer)>,
+    maximum_bytes: u64,
+) -> Result<Vec<WeightMatrix>, DeepseekRuntimeError> {
+    let mut names = Vec::with_capacity(specifications.len() * 2);
+    let mut buffers = Vec::with_capacity(specifications.len() * 2);
+    for ((name, rows, cols), (values, scales)) in specifications.iter().zip(reuse) {
+        let layout = inspect_weight_matrix(index, name, *rows, *cols)?;
+        if layout.format != (WeightFormat::MxFp4E2M1 { group_size: 32 }) {
+            return Err(DeepseekRuntimeError::Invalid(format!(
+                "reusable expert tensor {name:?} is not native group-32 MXFP4"
+            )));
+        }
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.scale"))
+            .ok_or_else(|| {
+                DeepseekRuntimeError::Invalid(format!(
+                    "reusable MXFP4 tensor {name:?} has no .weight suffix"
+                ))
+            })?;
+        names.push(name.clone());
+        buffers.push(values.into_vec());
+        names.push(scale_name);
+        buffers.push(scales.into_vec());
+    }
+
+    // V4 stores all three scale tensors together, followed much later by all three payloads.
+    // Reading this batch in physical order avoids repeatedly seeking between those two regions.
+    // Existing experts originate as Vec-backed reads, so keeping that allocation class also avoids
+    // glibc retaining a displaced generation of large heap buffers under tight RAM.
+    let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let payloads = index.read_tensors_bounded_reusing(&name_refs, buffers, maximum_bytes)?;
+    let mut payloads = payloads.into_iter();
+    specifications
+        .iter()
+        .map(|(_, rows, cols)| {
+            let values = payloads
+                .next()
+                .expect("each reusable MXFP4 matrix has a value payload")
+                .into();
+            let scales = payloads
+                .next()
+                .expect("each reusable MXFP4 matrix has a scale payload")
+                .into();
+            MxFp4Matrix::from_read_buffers(*rows, *cols, 32, values, scales)
+                .map(WeightMatrix::MxFp4)
+                .map_err(WeightError::from)
+                .map_err(DeepseekRuntimeError::from)
+        })
+        .collect()
 }
 
 fn bf16_rms_norm(
@@ -1646,7 +4205,7 @@ mod tests {
             vocab_size: geometry.vocab_size,
             bos_token_id: 0,
             eos_token_id: (geometry.vocab_size - 1) as u32,
-            max_position_embeddings: 8,
+            max_position_embeddings: 16,
             rms_norm_eps: geometry.rms_norm_eps,
             rope_theta: 10000.0,
             rope_scaling: super::super::config::RopeScaling {
@@ -1978,7 +4537,8 @@ mod tests {
         )
         .unwrap();
         let hidden = embedding.repeat(config.hc_mult);
-        let layer = DecoderLayer::load(&index, &config, 0).unwrap();
+        let vectors = DecoderLayerVectors::load(&index, &config, 0).unwrap();
+        let layer = DecoderLayer::load(&index, &config, 0, &vectors).unwrap();
         let mut attention = AttentionState::new(&config, 0).unwrap();
         let mut experts = DeepExpertStore::new(Arc::clone(&index), &config, 0, u64::MAX).unwrap();
 
@@ -2049,8 +4609,11 @@ mod tests {
         let oracle = tiny_oracle();
         let directory = fixture_dir();
         write_oracle_checkpoint(&directory, &oracle);
-        let model = DeepseekRuntimeModel::load(&directory, options()).unwrap();
-        let prompt = [oracle.token as u32, oracle.token as u32];
+        const PROMPT_TOKENS: usize = 13;
+        let mut load_options = options();
+        load_options.context_limit = PROMPT_TOKENS + 1;
+        let model = DeepseekRuntimeModel::load(&directory, load_options).unwrap();
+        let prompt = [oracle.token as u32; PROMPT_TOKENS];
 
         let mut sequential_state = model.new_state().unwrap();
         let mut sequential = None;
@@ -2068,9 +4631,23 @@ mod tests {
             batched_state.cached_f32_elements(),
             sequential_state.cached_f32_elements()
         );
+        let batched_telemetry = batched_state.expert_telemetry().clone();
+        let sequential_telemetry = sequential_state.expert_telemetry().clone();
         assert_eq!(
-            batched_state.expert_telemetry(),
-            sequential_state.expert_telemetry()
+            batched_telemetry.accesses(),
+            sequential_telemetry.accesses()
+        );
+        assert!(batched_telemetry.hits > sequential_telemetry.hits);
+        assert!(batched_telemetry.misses < sequential_telemetry.misses);
+        assert!(batched_telemetry.evictions < sequential_telemetry.evictions);
+        assert!(batched_telemetry.bytes_read < sequential_telemetry.bytes_read);
+        assert_eq!(
+            batched_telemetry.resident_experts,
+            sequential_telemetry.resident_experts
+        );
+        assert_eq!(
+            batched_telemetry.resident_bytes,
+            sequential_telemetry.resident_bytes
         );
 
         let next_sequential = model
@@ -2080,10 +4657,27 @@ mod tests {
             .forward_token(oracle.token as u32, &mut batched_state)
             .unwrap();
         assert_eq!(next_batched, next_sequential);
+        let next_sequential_telemetry = sequential_state.expert_telemetry();
+        let next_batched_telemetry = batched_state.expert_telemetry();
+        assert_eq!(
+            next_batched_telemetry.hits - batched_telemetry.hits,
+            next_sequential_telemetry.hits - sequential_telemetry.hits
+        );
+        assert_eq!(
+            next_batched_telemetry.misses - batched_telemetry.misses,
+            next_sequential_telemetry.misses - sequential_telemetry.misses
+        );
+        assert_eq!(
+            next_batched_telemetry.bytes_read - batched_telemetry.bytes_read,
+            next_sequential_telemetry.bytes_read - sequential_telemetry.bytes_read
+        );
 
         let mut profiled_state = model.new_state().unwrap();
         let profile = ProfileSession::start_with_threads_and_trace(None, true);
         let logits = CausalDecoder::prefill(&model, &prompt, &mut profiled_state).unwrap();
+        let _decode = model
+            .forward_token(oracle.token as u32, &mut profiled_state)
+            .unwrap();
         let report = profile.finish();
         assert_eq!(logits, sequential.logits);
         assert_eq!(report.stage(ProfileStage::Prefill).unwrap().calls, 1);
@@ -2093,9 +4687,12 @@ mod tests {
         );
         assert_eq!(
             report.stage(ProfileStage::DeepseekLayer).unwrap().calls,
-            (model.config().num_hidden_layers * prompt.len()) as u64
+            (model.config().num_hidden_layers * (prompt.len() + 1)) as u64
         );
-        assert_eq!(report.stage(ProfileStage::DeepseekLmHead).unwrap().calls, 1);
+        assert_eq!(report.stage(ProfileStage::DeepseekLmHead).unwrap().calls, 2);
+        assert!(report
+            .stage(ProfileStage::StreamedMatrixReadDecode)
+            .is_none());
         let trace: serde_json::Value = serde_json::from_slice(
             &report
                 .chrome_trace_json_pretty()
@@ -2137,6 +4734,43 @@ mod tests {
         assert_eq!(state.cached_f32_elements(), 2);
         let output = generate(&model, &[1], &GenerationConfig::greedy(2, vec![7]), |_| {}).unwrap();
         assert_eq!(output.generated_tokens, vec![0, 0]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn decoder_reloads_share_the_model_resident_vector_payloads() {
+        let directory = fixture_dir();
+        write_tiny_checkpoint(&directory);
+        let model = DeepseekRuntimeModel::load(&directory, options()).unwrap();
+        let vectors = &model.decoder_vectors[0];
+        let first = DecoderLayer::load(&model.index, &model.config, 0, vectors).unwrap();
+        let second = DecoderLayer::load(&model.index, &model.config, 0, vectors).unwrap();
+
+        assert!(Arc::ptr_eq(&first.attn_hc.base, &vectors.attn_hc.base));
+        assert!(Arc::ptr_eq(&first.attn_hc.scale, &vectors.attn_hc.scale));
+        assert!(Arc::ptr_eq(&first.ffn_hc.base, &vectors.ffn_hc.base));
+        assert!(Arc::ptr_eq(&first.ffn_hc.scale, &vectors.ffn_hc.scale));
+        assert!(Arc::ptr_eq(&first.attn_norm, &vectors.attn_norm));
+        assert!(Arc::ptr_eq(&first.ffn_norm, &vectors.ffn_norm));
+        assert!(Arc::ptr_eq(&first.attention.sink, &vectors.attention.sink));
+        assert!(Arc::ptr_eq(
+            &first.attention.q_norm,
+            &vectors.attention.q_norm
+        ));
+        assert!(Arc::ptr_eq(
+            &first.attention.kv_norm,
+            &vectors.attention.kv_norm
+        ));
+        assert!(Arc::ptr_eq(
+            first.moe.correction_bias.as_ref().unwrap(),
+            vectors.correction_bias.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&first.attn_norm, &second.attn_norm));
+        assert!(Arc::ptr_eq(
+            first.moe.correction_bias.as_ref().unwrap(),
+            second.moe.correction_bias.as_ref().unwrap()
+        ));
+
         fs::remove_dir_all(directory).unwrap();
     }
 }

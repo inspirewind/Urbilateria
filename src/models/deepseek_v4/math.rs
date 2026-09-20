@@ -104,17 +104,54 @@ fn round_to_bf16(value: f32) -> Result<f32, DeepseekMathError> {
 /// Executes one native linear layer, including the checkpoint's required activation-side MXFP8
 /// quantize/dequantize simulation for MXFP8 and MXFP4 weights.
 pub fn linear(weight: &WeightMatrix, input: &[f32]) -> Result<Vec<f32>, DeepseekMathError> {
-    let input = if weight.uses_mx_activation_quantization() {
-        let _profile = span(ProfileStage::DeepseekActivationQuantization);
-        simulate_e4m3_activation(input, 128).map_err(|error| {
-            DeepseekMathError::Invalid(format!("activation quantization failed: {error}"))
-        })?
-    } else {
-        input.to_vec()
-    };
-    let mut output = weight.matvec(&input)?;
     if weight.uses_mx_activation_quantization() {
+        let quantized = prepare_mx_activation(input)?;
+        linear_with_mx_activation(weight, input, &quantized)
+    } else {
+        // Plain matrices consume the caller's input directly; cloning it here used to add memory
+        // traffic to every router, norm projection, and other unquantized linear operation.
+        Ok(weight.matvec(input)?)
+    }
+}
+
+/// Produces the checkpoint-defined activation shared by MXFP8/MXFP4 projections with the same
+/// source vector. Gate/up and sibling routed experts all observe identical quantized values, so
+/// preparing them once removes redundant scans and allocations without changing arithmetic.
+pub(super) fn prepare_mx_activation(input: &[f32]) -> Result<Vec<f32>, DeepseekMathError> {
+    let _profile = span(ProfileStage::DeepseekActivationQuantization);
+    simulate_e4m3_activation(input, 128).map_err(|error| {
+        DeepseekMathError::Invalid(format!("activation quantization failed: {error}"))
+    })
+}
+
+/// Applies a linear layer with an already prepared MX activation. Non-MX matrices deliberately
+/// continue to consume the original input, which keeps synthetic/reference checkpoints valid.
+pub(super) fn linear_with_mx_activation(
+    weight: &WeightMatrix,
+    input: &[f32],
+    mx_input: &[f32],
+) -> Result<Vec<f32>, DeepseekMathError> {
+    let uses_mx = weight.uses_mx_activation_quantization();
+    let mut output = weight.matvec(if uses_mx { mx_input } else { input })?;
+    if uses_mx {
         // The release kernels accumulate in FP32 but materialize MX GEMM outputs as BF16.
+        round_to_bf16_in_place(&mut output)?;
+    }
+    Ok(output)
+}
+
+/// Batched counterpart of [`linear_with_mx_activation`]. Inputs and their shared MX views are
+/// consecutive `[batch, columns]` rows; every output row keeps the same numerical boundary as the
+/// independent matvec path.
+pub(super) fn linear_with_mx_activation_batch(
+    weight: &WeightMatrix,
+    input: &[f32],
+    mx_input: &[f32],
+    batch: usize,
+) -> Result<Vec<f32>, DeepseekMathError> {
+    let uses_mx = weight.uses_mx_activation_quantization();
+    let mut output = weight.matmul_rows(if uses_mx { mx_input } else { input }, batch)?;
+    if uses_mx {
         round_to_bf16_in_place(&mut output)?;
     }
     Ok(output)
@@ -172,11 +209,11 @@ pub fn unit_rms_norm_in_place(
 
 /// Scalar form of the official sparse-attention kernel. The learned sink contributes only a
 /// zero-valued softmax slot, hence it changes the denominator but never the value numerator.
-pub fn sparse_attention_with_sink(
+pub fn sparse_attention_with_sink<K: AsRef<[f32]>>(
     queries: &[f32],
     head_count: usize,
     head_dim: usize,
-    keys_values: &[Vec<f32>],
+    keys_values: &[K],
     selected: &[usize],
     sinks: &[f32],
     softmax_scale: f32,
@@ -187,7 +224,9 @@ pub fn sparse_attention_with_sink(
         || sinks.len() != head_count
         || selected.is_empty()
         || selected.iter().any(|&index| index >= keys_values.len())
-        || keys_values.iter().any(|values| values.len() != head_dim)
+        || keys_values
+            .iter()
+            .any(|values| values.as_ref().len() != head_dim)
         || !softmax_scale.is_finite()
         || softmax_scale <= 0.0
     {
@@ -198,33 +237,32 @@ pub fn sparse_attention_with_sink(
     let mut output = vec![0.0f32; queries.len()];
     for head in 0..head_count {
         let query = &queries[head * head_dim..(head + 1) * head_dim];
-        let scores = selected
+        let mut scores = selected
             .iter()
             .map(|&index| {
                 query
                     .iter()
-                    .zip(&keys_values[index])
+                    .zip(keys_values[index].as_ref())
                     .map(|(&left, &right)| left * right)
                     .sum::<f32>()
                     * softmax_scale
             })
             .collect::<Vec<_>>();
         let maximum = scores.iter().copied().fold(sinks[head], f32::max);
-        let exponentials = scores
-            .iter()
-            .map(|score| (*score - maximum).exp())
-            .collect::<Vec<_>>();
-        let denominator = exponentials.iter().sum::<f32>() + (sinks[head] - maximum).exp();
+        for score in &mut scores {
+            *score = (*score - maximum).exp();
+        }
+        let denominator = scores.iter().sum::<f32>() + (sinks[head] - maximum).exp();
         if !denominator.is_finite() || denominator <= 0.0 {
             return Err(DeepseekMathError::NonFinite);
         }
-        for (&index, probability) in selected.iter().zip(
-            exponentials
-                .iter()
-                .map(|exponential| exponential / denominator),
-        ) {
+        for (&index, probability) in selected
+            .iter()
+            .zip(scores.iter().map(|exponential| exponential / denominator))
+        {
             for feature in 0..head_dim {
-                output[head * head_dim + feature] += probability * keys_values[index][feature];
+                output[head * head_dim + feature] +=
+                    probability * keys_values[index].as_ref()[feature];
             }
         }
     }

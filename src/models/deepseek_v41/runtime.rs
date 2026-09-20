@@ -28,7 +28,7 @@ use crate::runtime::cache::LayerLruCache;
 use crate::runtime::{ExpertTelemetry, RuntimeLoadOptions};
 use crate::storage::{
     inspect_weight_matrix, load_reference_matrix_row, load_reference_values, load_reference_vector,
-    load_weight_matrices, load_weight_matrix, streamed_reference_matvec, SafetensorError,
+    load_weight_matrices, load_weight_matrix, streamed_reference_matvec_pipelined, SafetensorError,
     TensorIndex, TensorLoadError, WeightLoadError,
 };
 use crate::tokenizer::{ByteBpeTokenizer, TokenizerError};
@@ -378,8 +378,8 @@ impl DeepseekV41RuntimeModel {
         let hidden = collapse_bf16(&hidden, &incoming_pre, text.hidden_size)?;
         let hidden = bf16_rms_norm(&hidden, &self.final_norm, text.rms_norm_eps as f32)?;
         let _head_profile = span(ProfileStage::DeepseekLmHead);
-        let logits = streamed_reference_matvec(
-            &self.index,
+        let logits = streamed_reference_matvec_pipelined(
+            Arc::clone(&self.index),
             "head.weight",
             text.vocab_size,
             text.hidden_size,

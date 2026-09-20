@@ -137,6 +137,54 @@ Large matvec output rows run on one persistent CPU worker pool. Prompt ingestion
 DeepSeek-V4, Kimi-K3, Hy4, and the Qwen3.8 library runtime: one decoder layer is loaded for the entire
 prompt, and only the final prompt token reaches the vocabulary-sized LM head. DeepSeek-V4.1
 currently uses its exact token-at-a-time path for prompt prefill as well as decode.
+Adapters that stream a BF16 vocabulary head use a fixed-residency, queue-depth-aware pipeline. Up to
+eight I/O workers read adjacent subdivisions while the CPU pool computes the current one; all raw
+buffers together stay within the former single-chunk budget and are reused as the window advances.
+
+DeepSeek-V4 uses spare authorized RAM before generation to retain decoder layers and the compact
+BF16 LM head while preserving at least one complete routed-expert stripe. If the budget is smaller,
+it uses a streamed vocabulary head and pipelines decoder-layer reads with compute. Under partial
+layer residency, up to three persistent layer slots are exchanged for a four-layer read-ahead
+window, so storage can run farther ahead without increasing the conservative peak-RAM allowance; fully resident and
+minimum-memory configurations retain their existing behavior. On GNU/Linux, plans that stream any
+decoder layers also keep weight allocations up to 64 MiB in the bounded glibc arenas. Successive
+same-shaped layers therefore reuse already-faulted pages instead of repeating anonymous
+`mmap`/`munmap` cycles; fully resident plans leave the allocator threshold unchanged to avoid
+retaining prefill scratch that they cannot reuse. Independently of that allocator hint, a retired
+streamed layer donates its native MXFP8/MXFP4 payload and scale buffers to the next compatible
+prefetch task; exact-size buffers are overwritten in physical shard order while the existing
+read-ahead depth and RAM plan stay unchanged. Once every payload of a target layer has passed its
+first validation, later decode reloads retain all shape checks but skip the redundant linear scan
+of the same immutable quantized bytes. Decoder normalization, bias, sink, and hyper-connection
+vectors are read once in physical shard order and shared by every reload through immutable
+`Arc` storage; the planner charges this under-2-MiB cache explicitly. Fully resident layers never
+enter either reuse path. Routed
+experts that fit together compute concurrently and share one activation quantization. For an
+ordered single-token route batch no larger than the layer cache, the runtime simulates the serial
+LRU accesses, evicts exactly their inevitable victims up front, then loads and computes the batch
+concurrently before replaying its logical accesses in order. Larger batches retain the bounded
+fallback: one reserved transient expert pipelines the next storage read with the current expert's
+compute without exceeding the RAM plan. Evicted native MXFP4 experts donate their
+payload buffers to the next miss, whose six scale/payload ranges are read in physical shard order.
+During layer-wise prefill, the active layer temporarily borrows globally unused expert slots and
+groups up to 24 routing tokens by expert; exact MXFP4 kernels internally split groups above twelve.
+Logical
+cache accesses are then replayed in token/expert order before the borrowed capacity is returned.
+Batch misses are submitted to the bounded I/O pool up front, so blocking reads and cached-expert
+MXFP4 compute can overlap without occupying the Rayon compute workers. When a window's unique-expert
+union exceeds the active layer's available slots, the runtime no longer falls back for the entire
+layer token by token. It orders experts by last use and repeatedly reuses cache-sized parallel
+chunks, preserving cross-token batching and the final token-major LRU hot set within the fixed RAM
+budget. The same prefill path batches the independent Q/KV and output projections before replaying
+causal attention in token order; exact
+multi-input AVX2 kernels cover both ModelOpt 1x32 and block-quantized 128x128 MXFP8 layouts, including
+grouped output row ranges and compressor/indexer projections. Streamed BF16 matvecs defer payload
+finiteness checks to the already mandatory per-row result validation, preserving NaN/infinity
+rejection while avoiding a redundant full scan of large vocabulary heads across model runtimes.
+The default CPU pool uses one worker per available physical core; `--threads` remains an explicit
+override for measurement or unusual topologies, avoiding the cache/bandwidth regression from SMT.
+Decode rollback and sparse attention use incremental/no-copy KV views, so their copy cost does not
+grow with compressed history.
 
 ## Model Coverage
 
