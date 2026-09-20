@@ -680,6 +680,7 @@ impl TensorIndex {
         len: usize,
         reuse: Option<ReadBuffer>,
     ) -> Result<ReadBuffer, SafetensorError> {
+        #[cfg(target_os = "linux")]
         let mut reuse = reuse;
         #[cfg(target_os = "linux")]
         if direct_expert_io_enabled() && len != 0 {
@@ -839,6 +840,7 @@ impl TensorIndex {
         len: usize,
         reuse: Option<ReadBuffer>,
     ) -> Result<ReadBuffer, SafetensorError> {
+        #[cfg(target_os = "linux")]
         let mut reuse = reuse;
         #[cfg(target_os = "linux")]
         if direct_expert_io_enabled() {
@@ -1527,15 +1529,17 @@ mod tests {
             .read_range_direct_reusing("b", 1, 2, Some(output.into()))
             .unwrap();
         assert_eq!(direct.as_ref(), [8, 9]);
-        if matches!(direct, ReadBuffer::Heap(_)) {
-            assert_eq!(direct.as_ptr(), direct_pointer);
-        } else {
-            let expected = (index.require("b").unwrap().data_offset + 1)
-                % u64::try_from(DIRECT_ALIGNMENT).unwrap();
-            assert_eq!(
-                direct.as_ptr() as usize % DIRECT_ALIGNMENT,
-                expected as usize
-            );
+        match &direct {
+            ReadBuffer::Heap(_) => assert_eq!(direct.as_ptr(), direct_pointer),
+            #[cfg(target_os = "linux")]
+            ReadBuffer::Direct(_) => {
+                let expected = (index.require("b").unwrap().data_offset + 1)
+                    % u64::try_from(DIRECT_ALIGNMENT).unwrap();
+                assert_eq!(
+                    direct.as_ptr() as usize % DIRECT_ALIGNMENT,
+                    expected as usize
+                );
+            }
         }
         let direct_pointer = direct.as_ptr();
         let direct = index
@@ -1543,7 +1547,7 @@ mod tests {
             .unwrap();
         assert_eq!(direct.as_ref(), [8, 9]);
         assert_eq!(direct.as_ptr(), direct_pointer);
-        let was_direct = matches!(direct, ReadBuffer::Direct(_));
+        let was_direct = !matches!(direct, ReadBuffer::Heap(_));
         let aligned_pointer = direct.as_ptr();
         let aligned = index
             .read_range_aligned_reusing("b", 1, 2, Some(direct))

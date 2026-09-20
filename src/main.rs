@@ -6,8 +6,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use urbilateria::analysis::{
     analyze_checkpoint, build_deepseek_resource_plan, build_deepseek_v41_resource_plan,
-    build_hy4_resource_plan, build_kimi_k3_resource_plan, build_resource_plan, probe_tensor,
-    CheckpointReport, ProbeReport, ResourcePlan,
+    build_hy4_resource_plan, build_kimi_k3_resource_plan, build_resource_plan, decode_tokens,
+    detect_available_ram, explain_checkpoint, inspect_checkpoint, list_tensors, parse_token_ids,
+    plan_checkpoint, preflight_checkpoint, probe_tensor, tokenize_text, CheckpointReport,
+    DecodeReport, InspectionReport, ListOptions, PlanOptions, PreflightOptions, PreflightReport,
+    ProbeReport, ResourcePlan, TokenizeOptions, TokenizeReport,
 };
 use urbilateria::execution::{
     configure_threads, enable_streamed_weight_allocation_reuse, worker_threads,
@@ -25,7 +28,6 @@ use urbilateria::models::glm::runtime::GlmRuntimeModel;
 use urbilateria::models::hy4::runtime::Hy4RuntimeModel;
 use urbilateria::models::hy4::{prompt as hy4_prompt, schema as hy4_schema};
 use urbilateria::models::kimi_k3::runtime::KimiK3RuntimeModel;
-use urbilateria::models::kimi_k3::schema as kimi_k3_schema;
 use urbilateria::models::kimi_k3::{prompt as kimi_k3_prompt, tokenizer::KimiK3Tokenizer};
 use urbilateria::models::qwen3_8::{
     prompt as qwen38_prompt, schema as qwen38_schema, Qwen38Config, Qwen38RuntimeModel,
@@ -37,9 +39,11 @@ use urbilateria::tokenizer::{
     render_chat, ByteBpeTokenizer, ChatMessage, ChatRole, ChatTemplateOptions, TokenizerError,
 };
 use urbilateria::{
-    DeepseekV41Config, DeepseekV4Config, GlmConfig, Hy4Config, KimiK3Config, ModelConfig,
-    ModelFamily,
+    DeepseekV41Config, DeepseekV4Config, Hy4Config, KimiK3Config, ModelConfig, ModelFamily,
 };
+
+#[cfg(feature = "ui")]
+mod ui;
 
 fn main() {
     if let Err(error) = run() {
@@ -57,45 +61,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
         "--version" | "-V" | "version" => println!("urb {}", env!("CARGO_PKG_VERSION")),
+        "ui" => {
+            #[cfg(feature = "ui")]
+            ui::run_args(args.collect())?;
+            #[cfg(not(feature = "ui"))]
+            return Err("this build does not include the TUI; rebuild with --features ui".into());
+        }
         "inspect" => {
             let model = required_path(args.next(), "inspect requires MODEL_DIR")?;
             let flags: Vec<String> = args.collect();
             reject_unknown(&flags, &["--json"])?;
             let json = flags.iter().any(|flag| flag == "--json");
-            match ModelConfig::load(&model)? {
-                ModelConfig::Qwen38(config) => {
-                    let report = qwen38_schema::inspect_manifest(&config, &model)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    } else {
-                        print_qwen38_manifest(&report);
-                    }
-                }
-                ModelConfig::Hy4(config) => {
-                    let index = TensorIndex::open(&model)?;
-                    let report = hy4_schema::inspect_requirements(&config, &index, 1, 0)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    } else {
-                        print_hy4_manifest(&report);
-                    }
-                }
-                ModelConfig::DeepseekV41(config) => {
-                    let index = TensorIndex::open(&model)?;
-                    let report = deepseek_v41_schema::inspect_requirements(&config, &index, 1, 0)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    } else {
-                        print_deepseek_v41_manifest(&report);
-                    }
-                }
-                _ => {
-                    let report = analyze_checkpoint(&model)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&report)?);
-                    } else {
-                        print_checkpoint(&report);
-                    }
+            let inspection =
+                inspect_checkpoint(&model).map_err(|error| -> Box<dyn Error> { error })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&inspection.report)?);
+            } else {
+                match &inspection.report {
+                    InspectionReport::Checkpoint(report) => print_checkpoint(report),
+                    InspectionReport::Qwen38(report) => print_qwen38_manifest(report),
+                    InspectionReport::Hy4(report) => print_hy4_manifest(report),
+                    InspectionReport::DeepseekV41(report) => print_deepseek_v41_manifest(report),
                 }
             }
         }
@@ -129,57 +115,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &["--json"],
                 &["--ram-gib", "--context", "--kv-bytes"],
             )?;
-            let config = ModelConfig::load(&model)?;
-            if matches!(config, ModelConfig::Qwen38(_)) {
-                return Err("the generic `urb plan` report does not represent Qwen3.8 hybrid state; use `urb preflight MODEL_DIR --context N --expert-slots N` for its exact streamed-layer, recurrent, convolution, GQA-KV, scratch, and expert-cache budgets".into());
-            }
-            let plan = match &config {
-                ModelConfig::Glm52(config) => {
-                    let report = analyze_checkpoint(&model)?;
-                    build_resource_plan(config, &report, ram_gib, context, kv_bytes)
-                }
-                ModelConfig::DeepseekV4(config) => {
-                    let report = analyze_checkpoint(&model)?;
-                    let context_usize = usize::try_from(context)
-                        .map_err(|_| "--context does not fit this platform")?;
-                    let index = TensorIndex::open(&model)?;
-                    let requirements =
-                        deepseek_schema::inspect_requirements(config, &index, context_usize, 0)?;
-                    build_deepseek_resource_plan(
-                        config,
-                        &report,
-                        &requirements,
-                        ram_gib,
-                        context,
-                        kv_bytes,
-                    )
-                }
-                ModelConfig::DeepseekV41(config) => {
-                    let context_usize = usize::try_from(context)
-                        .map_err(|_| "--context does not fit this platform")?;
-                    let index = TensorIndex::open(&model)?;
-                    let requirements = deepseek_v41_schema::inspect_requirements(
-                        config,
-                        &index,
-                        context_usize,
-                        0,
-                    )?;
-                    build_deepseek_v41_resource_plan(config, &requirements, ram_gib, context)
-                }
-                ModelConfig::KimiK3(config) => {
-                    let report = analyze_checkpoint(&model)?;
-                    build_kimi_k3_resource_plan(config, &report, ram_gib, context, kv_bytes)
-                }
-                ModelConfig::Hy4(config) => {
-                    let context_usize = usize::try_from(context)
-                        .map_err(|_| "--context does not fit this platform")?;
-                    let index = TensorIndex::open(&model)?;
-                    let requirements =
-                        hy4_schema::inspect_requirements(config, &index, context_usize, 0)?;
-                    build_hy4_resource_plan(config, &requirements, ram_gib, context, kv_bytes)
-                }
-                ModelConfig::Qwen38(_) => unreachable!("Qwen3.8 returned before generic analysis"),
-            };
+            let planning = plan_checkpoint(
+                &model,
+                PlanOptions {
+                    ram_bytes: Some(ram_gib),
+                    context,
+                    kv_bytes,
+                },
+            )
+            .map_err(|error| -> Box<dyn Error> { error })?;
+            let plan = planning.report;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -204,245 +149,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &["--json", "--partial"],
                 &["--context", "--expert-slots"],
             )?;
-            match ModelConfig::load(&model)? {
-                ModelConfig::Glm52(_) => {
-                    if partial {
-                        return Err(
-                            "--partial is currently specific to an in-progress Kimi-K3 transfer"
-                                .into(),
-                        );
-                    }
-                    let requirements =
-                        GlmRuntimeModel::inspect_requirements(&model, context, expert_slots)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&requirements)?);
-                    } else {
-                        print_runtime_requirements(
-                            "GLM-5.2",
-                            requirements.context_limit,
-                            requirements.exact_context_ceiling,
-                            requirements.resident_bytes,
-                            requirements.kv_cache_bytes,
-                            requirements.maximum_expert_bytes,
-                            requirements.transient_expert_bytes,
-                            requirements.expert_cache_bytes,
-                            requirements.expert_slots_per_layer,
-                        );
-                    }
-                }
-                ModelConfig::DeepseekV4(config) => {
-                    if partial {
-                        return Err(
-                            "--partial is currently specific to an in-progress Kimi-K3 transfer"
-                                .into(),
-                        );
-                    }
-                    let index = TensorIndex::open(&model)?;
-                    let requirements = deepseek_schema::inspect_requirements(
-                        &config,
-                        &index,
-                        context,
-                        expert_slots,
-                    )?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&requirements)?);
-                    } else {
-                        print_runtime_requirements(
-                            "DeepSeek-V4",
-                            requirements.context_limit,
-                            requirements.exact_context_ceiling,
-                            requirements.resident_bytes,
-                            requirements.kv_cache_bytes,
-                            requirements.maximum_expert_bytes,
-                            requirements.transient_expert_bytes,
-                            requirements.expert_cache_bytes,
-                            requirements.expert_slots_per_layer,
-                        );
-                        println!(
-                            "  schema tensors      {} required / {} present ({} unexpected)",
-                            requirements.required_tensor_count,
-                            requirements.checkpoint_tensor_count,
-                            requirements.unexpected_tensor_count
-                        );
-                        println!(
-                            "  streamed rows       embedding {}, LM head {}",
-                            human_bytes(requirements.streamed_embedding_bytes),
-                            human_bytes(requirements.streamed_lm_head_bytes)
-                        );
-                        println!(
-                            "  architecture        {} indexed layers, {} DSpark stages",
-                            requirements.indexed_layer_count, requirements.dspark_stage_count
-                        );
-                    }
-                }
-                ModelConfig::DeepseekV41(config) => {
-                    if partial {
-                        return Err("DeepSeek-V4.1 preflight validates the complete native release; --partial applies only to Kimi-K3 shard transfer".into());
-                    }
-                    let index = TensorIndex::open(&model)?;
-                    let requirements = deepseek_v41_schema::inspect_requirements(
-                        &config,
-                        &index,
-                        context,
-                        expert_slots,
-                    )?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&requirements)?);
-                    } else {
-                        print_deepseek_v41_manifest(&requirements);
-                    }
-                }
-                ModelConfig::Hy4(config) => {
-                    if partial {
-                        return Err("Hy4 preflight validates the complete 130-shard release; --partial is Kimi-K3-specific".into());
-                    }
-                    let index = TensorIndex::open(&model)?;
-                    let requirements =
-                        hy4_schema::inspect_requirements(&config, &index, context, expert_slots)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&requirements)?);
-                    } else {
-                        print_runtime_requirements(
-                            "Hy4-preview-FP8",
-                            requirements.context_limit,
-                            requirements.exact_context_ceiling,
-                            requirements.resident_bytes,
-                            requirements.kv_cache_bytes,
-                            requirements.maximum_expert_bytes,
-                            requirements.transient_expert_bytes,
-                            requirements.expert_cache_bytes,
-                            requirements.expert_slots_per_layer,
-                        );
-                        println!(
-                            "  schema tensors      {} required / {} present across {} shards",
-                            requirements.required_tensor_count,
-                            requirements.checkpoint_tensor_count,
-                            requirements.checkpoint_shard_count
-                        );
-                        println!(
-                            "  architecture        {} full IndexCache layers · MTP {} (validated, base forward excludes it)",
-                            requirements.full_indexer_layer_count,
-                            human_bytes(requirements.mtp_payload_bytes)
-                        );
-                    }
-                }
-                ModelConfig::KimiK3(config) => {
-                    let index = TensorIndex::open(&model)?;
-                    if partial {
-                        let requirements =
-                            kimi_k3_schema::inspect_available_layers(&config, &index)?;
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&requirements)?);
-                        } else {
-                            let range = match (
-                                requirements.validated_layers.first(),
-                                requirements.validated_layers.last(),
-                            ) {
-                                (Some(first), Some(last)) => format!("{first}..={last}"),
-                                _ => "none".to_owned(),
-                            };
-                            println!("Kimi-K3 partial checkpoint preflight");
-                            println!(
-                                "  validated layers    {} ({range})",
-                                requirements.validated_layers.len()
-                            );
-                            println!(
-                                "  validated tensors   {} decoder / {} visible total",
-                                requirements.validated_tensor_count,
-                                requirements.checkpoint_tensor_count
-                            );
-                            println!(
-                                "  non-layer tensors   {} (not asserted in partial mode)",
-                                requirements.non_layer_tensor_count
-                            );
-                            println!(
-                                "  complete shards     {} exact .safetensors files",
-                                requirements.checkpoint_shard_count
-                            );
-                        }
-                    } else {
-                        let requirements = kimi_k3_schema::inspect_requirements(&config, &index)?;
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&requirements)?);
-                        } else {
-                            println!("Kimi-K3 complete multimodal checkpoint preflight");
-                            println!(
-                                "  schema tensors      {} required / {} present",
-                                requirements.required_tensor_count,
-                                requirements.checkpoint_tensor_count
-                            );
-                            println!(
-                                "  decoder tensors     {} ({} KDA, {} MLA; {} dense, {} MoE layers)",
-                                requirements.decoder_tensor_count,
-                                requirements.kda_layer_count,
-                                requirements.mla_layer_count,
-                                requirements.dense_layer_count,
-                                requirements.moe_layer_count
-                            );
-                            println!(
-                                "  multimodal tensors  {} projector + {} vision",
-                                requirements.projector_tensor_count,
-                                requirements.vision_tensor_count
-                            );
-                            println!(
-                                "  logical parameters  {}",
-                                requirements.logical_parameter_count
-                            );
-                            println!(
-                                "  checkpoint payload  {} across {} shards",
-                                human_bytes(requirements.checkpoint_payload_bytes),
-                                requirements.checkpoint_shard_count
-                            );
-                        }
-                    }
-                }
-                ModelConfig::Qwen38(_) => {
-                    if partial {
-                        return Err("Qwen3.8 runtime preflight validates the complete official checkpoint; --partial applies only to Kimi-K3 shard transfer".into());
-                    }
-                    let requirements =
-                        Qwen38RuntimeModel::inspect_requirements(&model, context, expert_slots)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&requirements)?);
-                    } else {
-                        println!("Qwen3.8 complete text-runtime preflight");
-                        println!(
-                            "  checkpoint          {} tensors across {} shards ({})",
-                            requirements.schema.checkpoint_tensor_count,
-                            requirements.schema.checkpoint_shard_count,
-                            human_bytes(requirements.schema.checkpoint_payload_bytes)
-                        );
-                        println!(
-                            "  streamed layer      {} peak",
-                            human_bytes(requirements.streamed_layer_bytes)
-                        );
-                        println!(
-                            "  recurrent + conv    {} + {}",
-                            human_bytes(requirements.recurrent_state_bytes),
-                            human_bytes(requirements.convolution_state_bytes)
-                        );
-                        println!(
-                            "  full-GQA KV         {} for {} tokens",
-                            human_bytes(requirements.kv_cache_bytes),
-                            requirements.context_limit
-                        );
-                        println!(
-                            "  execution scratch   {} (includes layer-wise prompt snapshots)",
-                            human_bytes(requirements.scratch_bytes)
-                        );
-                        println!(
-                            "  routed expert       {} each · {} cache slots/layer · {} cache",
-                            human_bytes(requirements.expert_bytes),
-                            requirements.expert_slots_per_layer,
-                            human_bytes(requirements.expert_cache_bytes)
-                        );
-                        println!(
-                            "  resident execution  {} persistent · {} miss peak (state separate)",
-                            human_bytes(requirements.resident_bytes),
-                            human_bytes(requirements.peak_resident_bytes)
-                        );
-                    }
-                }
+            let preflight = preflight_checkpoint(
+                &model,
+                PreflightOptions {
+                    context,
+                    expert_slots,
+                    partial,
+                },
+            )
+            .map_err(|error| -> Box<dyn Error> { error })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preflight.report)?);
+            } else {
+                print_preflight(&preflight.report);
             }
         }
         "probe" => {
@@ -473,94 +192,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             if no_thinking && !chat {
                 return Err("--no-thinking requires --chat".into());
             }
-            let config = ModelConfig::load(&model)?;
-            let (prompt, token_ids) = match config {
-                ModelConfig::KimiK3(_) => {
-                    let tokenizer = KimiK3Tokenizer::load(&model)?;
-                    if chat {
-                        let messages = [kimi_k3_prompt::Message::new(
-                            kimi_k3_prompt::Role::User,
-                            text,
-                        )];
-                        let options = kimi_k3_prompt::PromptOptions {
-                            thinking: !no_thinking,
-                            thinking_effort: (!no_thinking)
-                                .then_some(kimi_k3_prompt::ThinkingEffort::Max),
-                            ..kimi_k3_prompt::PromptOptions::default()
-                        };
-                        let prompt = kimi_k3_prompt::render_chat(&messages, options)?;
-                        let token_ids = tokenizer.encode_chat(&messages, options)?;
-                        (prompt, token_ids)
-                    } else {
-                        let token_ids = tokenizer.encode(&text)?;
-                        (text, token_ids)
-                    }
-                }
-                config => {
-                    let tokenizer = ByteBpeTokenizer::load(&model)?;
-                    let prompt = if chat {
-                        tokenizer.validate_chat_content(&text)?;
-                        match config {
-                            ModelConfig::Glm52(_) => render_chat(
-                                &[ChatMessage::new(ChatRole::User, text)],
-                                ChatTemplateOptions {
-                                    enable_thinking: !no_thinking,
-                                    ..ChatTemplateOptions::default()
-                                },
-                            ),
-                            ModelConfig::DeepseekV4(_) => deepseek_prompt::render_chat(
-                                &[deepseek_prompt::Message::new(
-                                    deepseek_prompt::Role::User,
-                                    text,
-                                )],
-                                deepseek_prompt::PromptOptions {
-                                    thinking_mode: if no_thinking {
-                                        deepseek_prompt::ThinkingMode::Chat
-                                    } else {
-                                        deepseek_prompt::ThinkingMode::Thinking
-                                    },
-                                    ..deepseek_prompt::PromptOptions::default()
-                                },
-                            ),
-                            ModelConfig::DeepseekV41(_) => deepseek_v41_prompt::render_chat(
-                                &[deepseek_v41_prompt::Message::new(
-                                    deepseek_v41_prompt::Role::User,
-                                    text,
-                                )],
-                                deepseek_v41_prompt::PromptOptions {
-                                    thinking_mode: if no_thinking {
-                                        deepseek_v41_prompt::ThinkingMode::Chat
-                                    } else {
-                                        deepseek_v41_prompt::ThinkingMode::Thinking
-                                    },
-                                    ..deepseek_v41_prompt::PromptOptions::default()
-                                },
-                            ),
-                            ModelConfig::Hy4(_) => hy4_prompt::render_chat(
-                                &[hy4_prompt::Message::new(hy4_prompt::Role::User, text)],
-                                hy4_prompt::PromptOptions {
-                                    enable_thinking: !no_thinking,
-                                    ..hy4_prompt::PromptOptions::default()
-                                },
-                            ),
-                            ModelConfig::KimiK3(_) => unreachable!("handled above"),
-                            ModelConfig::Qwen38(_) => {
-                                if no_thinking {
-                                    return Err("Qwen3.8 requires thinking; --no-thinking is unsupported by the official template".into());
-                                }
-                                qwen38_prompt::render_chat(
-                                    &[qwen38_prompt::Message::new(qwen38_prompt::Role::User, text)],
-                                    qwen38_prompt::PromptOptions::default(),
-                                )?
-                            }
-                        }
-                    } else {
-                        text
-                    };
-                    let token_ids = tokenizer.encode(&prompt)?;
-                    (prompt, token_ids)
-                }
-            };
+            let tokenization = tokenize_text(&model, text, TokenizeOptions { chat, no_thinking })
+                .map_err(|error| -> Box<dyn Error> { error })?;
+            let TokenizeReport {
+                prompt, token_ids, ..
+            } = tokenization.report;
             if json {
                 println!(
                     "{}",
@@ -593,18 +229,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             let skip_special = has_flag(&remaining, "--skip-special");
             reject_unknown(&remaining, &["--json", "--skip-special"])?;
             let token_ids = parse_token_ids(&token_text)?;
-            let text = match ModelConfig::load(&model)? {
-                ModelConfig::KimiK3(_) => {
-                    KimiK3Tokenizer::load(&model)?.decode(&token_ids, skip_special)?
-                }
-                ModelConfig::Glm52(_)
-                | ModelConfig::DeepseekV4(_)
-                | ModelConfig::DeepseekV41(_)
-                | ModelConfig::Hy4(_)
-                | ModelConfig::Qwen38(_) => {
-                    ByteBpeTokenizer::load(&model)?.decode(&token_ids, skip_special)?
-                }
-            };
+            let decoding = decode_tokens(&model, token_ids, skip_special)
+                .map_err(|error| -> Box<dyn Error> { error })?;
+            let DecodeReport { text, token_ids } = decoding.report;
             if json {
                 println!(
                     "{}",
@@ -642,24 +269,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 return Err("--limit must be in 1..=100000".into());
             }
             reject_unknown_with_values(&remaining, &["--json"], &["--limit"])?;
-            let index = TensorIndex::open(&model)?;
-            let matches: Vec<_> = index
-                .tensors()
-                .filter(|tensor| {
-                    filter
-                        .as_deref()
-                        .map(|pattern| tensor.name.contains(pattern))
-                        .unwrap_or(true)
-                })
-                .collect();
+            let listing = list_tensors(&model, ListOptions { filter, limit })
+                .map_err(|error| -> Box<dyn Error> { error })?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&matches.iter().take(limit).collect::<Vec<_>>())?
-                );
+                println!("{}", serde_json::to_string_pretty(&listing.tensors)?);
             } else {
-                println!("{} tensor(s) match; showing at most {limit}", matches.len());
-                for tensor in matches.iter().take(limit) {
+                println!(
+                    "{} tensor(s) match; showing at most {limit}",
+                    listing.total_matches
+                );
+                for tensor in &listing.tensors {
                     println!(
                         "{:>10}  {:<10}  {:?}  {}",
                         human_bytes(tensor.data_len),
@@ -674,13 +293,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             let model = required_path(args.next(), "explain requires MODEL_DIR")?;
             let remaining: Vec<String> = args.collect();
             reject_unknown(&remaining, &[])?;
-            match ModelConfig::load(&model)? {
-                ModelConfig::Glm52(config) => print_glm_explanation(&config),
-                ModelConfig::DeepseekV4(config) => print_deepseek_explanation(&config),
-                ModelConfig::DeepseekV41(config) => print_deepseek_v41_explanation(&config),
-                ModelConfig::Hy4(config) => print_hy4_explanation(&config),
-                ModelConfig::KimiK3(config) => print_kimi_k3_explanation(&config),
-                ModelConfig::Qwen38(config) => print_qwen38_explanation(&config),
+            let explanation =
+                explain_checkpoint(&model).map_err(|error| -> Box<dyn Error> { error })?;
+            for line in explanation.lines {
+                println!("{line}");
             }
         }
         other => return Err(format!("unknown command {other:?}; run `urb help`").into()),
@@ -692,6 +308,7 @@ fn print_help() {
     println!(
         "Urbilateria — a small pure-Rust model inference and analysis framework\n\n\
 Usage:\n  \
+  urb ui [MODEL_DIR]\n  \
   urb inspect MODEL_DIR [--json]\n  \
   urb plan MODEL_DIR [--ram-gib N] [--context N] [--kv-bytes 2|4] [--json]\n  \
   urb preflight MODEL_DIR [--context N] [--expert-slots N] [--partial] [--json]\n  \
@@ -705,6 +322,7 @@ Usage:\n  \
       [--raw-prompt | --no-thinking]\n  \
   urb explain MODEL_DIR\n\n\
 Commands:\n  \
+  ui       Open the interactive checkpoint explorer (requires the ui feature)\n  \
   inspect  Validate config/shard headers and build a static parameter X-ray\n  \
   plan     Estimate resident, KV, scratch, and per-layer expert-cache budgets\n  \
   preflight Validate every runtime tensor without payload reads; Kimi `--partial` validates completed layers during rsync\n  \
@@ -2097,21 +1715,169 @@ fn run_generate_deepseek_v41<W: Write>(
     Ok(())
 }
 
-fn parse_token_ids(text: &str) -> Result<Vec<u32>, Box<dyn Error>> {
-    if text.trim().is_empty() {
-        return Err("TOKEN_IDS must not be empty".into());
+fn print_preflight(report: &PreflightReport) {
+    match report {
+        PreflightReport::Glm(requirements) => {
+            print_runtime_requirements(
+                "GLM-5.2",
+                requirements.context_limit,
+                requirements.exact_context_ceiling,
+                requirements.resident_bytes,
+                requirements.kv_cache_bytes,
+                requirements.maximum_expert_bytes,
+                requirements.transient_expert_bytes,
+                requirements.expert_cache_bytes,
+                requirements.expert_slots_per_layer,
+            );
+        }
+        PreflightReport::DeepseekV4(requirements) => {
+            print_runtime_requirements(
+                "DeepSeek-V4",
+                requirements.context_limit,
+                requirements.exact_context_ceiling,
+                requirements.resident_bytes,
+                requirements.kv_cache_bytes,
+                requirements.maximum_expert_bytes,
+                requirements.transient_expert_bytes,
+                requirements.expert_cache_bytes,
+                requirements.expert_slots_per_layer,
+            );
+            println!(
+                "  schema tensors      {} required / {} present ({} unexpected)",
+                requirements.required_tensor_count,
+                requirements.checkpoint_tensor_count,
+                requirements.unexpected_tensor_count
+            );
+            println!(
+                "  streamed rows       embedding {}, LM head {}",
+                human_bytes(requirements.streamed_embedding_bytes),
+                human_bytes(requirements.streamed_lm_head_bytes)
+            );
+            println!(
+                "  architecture        {} indexed layers, {} DSpark stages",
+                requirements.indexed_layer_count, requirements.dspark_stage_count
+            );
+        }
+        PreflightReport::DeepseekV41(requirements) => {
+            print_deepseek_v41_manifest(requirements);
+        }
+        PreflightReport::Hy4(requirements) => {
+            print_runtime_requirements(
+                "Hy4-preview-FP8",
+                requirements.context_limit,
+                requirements.exact_context_ceiling,
+                requirements.resident_bytes,
+                requirements.kv_cache_bytes,
+                requirements.maximum_expert_bytes,
+                requirements.transient_expert_bytes,
+                requirements.expert_cache_bytes,
+                requirements.expert_slots_per_layer,
+            );
+            println!(
+                "  schema tensors      {} required / {} present across {} shards",
+                requirements.required_tensor_count,
+                requirements.checkpoint_tensor_count,
+                requirements.checkpoint_shard_count
+            );
+            println!(
+                            "  architecture        {} full IndexCache layers · MTP {} (validated, base forward excludes it)",
+                            requirements.full_indexer_layer_count,
+                            human_bytes(requirements.mtp_payload_bytes)
+                        );
+        }
+        PreflightReport::KimiK3Partial(requirements) => {
+            let range = match (
+                requirements.validated_layers.first(),
+                requirements.validated_layers.last(),
+            ) {
+                (Some(first), Some(last)) => format!("{first}..={last}"),
+                _ => "none".to_owned(),
+            };
+            println!("Kimi-K3 partial checkpoint preflight");
+            println!(
+                "  validated layers    {} ({range})",
+                requirements.validated_layers.len()
+            );
+            println!(
+                "  validated tensors   {} decoder / {} visible total",
+                requirements.validated_tensor_count, requirements.checkpoint_tensor_count
+            );
+            println!(
+                "  non-layer tensors   {} (not asserted in partial mode)",
+                requirements.non_layer_tensor_count
+            );
+            println!(
+                "  complete shards     {} exact .safetensors files",
+                requirements.checkpoint_shard_count
+            );
+        }
+        PreflightReport::KimiK3(requirements) => {
+            println!("Kimi-K3 complete multimodal checkpoint preflight");
+            println!(
+                "  schema tensors      {} required / {} present",
+                requirements.required_tensor_count, requirements.checkpoint_tensor_count
+            );
+            println!(
+                "  decoder tensors     {} ({} KDA, {} MLA; {} dense, {} MoE layers)",
+                requirements.decoder_tensor_count,
+                requirements.kda_layer_count,
+                requirements.mla_layer_count,
+                requirements.dense_layer_count,
+                requirements.moe_layer_count
+            );
+            println!(
+                "  multimodal tensors  {} projector + {} vision",
+                requirements.projector_tensor_count, requirements.vision_tensor_count
+            );
+            println!(
+                "  logical parameters  {}",
+                requirements.logical_parameter_count
+            );
+            println!(
+                "  checkpoint payload  {} across {} shards",
+                human_bytes(requirements.checkpoint_payload_bytes),
+                requirements.checkpoint_shard_count
+            );
+        }
+        PreflightReport::Qwen38(requirements) => {
+            println!("Qwen3.8 complete text-runtime preflight");
+            println!(
+                "  checkpoint          {} tensors across {} shards ({})",
+                requirements.schema.checkpoint_tensor_count,
+                requirements.schema.checkpoint_shard_count,
+                human_bytes(requirements.schema.checkpoint_payload_bytes)
+            );
+            println!(
+                "  streamed layer      {} peak",
+                human_bytes(requirements.streamed_layer_bytes)
+            );
+            println!(
+                "  recurrent + conv    {} + {}",
+                human_bytes(requirements.recurrent_state_bytes),
+                human_bytes(requirements.convolution_state_bytes)
+            );
+            println!(
+                "  full-GQA KV         {} for {} tokens",
+                human_bytes(requirements.kv_cache_bytes),
+                requirements.context_limit
+            );
+            println!(
+                "  execution scratch   {} (includes layer-wise prompt snapshots)",
+                human_bytes(requirements.scratch_bytes)
+            );
+            println!(
+                "  routed expert       {} each · {} cache slots/layer · {} cache",
+                human_bytes(requirements.expert_bytes),
+                requirements.expert_slots_per_layer,
+                human_bytes(requirements.expert_cache_bytes)
+            );
+            println!(
+                "  resident execution  {} persistent · {} miss peak (state separate)",
+                human_bytes(requirements.resident_bytes),
+                human_bytes(requirements.peak_resident_bytes)
+            );
+        }
     }
-    text.split(',')
-        .map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                Err("TOKEN_IDS contains an empty item".into())
-            } else {
-                part.parse::<u32>()
-                    .map_err(|error| format!("invalid token ID {part:?}: {error}").into())
-            }
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2440,234 +2206,6 @@ fn print_probe(report: &ProbeReport) {
     println!("  note                {}", report.sampling_note);
 }
 
-fn print_glm_explanation(config: &GlmConfig) {
-    let q_lora = config.q_lora_rank_value();
-    println!("GLM-5.2 token path (row-major weights use Y = X · Wᵀ)");
-    println!("  token → embedding [{}]", config.hidden_size);
-    println!(
-        "  × {} decoder blocks: RMSNorm → MLA/IndexShare → residual → RMSNorm → FFN → residual",
-        config.num_hidden_layers
-    );
-    println!(
-        "  MLA query: {} → {} → {} heads × {} dims ({} non-RoPE + {} RoPE)",
-        config.hidden_size,
-        q_lora,
-        config.num_attention_heads,
-        config.qk_head_dim,
-        config.qk_nope_head_dim,
-        config.qk_rope_head_dim
-    );
-    println!(
-        "  compressed KV/token/layer: {} latent + {} shared RoPE values",
-        config.kv_lora_rank, config.qk_rope_head_dim
-    );
-    println!(
-        "  FFN: {} dense layers, then {} MoE layers; each token selects {}/{} routed experts plus {} shared",
-        config.num_hidden_layers - config.sparse_layer_count(),
-        config.sparse_layer_count(),
-        config.num_experts_per_tok,
-        config.n_routed_experts,
-        config.n_shared_experts
-    );
-    println!(
-        "  router: choose by sigmoid(logit)+bias; mix by unbiased sigmoid, normalize={}, scale={}",
-        config.norm_topk_prob, config.routed_scaling_factor
-    );
-    println!(
-        "  final RMSNorm → LM head [{} logits] → sampler",
-        config.vocab_size
-    );
-}
-
-fn print_deepseek_explanation(config: &DeepseekV4Config) {
-    println!("DeepSeek-V4 token path (row-major weights use Y = X · Wᵀ)");
-    println!(
-        "  token → streamed embedding [{}] → {} Hyper-Connection streams",
-        config.hidden_size, config.hc_mult
-    );
-    println!(
-        "  × {} decoder blocks: HC/Sinkhorn → RMSNorm → MLA → HC merge → HC/Sinkhorn → RMSNorm → MoE → HC merge",
-        config.num_hidden_layers
-    );
-    println!(
-        "  MLA query: {} → Q-LoRA {} → {} heads × {} dims ({} paired-RoPE dims)",
-        config.hidden_size,
-        config.q_lora_rank,
-        config.num_attention_heads,
-        config.head_dim,
-        config.qk_rope_head_dim
-    );
-    println!(
-        "  attention memory: {}-token local window; compression schedule has {} indexed ratio-4 layers",
-        config.sliding_window,
-        config.indexed_layer_count()
-    );
-    println!(
-        "  MoE: every base layer selects {}/{} routed FP4 experts plus {} shared FP8 expert; first {} layers use token-hash IDs",
-        config.num_experts_per_tok,
-        config.n_routed_experts,
-        config.n_shared_experts,
-        config.num_hash_layers
-    );
-    println!(
-        "  router: sqrt(softplus(logit)); correction bias selects only; normalized × {}",
-        config.routed_scaling_factor
-    );
-    println!(
-        "  HC head → final RMSNorm → streamed LM head [{} logits] → sampler",
-        config.vocab_size
-    );
-    println!(
-        "  checkpoint also contains {} DSpark stage(s), validated independently of base decoding",
-        config.declared_dspark_stage_count()
-    );
-}
-
-fn print_deepseek_v41_explanation(config: &DeepseekV41Config) {
-    let text = &config.text_config;
-    println!("DeepSeek-V4.1-Flash execution model");
-    println!(
-        "  CED stack: {} causal-encoder + {} decoder layers; hidden {} x {} Single-Pass mHC streams",
-        config.encoder_layer_count(),
-        config.decoder_layer_count(),
-        text.hidden_size,
-        text.hc_mult
-    );
-    println!(
-        "  CSA2: KV sources {:?}; index sources {:?}; top-{}; decoder candidates {} blocks x {} positions",
-        text.kv_source_layer_ids,
-        text.index_source_layer_ids,
-        text.index_topk,
-        text.candidate_topk_blocks,
-        text.candidate_block_size
-    );
-    println!(
-        "  MoE: {} routed experts, top-{}, plus {} shared expert; intermediate {}",
-        text.n_routed_experts,
-        text.num_experts_per_tok,
-        text.n_shared_experts,
-        text.moe_intermediate_size
-    );
-    println!(
-        "  Engram: layers {:?}, table rows {:?}, 2-gram through {}-gram with {} heads",
-        text.engram_layer_ids,
-        text.engram_num_embeddings,
-        text.engram_max_ngram_size,
-        text.engram_n_heads
-    );
-    println!(
-        "  checkpoint: 32x32 E4M3/E8M0 trunk, packed E2M1 experts; context {}",
-        text.max_position_embeddings
-    );
-    println!(
-        "  execution status: scalar base-text CED/CSA2/Engram generation is enabled; vision and DSpark remain schema-only"
-    );
-}
-
-fn print_hy4_explanation(config: &Hy4Config) {
-    println!("Hy4-preview token path (row-major weights use Y = X · Wᵀ)");
-    println!(
-        "  token → streamed BF16 embedding [{}] → {} identity-HC streams",
-        config.hidden_size, config.hc_mult
-    );
-    println!(
-        "  × {} blocks: iHC → RMSNorm → Gated DSA/MLA → iHC merge → iHC → RMSNorm → FFN/MoE → iHC merge",
-        config.num_hidden_layers
-    );
-    println!(
-        "  MLA: Q-LoRA {} · KV-LoRA {} · {} heads × ({} NoPE + {} RoPE) → {}-dim values",
-        config.q_lora_rank,
-        config.kv_lora_rank,
-        config.num_attention_heads,
-        config.qk_nope_head_dim,
-        config.qk_rope_head_dim,
-        config.v_head_dim
-    );
-    println!(
-        "  Gated attention: elementwise {}-wide gate + {} learnable per-head sinks",
-        config.num_attention_heads * config.v_head_dim,
-        config.num_attention_heads
-    );
-    println!(
-        "  DSA IndexCache: {} heads × {} dims · top-{} positions · {} full indexer layers",
-        config.index_n_heads,
-        config.index_head_dim,
-        config.index_topk,
-        config.full_indexer_layer_count()
-    );
-    println!(
-        "  FFN: {} dense + {} MoE layers; each token selects {}/{} routed experts plus {} shared",
-        config.num_hidden_layers - config.sparse_layer_count(),
-        config.sparse_layer_count(),
-        config.num_experts_per_tok,
-        config.n_routed_experts,
-        config.n_shared_experts
-    );
-    println!("  storage: ModelOpt MXFP8 E4M3 matrices with U8 E8M0 scales per 1×32 input block");
-    println!(
-        "  final iHC head → RMSNorm → streamed BF16 LM head [{} logits]; {} native MTP layer is validation-only",
-        config.vocab_size, config.num_nextn_predict_layers
-    );
-    println!(
-        "  context: checkpoint advertises {}; exact dense fallback covers ≤{} tokens until IndexCache execution lands",
-        config.max_position_embeddings,
-        config.exact_dense_context_ceiling()
-    );
-}
-
-fn print_kimi_k3_explanation(config: &KimiK3Config) {
-    let text = &config.text_config;
-    println!("Kimi-K3 text token path (row-major weights use Y = X · Wᵀ)");
-    println!(
-        "  XTML/tiktoken token → embedding [{}] → {} decoder blocks",
-        text.hidden_size, text.num_hidden_layers
-    );
-    println!(
-        "  hybrid attention: {} KDA layers ({} heads × {} state dims, causal conv {}) + {} gated NoPE-MLA layers",
-        text.kda_layer_count(),
-        text.linear_attn_config.num_heads,
-        text.linear_attn_config.head_dim,
-        text.linear_attn_config.short_conv_kernel_size,
-        text.full_attention_layer_count()
-    );
-    println!(
-        "  MLA: Q-LoRA {} · KV-LoRA {} · {} heads × ({} NoPE + {} reserved RoPE) → gated {}-dim values",
-        text.q_lora_rank,
-        text.kv_lora_rank,
-        text.num_attention_heads,
-        text.qk_nope_head_dim,
-        text.qk_rope_head_dim,
-        text.v_head_dim
-    );
-    println!(
-        "  AttnRes block size {} mixes normalized keys with raw residual values",
-        text.attn_res_block_size
-    );
-    println!(
-        "  LatentMoE: {} dense layer, then {} sparse layers; each token selects {}/{} MXFP4 routed experts plus {} shared experts",
-        text.first_k_dense_replace,
-        text.num_hidden_layers.saturating_sub(text.first_k_dense_replace),
-        text.num_experts_per_token,
-        text.num_experts,
-        text.num_shared_experts
-    );
-    println!(
-        "  routed expert: {} → latent {} → SiTU hidden {} → latent → {}, with normalized aggregate",
-        text.hidden_size,
-        text.routed_expert_hidden_size,
-        text.moe_intermediate_size,
-        text.hidden_size
-    );
-    println!(
-        "  final RMSNorm + output AttnRes → LM head [{} logits]; generation stop token is {}",
-        text.vocab_size, config.eos_token_id
-    );
-    println!(
-        "  MoonViT-V2 has {} vision blocks; vision execution is a separate milestone from text-only generation",
-        config.vision_config.vt_num_hidden_layers
-    );
-}
-
 fn print_qwen38_manifest(report: &qwen38_schema::Qwen38ManifestReport) {
     println!("Qwen3.8-2.4T-A95B-FP8 manifest preflight");
     println!(
@@ -2695,50 +2233,6 @@ fn print_qwen38_manifest(report: &qwen38_schema::Qwen38ManifestReport) {
     );
     println!("  generation stops    {:?}", report.stop_token_ids);
     println!("  runtime status      experimental text-only generation; independent real-weight logits oracle passed");
-}
-
-fn print_qwen38_explanation(config: &Qwen38Config) {
-    let linear = config
-        .layer_types
-        .iter()
-        .filter(|kind| kind.as_str() == "linear_attention")
-        .count();
-    let full = config.num_hidden_layers.saturating_sub(linear);
-    println!("Qwen3.8-2.4T-A95B-FP8 token path (Y = X · Wᵀ)");
-    println!(
-        "  byte-BPE/ChatML token → embedding [{}] → {} hybrid decoder blocks",
-        config.hidden_size, config.num_hidden_layers
-    );
-    println!(
-        "  hybrid attention: {linear} Gated DeltaNet layers ({} key heads, {} value heads, dim {}, conv {}) + {full} gated GQA layers",
-        config.linear_num_key_heads,
-        config.linear_num_value_heads,
-        config.linear_key_head_dim,
-        config.linear_conv_kernel_dim
-    );
-    println!(
-        "  full GQA: {} query heads / {} KV heads × {} dims; RoPE covers {:.0}% of each head",
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim,
-        config.partial_rotary_factor * 100.0
-    );
-    println!(
-        "  MoE: every layer selects {}/{} routed E4M3 experts plus one BF16 shared expert (intermediate {})",
-        config.num_experts_per_tok,
-        config.num_experts,
-        config.moe_intermediate_size
-    );
-    println!(
-        "  routed storage: 128×128 E4M3 blocks with BF16 weight_scale_inv; trunk/router/shared expert stay BF16"
-    );
-    println!(
-        "  final RMSNorm → independent LM head [{} logits]; native context {}",
-        config.vocab_size, config.max_position_embeddings
-    );
-    println!(
-        "  runtime boundary: full scalar forward, state, streaming, and preflight are implemented; public generate awaits real-weight and independent-logits gates"
-    );
 }
 
 fn print_stats(label: &str, stats: &urbilateria::analysis::NumericStats) {
@@ -2822,49 +2316,6 @@ fn reject_unknown_with_values(
         }
     }
     Ok(())
-}
-
-fn detect_available_ram() -> Option<u64> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    let line = meminfo
-        .lines()
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    let host_available = kib.checked_mul(1024)?;
-    Some(
-        cgroup_memory_remaining()
-            .map(|remaining| remaining.min(host_available))
-            .unwrap_or(host_available),
-    )
-}
-
-fn cgroup_memory_remaining() -> Option<u64> {
-    let pairs = [
-        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
-        (
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-        ),
-    ];
-    for (limit_path, usage_path) in pairs {
-        let Ok(limit_text) = fs::read_to_string(limit_path) else {
-            continue;
-        };
-        if limit_text.trim() == "max" {
-            continue;
-        }
-        let Ok(limit) = limit_text.trim().parse::<u64>() else {
-            continue;
-        };
-        let Ok(usage_text) = fs::read_to_string(usage_path) else {
-            continue;
-        };
-        let Ok(usage) = usage_text.trim().parse::<u64>() else {
-            continue;
-        };
-        return Some(limit.saturating_sub(usage));
-    }
-    None
 }
 
 fn gib_to_bytes(value: f64) -> Result<u64, Box<dyn Error>> {
@@ -3005,6 +2456,81 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn shared_text_analysis_roundtrips_unicode_and_preserves_chat_and_special_tokens() {
+        let path = empty_model_dir();
+        write_tiny_generate_fixture(&path);
+        // Text analysis must work without reading tensor files.
+        for entry in fs::read_dir(&path).unwrap() {
+            let file = entry.unwrap().path();
+            if file
+                .extension()
+                .is_some_and(|extension| extension == "safetensors")
+            {
+                fs::remove_file(file).unwrap();
+            }
+        }
+        let tokenizer = ByteBpeTokenizer::load(&path).unwrap();
+        let text = "hello 中文🙂\n/quit <|user|>";
+        let encoded = tokenize_text(&path, text.into(), TokenizeOptions::default()).unwrap();
+        assert_eq!(encoded.report.token_ids, tokenizer.encode(text).unwrap());
+        assert_eq!(encoded.report.token_count, encoded.report.token_ids.len());
+        let decoded = decode_tokens(&path, encoded.report.token_ids.clone(), false).unwrap();
+        assert_eq!(decoded.report.text, text);
+        let decoded = decode_tokens(&path, encoded.report.token_ids, true).unwrap();
+        assert_eq!(decoded.report.text, "hello 中文🙂\n/quit ");
+        let chat = tokenize_text(
+            &path,
+            "你好".into(),
+            TokenizeOptions {
+                chat: true,
+                no_thinking: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chat.report.prompt,
+            render_chat(
+                &[ChatMessage::new(ChatRole::User, "你好")],
+                ChatTemplateOptions {
+                    enable_thinking: false,
+                    ..ChatTemplateOptions::default()
+                }
+            )
+        );
+        assert_eq!(
+            chat.report.token_ids,
+            tokenizer.encode(&chat.report.prompt).unwrap()
+        );
+        assert!(tokenize_text(
+            &path,
+            "<|user|>".into(),
+            TokenizeOptions {
+                chat: true,
+                no_thinking: false
+            }
+        )
+        .is_err());
+        assert!(tokenize_text(
+            &path,
+            "hello".into(),
+            TokenizeOptions {
+                chat: false,
+                no_thinking: true
+            }
+        )
+        .is_err());
+        assert!(decode_tokens(&path, vec![u32::MAX], false).is_err());
+        assert!(
+            tokenize_text(&path, String::new(), TokenizeOptions::default())
+                .unwrap()
+                .report
+                .token_ids
+                .is_empty()
+        );
+        fs::remove_dir_all(path).unwrap();
     }
 
     fn write_tiny_generate_fixture(path: &Path) {

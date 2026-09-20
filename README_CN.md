@@ -16,10 +16,10 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 </p>
 
 <p>
-<img src="https://img.shields.io/badge/Rust-1.83%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.83+">
+<img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="仅 CPU 运行时">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="五个模型家族">
-<img src="https://img.shields.io/badge/tests-338_passing-2e7d32?style=flat-square" alt="338 项测试通过">
+<img src="https://img.shields.io/badge/tests-379_passing-2e7d32?style=flat-square" alt="379 项测试通过">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT 许可证"></a>
 </p>
 
@@ -28,7 +28,7 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 <td align="center"><b>2.78T</b><br><sub>最大支持参数</sub></td>
 <td align="center"><b>6</b><br><sub>模型适配器</sub></td>
 <td align="center"><b>6</b><br><sub>公开生成路径</sub></td>
-<td align="center"><b>338</b><br><sub>默认测试通过</sub></td>
+<td align="center"><b>379</b><br><sub>默认测试通过</sub></td>
 <td align="center"><b>0</b><br><sub>所需 GPU</sub></td>
 </tr>
 </table>
@@ -58,12 +58,73 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 
 ## 快速开始
 
+从源码构建需要 Rust 1.88 或更新版本。使用 rustup 时，仓库会通过 `rust-toolchain.toml` 自动选择
+Rust 1.88.0，并包含 rustfmt 和 Clippy。
+
+0.2.0 引入交互式 TUI，完整变更见 [CHANGELOG.md](CHANGELOG.md)。正式发布后，
+[GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) 将提供 Linux x86_64
+（glibc 2.35+）与 Apple Silicon macOS（部署目标 13+，在 15 上测试）的预编译程序，
+默认包含 UI，运行无需安装 Rust。压缩包内容与校验方法见 [RELEASING.md](RELEASING.md)。
+
 构建 release 二进制并查看可用命令：
 
 ```bash
 cargo build --release --locked
 ./target/release/urb help
 ```
+
+在 Linux 或 macOS 上启动交互式终端界面：
+
+```bash
+./target/release/urb ui                 # 进入后用 /inspect 选择模型
+./target/release/urb ui /path/to/model  # 进入后运行 /inspect
+```
+
+界面提供可滚动的结果区、多行 Unicode 输入、会话历史、斜杠命令补全，以及带耗时显示的后台
+模型分析和分词。支持 `/inspect`、`/plan`、`/preflight`、`/list`、`/explain`、`/probe`、
+`/tokenize`、`/decode`，以及 `/help`、`/version`、`/clear`、`/quit`。
+**Enter** 执行，**Ctrl+J** 或 **Alt+Enter** 换行，**Tab** 补全，输入首行/末行的
+**↑/↓** 浏览历史，**PgUp/PgDn** 滚动结果，**Ctrl+C** 退出。粘贴只进入编辑框，提交后才执行。
+包含空格的路径需要加引号；终端最小尺寸为 36 列 × 10 行。
+
+在界面中依次执行：
+
+```text
+/inspect "/path/to/model"
+/plan --ram-gib 32 --context 2048
+/preflight --context 2048 --expert-slots 8
+/list self_attn --limit 20
+/explain
+/probe model.embed_tokens.weight --samples 1024
+/tokenize "你好，世界" --chat --no-thinking
+/decode 123,456 --skip-special
+/version
+```
+
+以上张量名及 token ID 仅为示例，请使用 `/list`、`/tokenize` 返回的实际值。
+`/inspect`、`/plan`、`/preflight`、`/explain` 接受可选的 `MODEL_DIR`；
+`/list [FILTER]`、`/probe TENSOR_NAME`、`/tokenize "TEXT"`、`/decode TOKEN_IDS`
+使用 `--model "/path/to/model"` 指定其他目录，避免与文本或张量名混淆。
+省略目录会复用当前模型，命令成功后更新模型选择；参数仅对本次命令生效。
+`/list` 按名称子串筛选，默认返回 100 条，`--limit` 范围为 1–100,000。
+`/probe` 默认采样 8,192 个值，`--samples` 范围为 1–10,000,000；只有它会读取采样所需的张量 payload。
+`/tokenize` 默认编码原始文本；`--chat` 使用原生聊天模板，`--no-thinking` 必须与它一起使用，
+是否支持取决于模型（Qwen3.8 必须保留 thinking）。包含空格或换行的文本需要引号；
+以 `-` 开头的正文可放在 `--` 后。`/decode` 默认保留特殊 token。
+较长结果会明确提示显示已截断，可缩小筛选范围或使用普通 CLI 获取完整输出。
+`/plan` 默认使用检测到的可用 RAM、2,048 个上下文 token、`--kv-bytes 4`（也接受 `2`）。
+macOS 需要显式传入 `--ram-gib`。`/preflight` 默认检查 1 个上下文 token、每层 0 个专家缓存槽位。
+内存规划展示估算及检查点警告；preflight 验证文件头并展示模型家族对应的需求，不加载权重或执行推理。
+Qwen3.8 通过 `/preflight` 查看混合状态内存需求，不支持 `/plan`。
+Kimi-K3 的 preflight 仅检查 schema，context/cache 参数不影响检查；`--partial` 用于传输过程中
+验证可见的 decoder 层，不代表整个检查点完整。
+
+界面使用 Rust、Ratatui 和 Crossterm 实现。编译需要 Rust 和系统链接器，macOS 可安装
+Xcode Command Line Tools；运行编译好的程序不需要 Rust、Python 或 Node.js。
+二进制需要与操作系统及 CPU 架构匹配，终端需要支持 ANSI 控制序列与 UTF-8。
+`ui` 要求标准输入和输出连接交互式终端；普通 CLI 命令仍可用于管道和 `--json` 输出。
+第一版未接入依赖 Linux 的运行时性能计数器。若不需要界面，可使用
+`cargo build --release --locked --no-default-features` 构建。
 
 从元数据开始。以下命令无需读取完整张量 payload：
 
@@ -333,7 +394,7 @@ argmax 和相同的 top 20 token。在全部 248,320 个 logits 上，余弦相�
 cargo test --all-targets --locked
 ```
 
-当前结果：**338 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
+当前 Linux 结果：**379 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
 模型目录。
 
 <details>
@@ -365,6 +426,7 @@ HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
 
 | 命令 | 用途 | 模型支持 |
 | --- | --- | --- |
+| `ui [MODEL_DIR]` | 带历史、补全及后台模型分析、张量浏览与分词的交互式终端；12 个命令 | Linux/macOS；模型覆盖与对应 CLI 命令一致；`generate` 仍使用普通 CLI |
 | `inspect` | 构建静态参数、量化、张量与路由透视 | 全部六个适配器 |
 | `plan` | 估算常驻、KV、暂存空间与专家缓存预算 | GLM、DeepSeek、Kimi、Hy4 |
 | `preflight` | 不读取 payload，验证精确运行时张量与内存 | 全部六个适配器 |
@@ -458,6 +520,7 @@ profile。
 | `src/models/` | 家族私有的配置、schema、提示词、注意力、MoE、权重与运行时代码 |
 | `src/runtime/` | 模型无关的运行时契约和确定性专家缓存机制 |
 | `src/generation.rs` | 后端无关的自回归 token 循环与停止语义 |
+| `src/ui/` | 终端生命周期、输入状态、渲染与后台检查线程 |
 | `src/profiling.rs` | 可选的 inclusive 阶段指标和稳定 JSON 报告 |
 | `tests/` | 真实检查点正确性门禁与跨模型性能测试工具 |
 | `tools/` | 验证期间使用的独立 Python 预言机生成工具，不参与推理 |
@@ -473,6 +536,16 @@ cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
+
+CI 在 Linux（Ubuntu 24.04）和 Apple Silicon macOS（macOS 15）上，分别使用 Rust 1.88.0
+和 stable 测试启用和关闭 `ui` 的构建；暂不覆盖 Intel Mac。格式与两种 feature 配置的 Clippy
+固定使用 Rust 1.88.0。终端冒烟测试使用 Python 标准库驱动伪终端，覆盖全部 12 个命令、
+粘贴、缩放、阻塞中的后台任务、正常/信号退出及 panic 清理。Linux release 构建还会运行
+CLI 帮助及 TUI 交互检查。CI 的 Cargo 构建与测试均使用 `--locked` 固定依赖版本。
+发布工具使用 Python 标准库测试。推送版本标签后会再次运行 CI、打包两个受支持平台，
+并创建 GitHub Release 草稿；完整发布流程见 [RELEASING.md](RELEASING.md)。
+构建后可在本地运行 `python3 tests/tui_smoke.py target/debug/urb`；CI 还会通过
+`--panic-test` 传入二进制单元测试程序，执行需要终端的 panic 恢复测试。
 
 行为变更应包含有针对性的测试。优化 kernel 必须继续与可读的标量参考实现进行核对；
 在数值契约明确之前，更快的路径不能视为完成。

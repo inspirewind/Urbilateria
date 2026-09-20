@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Check tag, Cargo version, and changelog
+        id: version
+        run: python3 .github/release.py validate --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
+
+  checks:
+    name: Run CI on the tagged commit
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Package (${{ matrix.target }})
+    needs: [validate, checks]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    env:
+      RELEASE_TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal --target "$RELEASE_TARGET"
+      - name: Build native release binary
+        run: cargo +1.88.0 build --release --locked --features ui --bin urb --target "$RELEASE_TARGET"
+      - name: Package binary and check runtime baseline
+        run: python3 .github/release.py package --tag "$RELEASE_TAG" --target "$RELEASE_TARGET"
+      - name: Test the packaged binary in a pseudo-terminal
+        run: |
+          archive="target/release-assets/urb-${RELEASE_TAG}-${RELEASE_TARGET}.tar.gz"
+          mkdir -p "$RUNNER_TEMP/urb-package"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/urb-package"
+          python3 tests/tui_smoke.py "$RUNNER_TEMP/urb-package/urb-${RELEASE_TAG}-${RELEASE_TARGET}/urb"
+      - name: Upload release archive and checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: target/release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  draft:
+    name: Prepare GitHub Release draft
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Download both platform archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: target/release-assets
+          merge-multiple: true
+      - name: Verify archives and prepare release notes
+        run: python3 .github/release.py collect --tag "$RELEASE_TAG"
+      - name: Create or update draft with all assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          assets=(
+            "target/release-assets/urb-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+            "target/release-assets/urb-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz"
+            "target/release-assets/SHA256SUMS"
+          )
+          if gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' > "$RUNNER_TEMP/urb-is-draft"; then
+            if [ "$(cat "$RUNNER_TEMP/urb-is-draft")" != true ]; then
+              echo "Release $RELEASE_TAG is already public; refusing to replace its assets." >&2
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" --draft \
+              --title "Urbilateria $RELEASE_VERSION" \
+              --notes-file target/release-assets/RELEASE_NOTES.md
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --draft --verify-tag \
+              --title "Urbilateria $RELEASE_VERSION" \
+              --notes-file target/release-assets/RELEASE_NOTES.md
+          fi

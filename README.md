@@ -16,10 +16,10 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 </p>
 
 <p>
-<img src="https://img.shields.io/badge/Rust-1.83%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.83+">
+<img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="CPU-only runtime">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="Five model families">
-<img src="https://img.shields.io/badge/tests-338_passing-2e7d32?style=flat-square" alt="338 tests passing">
+<img src="https://img.shields.io/badge/tests-379_passing-2e7d32?style=flat-square" alt="379 tests passing">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT License"></a>
 </p>
 
@@ -28,7 +28,7 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 <td align="center"><b>2.78T</b><br><sub>maximum parameter count</sub></td>
 <td align="center"><b>6</b><br><sub>model adapters</sub></td>
 <td align="center"><b>6</b><br><sub>public generation paths</sub></td>
-<td align="center"><b>338</b><br><sub>default tests passing</sub></td>
+<td align="center"><b>379</b><br><sub>default tests passing</sub></td>
 <td align="center"><b>0</b><br><sub>GPUs required</sub></td>
 </tr>
 </table>
@@ -62,12 +62,80 @@ model weights are included in this repository.
 
 ## Quick Start
 
+Building from source requires Rust 1.88 or newer. With rustup, this repository automatically selects Rust 1.88.0
+using `rust-toolchain.toml`, including rustfmt and Clippy.
+
+Version 0.2.0 introduces the interactive TUI; see [CHANGELOG.md](CHANGELOG.md) for all changes.
+After publication, [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) will
+provide binaries for Linux x86_64 (glibc 2.35+) and Apple Silicon macOS (deployment target 13+,
+tested on 15). They include the UI and need no Rust installation. See
+[RELEASING.md](RELEASING.md) for archive contents and checksum verification.
+
 Build the release binary and inspect the available commands:
 
 ```bash
 cargo build --release --locked
 ./target/release/urb help
 ```
+
+For an interactive terminal interface on Linux or macOS:
+
+```bash
+./target/release/urb ui                 # select a model with /inspect
+./target/release/urb ui /path/to/model  # then run /inspect
+```
+
+The UI provides a scrollable transcript, multiline Unicode input, session history,
+slash-command completion, and background model analysis and tokenization with elapsed time.
+Commands are `/inspect`, `/plan`, `/preflight`, `/list`, `/explain`, `/probe`, `/tokenize`, `/decode`,
+plus `/help`, `/version`, `/clear`, and `/quit`. Use **Enter** to run, **Ctrl+J** or
+**Alt+Enter** for a newline, **Tab** to complete, **Up/Down** for history at the input boundaries,
+**PgUp/PgDn** to scroll, and **Ctrl+C** to exit. Pasted text stays in the editor until submitted.
+Quote paths with spaces. The minimum terminal size is 36 columns by 10 rows.
+
+Run these commands separately inside the UI:
+
+```text
+/inspect "/path/to/model"
+/plan --ram-gib 32 --context 2048
+/preflight --context 2048 --expert-slots 8
+/list self_attn --limit 20
+/explain
+/probe model.embed_tokens.weight --samples 1024
+/tokenize "Hello, world" --chat --no-thinking
+/decode 123,456 --skip-special
+/version
+```
+
+The tensor name and token IDs above are examples; use actual values from `/list` and `/tokenize`.
+`/inspect`, `/plan`, `/preflight`, and `/explain` take an optional `MODEL_DIR`.
+For `/list [FILTER]`, `/probe TENSOR_NAME`, `/tokenize "TEXT"`, and `/decode TOKEN_IDS`,
+select a different directory with `--model "/path/to/model"` to distinguish it from the argument.
+Omitting the directory reuses the current model; a successful command updates the selection.
+Options apply only to that command. `/list` matches name substrings and returns 100 rows by default;
+`--limit` accepts 1–100,000. `/probe` samples 8,192 values by default; `--samples` accepts
+1–10,000,000. Only `/probe` reads the tensor payload ranges needed for sampling.
+`/tokenize` encodes raw text by default; `--chat` renders a native chat prompt.
+`--no-thinking` requires `--chat` and model support (Qwen3.8 always requires thinking).
+Quote text containing spaces or newlines; use `--` before literal text starting with `-`.
+`/decode` preserves special tokens unless `--skip-special` is supplied.
+Long results show an explicit truncation notice; narrow the filter or use the plain CLI for full output.
+`/plan` defaults to detected available RAM, 2,048 context
+tokens, and `--kv-bytes 4` (`2` is also accepted). On macOS, pass `--ram-gib` explicitly.
+`/preflight` defaults to one context token and zero expert-cache slots per layer.
+Planning reports estimates and checkpoint warnings; preflight validates headers and shows
+family-specific requirements without loading weights or attempting inference.
+Qwen3.8 uses `/preflight` for hybrid memory requirements and does not support `/plan`.
+Kimi-K3 preflight checks schema only, so context/cache options do not affect it; `--partial`
+validates visible decoder layers during a transfer without asserting checkpoint completeness.
+
+The UI is written in Rust with Ratatui and Crossterm. Building needs Rust and a system linker
+(on macOS, install Xcode Command Line Tools); running a built binary needs neither Rust nor
+Python/Node.js. Use a binary built for your OS and architecture. The terminal must support
+ANSI control sequences and UTF-8. `ui` requires interactive stdin/stdout; ordinary CLI commands
+remain suitable for pipes and `--json`. Linux-specific runtime performance counters are not
+part of this initial UI. Build without the interface using
+`cargo build --release --locked --no-default-features`.
 
 Start with metadata. These commands do not need to read the full tensor payload:
 
@@ -350,7 +418,7 @@ The model-free suite is fast and does not need a checkpoint:
 cargo test --all-targets --locked
 ```
 
-Current result: **338 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
+Current Linux result: **379 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
 their model directory is supplied.
 
 <details>
@@ -382,6 +450,7 @@ HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
 
 | Command | Purpose | Model support |
 | --- | --- | --- |
+| `ui [MODEL_DIR]` | Interactive terminal with history, completion, background analysis, tensor browsing, and tokenization; 12 commands | Linux/macOS; same model coverage as corresponding CLI commands; use the plain CLI for `generate` |
 | `inspect` | Build a static parameter, quantization, tensor, and routing X-ray | All six adapters |
 | `plan` | Estimate resident, KV, scratch, and expert-cache budgets | GLM, DeepSeek, Kimi, Hy4 |
 | `preflight` | Validate exact runtime tensors and memory without payload reads | All six adapters |
@@ -475,6 +544,7 @@ checkpoint, prompt, thread count, and expert-slot settings.
 | `src/models/` | family-private config, schema, prompt, attention, MoE, weights, and runtime code |
 | `src/runtime/` | model-neutral runtime contracts and deterministic expert-cache mechanics |
 | `src/generation.rs` | backend-independent autoregressive token loop and stop semantics |
+| `src/ui/` | terminal lifecycle, input state, rendering, and the background analysis worker |
 | `src/profiling.rs` | opt-in inclusive stage metrics and stable JSON reports |
 | `tests/` | real-checkpoint correctness gates and cross-model performance harnesses |
 | `tools/` | independent Python oracle generation used during validation, not inference |
@@ -491,6 +561,19 @@ cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
+
+CI runs model-free tests with and without `ui` on Linux (Ubuntu 24.04) and Apple Silicon macOS
+(macOS 15), using Rust 1.88.0 and stable; Intel Macs are not currently covered. Formatting and
+Clippy for both feature configurations use Rust 1.88.0. The terminal smoke test uses Python's
+standard library to exercise all 12 commands in a PTY, including paste, resize, blocked background
+tasks, normal/signal exits, and panic cleanup. The Linux release build also runs CLI help and
+TUI interaction checks. CI Cargo builds and tests use `--locked` to preserve dependency versions.
+Release tooling is tested with Python's standard library. Pushing a version tag runs CI again,
+packages both supported platforms, and prepares a GitHub Release draft; the full process is in
+[RELEASING.md](RELEASING.md).
+After building, run the terminal test locally with
+`python3 tests/tui_smoke.py target/debug/urb`; CI also passes the binary test executable through
+`--panic-test` to exercise the terminal-only panic test.
 
 Behavior changes should include focused tests. Optimized kernels must remain checked against the
 readable scalar reference; a faster path is not complete until its numerical contract is explicit.

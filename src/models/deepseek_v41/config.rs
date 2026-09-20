@@ -405,7 +405,7 @@ impl DeepseekV41TextConfig {
     fn validate_engram(&self) -> Result<(), ConfigError> {
         if self.engram_layer_ids != [1, 14]
             || self.engram_num_embeddings.len() != self.engram_layer_ids.len()
-            || self.engram_num_embeddings.iter().any(|&rows| rows == 0)
+            || self.engram_num_embeddings.contains(&0)
             || self.engram_max_ngram_size != 4
             || self.engram_vocab_size == 0
             || self.engram_compressed_vocab_size == 0

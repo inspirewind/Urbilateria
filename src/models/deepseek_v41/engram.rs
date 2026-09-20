@@ -360,7 +360,7 @@ impl NgramHashState {
                 .get(token_id as usize)
                 .copied()
                 .ok_or(TokenizerError::UnknownTokenId(token_id))?;
-            let live = participates.map_or(true, |mask| mask[offset]);
+            let live = participates.is_none_or(|mask| mask[offset]);
             self.cache.push(live.then_some(u64::from(compressed)));
             output.push(self.hash_position(self.cache.len() - 1));
         }

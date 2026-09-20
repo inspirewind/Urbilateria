@@ -4,9 +4,12 @@
 //! rows across that pool, while each row keeps its original scalar reduction order.
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::collections::{HashSet, VecDeque};
+#[cfg(any(target_os = "linux", test))]
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
@@ -330,6 +333,7 @@ fn physical_core_first_cpu_order() -> Vec<usize> {
     Vec::new()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn physical_core_first(topology: &[(usize, usize, usize)]) -> Vec<usize> {
     let mut seen = HashSet::new();
     let mut primary = Vec::new();
@@ -345,6 +349,7 @@ fn physical_core_first(topology: &[(usize, usize, usize)]) -> Vec<usize> {
     primary
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cpu_list(value: &str) -> Option<Vec<usize>> {
     let mut cpus = Vec::new();
     for part in value.split(',') {

@@ -595,100 +595,97 @@ impl MxFp8Matrix {
                 MxError::Shape("batched matvec row range is out of bounds".to_owned())
             })?;
         #[cfg(target_arch = "x86_64")]
-        let compact_avx2_fma = (2..=12).contains(&batch)
-            && self.block_rows == 1
-            && self.block_cols == 32
-            && self.cols % 32 == 0
-            && matches!(self.scales, MxFp8Scales::E8M0(_))
-            && std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma");
-        #[cfg(not(target_arch = "x86_64"))]
-        let compact_avx2_fma = false;
-        #[cfg(target_arch = "x86_64")]
-        let ordered_avx2 = (2..=12).contains(&batch)
-            && self.block_cols >= 8
-            && matches!(self.scales, MxFp8Scales::E8M0(_))
-            && std::arch::is_x86_feature_detected!("avx2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let ordered_avx2 = false;
-
-        if !compact_avx2_fma && !ordered_avx2 {
-            let mut output = Vec::with_capacity(batch.saturating_mul(count));
-            for input in input.chunks_exact(self.cols) {
-                output.extend(self.matvec_rows(start, count, input)?);
-            }
-            return Ok(output);
-        }
-
-        let work = batch.saturating_mul(count).saturating_mul(self.cols);
-        let _profile = span_with_work(ProfileStage::MatvecMxFp8, work);
-        let scale_cols = self.cols.div_ceil(self.block_cols);
-        let MxFp8Scales::E8M0(scales) = &self.scales else {
-            unreachable!("batched AVX2 is selected only for E8M0 scales")
-        };
-        let mut output_by_row = vec![0.0f32; count.saturating_mul(batch)];
-        let compute_row = |row: usize, output: &mut [f32]| {
-            let codes = &self.values[row * self.cols..(row + 1) * self.cols];
-            let scale_row = row / self.block_rows;
-            let row_scales = &scales[scale_row * scale_cols..(scale_row + 1) * scale_cols];
-            macro_rules! compute_batch {
-                ($batch:literal) => {
-                    if compact_avx2_fma {
-                        dot_e4m3_e8m0_batch_aligned_avx2_fma::<$batch>(
-                            codes, row_scales, input, output,
-                        )
-                    } else {
-                        dot_e4m3_e8m0_batch_f64_ordered_avx2::<$batch>(
-                            codes,
-                            row_scales,
-                            input,
-                            self.cols,
-                            self.block_cols,
-                            output,
-                        )
+        {
+            let compact_avx2_fma = (2..=12).contains(&batch)
+                && self.block_rows == 1
+                && self.block_cols == 32
+                && self.cols % 32 == 0
+                && matches!(self.scales, MxFp8Scales::E8M0(_))
+                && std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma");
+            let ordered_avx2 = (2..=12).contains(&batch)
+                && self.block_cols >= 8
+                && matches!(self.scales, MxFp8Scales::E8M0(_))
+                && std::arch::is_x86_feature_detected!("avx2");
+            if compact_avx2_fma || ordered_avx2 {
+                let work = batch.saturating_mul(count).saturating_mul(self.cols);
+                let _profile = span_with_work(ProfileStage::MatvecMxFp8, work);
+                let scale_cols = self.cols.div_ceil(self.block_cols);
+                let MxFp8Scales::E8M0(scales) = &self.scales else {
+                    unreachable!("batched AVX2 is selected only for E8M0 scales")
+                };
+                let mut output_by_row = vec![0.0f32; count.saturating_mul(batch)];
+                let compute_row = |row: usize, output: &mut [f32]| {
+                    let codes = &self.values[row * self.cols..(row + 1) * self.cols];
+                    let scale_row = row / self.block_rows;
+                    let row_scales = &scales[scale_row * scale_cols..(scale_row + 1) * scale_cols];
+                    macro_rules! compute_batch {
+                        ($batch:literal) => {
+                            if compact_avx2_fma {
+                                dot_e4m3_e8m0_batch_aligned_avx2_fma::<$batch>(
+                                    codes, row_scales, input, output,
+                                )
+                            } else {
+                                dot_e4m3_e8m0_batch_f64_ordered_avx2::<$batch>(
+                                    codes,
+                                    row_scales,
+                                    input,
+                                    self.cols,
+                                    self.block_cols,
+                                    output,
+                                )
+                            }
+                        };
+                    }
+                    // SAFETY: dispatch proves AVX2 support, batch is in 2..=12, and validated matrix/input
+                    // slices cover every code, scale block, and input row. The compact branch additionally
+                    // proves FMA support and aligned 1x32 geometry.
+                    unsafe {
+                        match batch {
+                            2 => compute_batch!(2),
+                            3 => compute_batch!(3),
+                            4 => compute_batch!(4),
+                            5 => compute_batch!(5),
+                            6 => compute_batch!(6),
+                            7 => compute_batch!(7),
+                            8 => compute_batch!(8),
+                            9 => compute_batch!(9),
+                            10 => compute_batch!(10),
+                            11 => compute_batch!(11),
+                            12 => compute_batch!(12),
+                            _ => unreachable!(
+                                "MXFP8 batch dispatch is limited to two through twelve"
+                            ),
+                        }
                     }
                 };
-            }
-            // SAFETY: dispatch proves AVX2 support, batch is in 2..=12, and validated matrix/input
-            // slices cover every code, scale block, and input row. The compact branch additionally
-            // proves FMA support and aligned 1x32 geometry.
-            unsafe {
-                match batch {
-                    2 => compute_batch!(2),
-                    3 => compute_batch!(3),
-                    4 => compute_batch!(4),
-                    5 => compute_batch!(5),
-                    6 => compute_batch!(6),
-                    7 => compute_batch!(7),
-                    8 => compute_batch!(8),
-                    9 => compute_batch!(9),
-                    10 => compute_batch!(10),
-                    11 => compute_batch!(11),
-                    12 => compute_batch!(12),
-                    _ => unreachable!("MXFP8 batch dispatch is limited to two through twelve"),
+                if should_parallelize(self.rows, work) {
+                    install(|| {
+                        output_by_row
+                            .par_chunks_mut(batch)
+                            .enumerate()
+                            .for_each(|(offset, output)| compute_row(start + offset, output));
+                    });
+                } else {
+                    for (row, output) in (start..end).zip(output_by_row.chunks_mut(batch)) {
+                        compute_row(row, output);
+                    }
                 }
-            }
-        };
-        if should_parallelize(self.rows, work) {
-            install(|| {
-                output_by_row
-                    .par_chunks_mut(batch)
-                    .enumerate()
-                    .for_each(|(offset, output)| compute_row(start + offset, output));
-            });
-        } else {
-            for (row, output) in (start..end).zip(output_by_row.chunks_mut(batch)) {
-                compute_row(row, output);
+                let mut output = vec![0.0f32; batch.saturating_mul(count)];
+                for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
+                    for (token, &value) in values.iter().enumerate() {
+                        output[token * count + row] = value;
+                    }
+                }
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(MxError::NonFinite);
+                }
+                return Ok(output);
             }
         }
-        let mut output = vec![0.0f32; batch.saturating_mul(count)];
-        for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
-            for (token, &value) in values.iter().enumerate() {
-                output[token * count + row] = value;
-            }
-        }
-        if output.iter().any(|value| !value.is_finite()) {
-            return Err(MxError::NonFinite);
+        let mut output = Vec::with_capacity(batch.saturating_mul(count));
+        for input in input.chunks_exact(self.cols) {
+            output.extend(self.matvec_rows(start, end - start, input)?);
         }
         Ok(output)
     }
@@ -1485,80 +1482,80 @@ impl MxFp4Matrix {
             return Err(MxError::NonFinite);
         }
         #[cfg(target_arch = "x86_64")]
-        let ordered_avx2 = (2..=12).contains(&batch)
-            && self.group_size >= 8
-            && self.group_size % 2 == 0
-            && std::arch::is_x86_feature_detected!("avx2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let ordered_avx2 = false;
-
-        if !ordered_avx2 {
-            let mut output = Vec::with_capacity(batch.saturating_mul(self.rows));
-            for input in input.chunks_exact(self.cols) {
-                output.extend(self.matvec(input)?);
-            }
-            return Ok(output);
-        }
-
-        let work = batch.saturating_mul(self.rows).saturating_mul(self.cols);
-        let _profile = span_with_work(ProfileStage::MatvecMxFp4, work);
-        let row_bytes = self.cols.div_ceil(2);
-        let groups = self.cols.div_ceil(self.group_size);
-        let mut output_by_row = vec![0.0f32; self.rows.saturating_mul(batch)];
-        let compute_row = |row: usize, output: &mut [f32]| {
-            let packed = &self.packed[row * row_bytes..(row + 1) * row_bytes];
-            let scales = &self.scale_bytes[row * groups..(row + 1) * groups];
-            macro_rules! compute_batch {
-                ($batch:literal) => {
-                    dot_e2m1_e8m0_batch_f64_ordered_avx2::<$batch>(
-                        packed,
-                        scales,
-                        input,
-                        self.cols,
-                        self.group_size,
-                        output,
-                    )
+        {
+            let ordered_avx2 = (2..=12).contains(&batch)
+                && self.group_size >= 8
+                && self.group_size % 2 == 0
+                && std::arch::is_x86_feature_detected!("avx2");
+            if ordered_avx2 {
+                let work = batch.saturating_mul(self.rows).saturating_mul(self.cols);
+                let _profile = span_with_work(ProfileStage::MatvecMxFp4, work);
+                let row_bytes = self.cols.div_ceil(2);
+                let groups = self.cols.div_ceil(self.group_size);
+                let mut output_by_row = vec![0.0f32; self.rows.saturating_mul(batch)];
+                let compute_row = |row: usize, output: &mut [f32]| {
+                    let packed = &self.packed[row * row_bytes..(row + 1) * row_bytes];
+                    let scales = &self.scale_bytes[row * groups..(row + 1) * groups];
+                    macro_rules! compute_batch {
+                        ($batch:literal) => {
+                            dot_e2m1_e8m0_batch_f64_ordered_avx2::<$batch>(
+                                packed,
+                                scales,
+                                input,
+                                self.cols,
+                                self.group_size,
+                                output,
+                            )
+                        };
+                    }
+                    // SAFETY: dispatch proves AVX2 support, batch is in 2..=12, and validated matrix/input
+                    // slices cover every packed nibble, scale group, and input row.
+                    unsafe {
+                        match batch {
+                            2 => compute_batch!(2),
+                            3 => compute_batch!(3),
+                            4 => compute_batch!(4),
+                            5 => compute_batch!(5),
+                            6 => compute_batch!(6),
+                            7 => compute_batch!(7),
+                            8 => compute_batch!(8),
+                            9 => compute_batch!(9),
+                            10 => compute_batch!(10),
+                            11 => compute_batch!(11),
+                            12 => compute_batch!(12),
+                            _ => unreachable!(
+                                "MXFP4 batch dispatch is limited to two through twelve"
+                            ),
+                        }
+                    }
                 };
-            }
-            // SAFETY: dispatch proves AVX2 support, batch is in 2..=12, and validated matrix/input
-            // slices cover every packed nibble, scale group, and input row.
-            unsafe {
-                match batch {
-                    2 => compute_batch!(2),
-                    3 => compute_batch!(3),
-                    4 => compute_batch!(4),
-                    5 => compute_batch!(5),
-                    6 => compute_batch!(6),
-                    7 => compute_batch!(7),
-                    8 => compute_batch!(8),
-                    9 => compute_batch!(9),
-                    10 => compute_batch!(10),
-                    11 => compute_batch!(11),
-                    12 => compute_batch!(12),
-                    _ => unreachable!("MXFP4 batch dispatch is limited to two through twelve"),
+                if should_parallelize(self.rows, work) {
+                    install(|| {
+                        output_by_row
+                            .par_chunks_mut(batch)
+                            .enumerate()
+                            .for_each(|(row, output)| compute_row(row, output));
+                    });
+                } else {
+                    for (row, output) in output_by_row.chunks_mut(batch).enumerate() {
+                        compute_row(row, output);
+                    }
                 }
-            }
-        };
-        if should_parallelize(self.rows, work) {
-            install(|| {
-                output_by_row
-                    .par_chunks_mut(batch)
-                    .enumerate()
-                    .for_each(|(row, output)| compute_row(row, output));
-            });
-        } else {
-            for (row, output) in output_by_row.chunks_mut(batch).enumerate() {
-                compute_row(row, output);
+                let mut output = vec![0.0f32; batch.saturating_mul(self.rows)];
+                for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
+                    for (token, &value) in values.iter().enumerate() {
+                        output[token * self.rows + row] = value;
+                    }
+                }
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(MxError::NonFinite);
+                }
+                return Ok(output);
             }
         }
-        let mut output = vec![0.0f32; batch.saturating_mul(self.rows)];
-        for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
-            for (token, &value) in values.iter().enumerate() {
-                output[token * self.rows + row] = value;
-            }
-        }
-        if output.iter().any(|value| !value.is_finite()) {
-            return Err(MxError::NonFinite);
+        let mut output = Vec::with_capacity(batch.saturating_mul(self.rows));
+        for input in input.chunks_exact(self.cols) {
+            output.extend(self.matvec(input)?);
         }
         Ok(output)
     }

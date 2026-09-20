@@ -8,6 +8,7 @@ on:
     branches:
       - main
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -32,28 +33,37 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.83
+      - name: Install Rust 1.88
         run: |
-          rustup toolchain install 1.83.0 \
+          rustup toolchain install 1.88.0 \
             --profile minimal \
             --component rustfmt,clippy
 
       - name: Check formatting
-        run: cargo +1.83.0 fmt --all -- --check
+        run: cargo +1.88.0 fmt --all -- --check
+
+      - name: Test release tooling
+        run: python3 -B -m unittest discover -s .github -p 'test_release.py' -v
 
       - name: Run Clippy
-        run: cargo +1.83.0 clippy --locked --all-targets -- -D warnings
+        run: cargo +1.88.0 clippy --locked --all-targets -- -D warnings
+
+      - name: Run Clippy without the UI dependencies
+        run: cargo +1.88.0 clippy --locked --no-default-features --all-targets -- -D warnings
 
   tests:
-    name: Tests (Rust ${{ matrix.toolchain }})
-    runs-on: ubuntu-24.04
+    name: Tests (${{ matrix.os }}, Rust ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15 # Apple Silicon (arm64)
         toolchain:
-          - 1.83.0
+          - 1.88.0
           - stable
 
     steps:
@@ -68,6 +78,37 @@ jobs:
       - name: Run all model-free tests
         run: cargo +${{ matrix.toolchain }} test --locked --all-targets
 
+      - name: Test without the UI dependencies
+        run: cargo +${{ matrix.toolchain }} test --locked --no-default-features --all-targets
+
+      - name: Build UI binary and terminal cleanup test
+        run: |
+          cargo +${{ matrix.toolchain }} build --locked --features ui --bin urb
+          cargo +${{ matrix.toolchain }} test --locked --features ui --bin urb --no-run --message-format=json > "$RUNNER_TEMP/urb-ui-tests.jsonl"
+
+      - name: Smoke-test UI in a pseudo-terminal
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          artifacts = Path(os.environ["RUNNER_TEMP"]) / "urb-ui-tests.jsonl"
+          tests = []
+          for line in artifacts.read_text().splitlines():
+              item = json.loads(line)
+              if (item.get("reason") == "compiler-artifact"
+                      and item.get("target", {}).get("name") == "urb"
+                      and item.get("profile", {}).get("test")
+                      and item.get("executable")):
+                  tests.append(item["executable"])
+          if len(tests) != 1:
+              raise SystemExit(f"Expected one urb test executable, found {tests!r}")
+          subprocess.run([sys.executable, "tests/tui_smoke.py", "target/debug/urb",
+                          "--panic-test", tests[0]], check=True)
+          PY
+
   release-smoke:
     name: Release build
     runs-on: ubuntu-24.04
@@ -79,11 +120,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.83
-        run: rustup toolchain install 1.83.0 --profile minimal
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Build release binary
-        run: cargo +1.83.0 build --release --locked --bin urb
+        run: cargo +1.88.0 build --release --locked --bin urb
 
       - name: Smoke-test CLI
-        run: ./target/release/urb help
+        run: |
+          ./target/release/urb --version
+          ./target/release/urb help
+          ./target/release/urb ui --help
+
+      - name: Smoke-test release UI in a pseudo-terminal
+        run: python3 tests/tui_smoke.py target/release/urb

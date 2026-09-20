@@ -88,7 +88,7 @@ pub fn select_positions(
         .copied()
         .enumerate()
         .map(|(position, score)| {
-            let reachable = position < visible && candidates.map_or(true, |mask| mask[position]);
+            let reachable = position < visible && candidates.is_none_or(|mask| mask[position]);
             (position, if reachable { score } else { f32::NEG_INFINITY })
         })
         .collect::<Vec<_>>();

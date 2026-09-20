@@ -356,7 +356,7 @@ impl GlmConfig {
 
         let index_dimensions = [self.index_n_heads, self.index_head_dim, self.index_topk];
         let index_enabled = index_dimensions.iter().any(|&value| value != 0);
-        if index_enabled && index_dimensions.iter().any(|&value| value == 0) {
+        if index_enabled && index_dimensions.contains(&0) {
             return Err(ConfigError::Invalid(
                 "index_n_heads, index_head_dim, and index_topk must be all zero or all non-zero"
                     .to_owned(),
