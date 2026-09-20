@@ -19,7 +19,7 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="CPU-only runtime">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="Five model families">
-<img src="https://img.shields.io/badge/tests-379_passing-2e7d32?style=flat-square" alt="379 tests passing">
+<img src="https://img.shields.io/badge/tests-380_passing-2e7d32?style=flat-square" alt="380 tests passing">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT License"></a>
 </p>
 
@@ -28,7 +28,7 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 <td align="center"><b>2.78T</b><br><sub>maximum parameter count</sub></td>
 <td align="center"><b>6</b><br><sub>model adapters</sub></td>
 <td align="center"><b>6</b><br><sub>public generation paths</sub></td>
-<td align="center"><b>379</b><br><sub>default tests passing</sub></td>
+<td align="center"><b>380</b><br><sub>default tests passing</sub></td>
 <td align="center"><b>0</b><br><sub>GPUs required</sub></td>
 </tr>
 </table>
@@ -418,7 +418,7 @@ The model-free suite is fast and does not need a checkpoint:
 cargo test --all-targets --locked
 ```
 
-Current Linux result: **379 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
+Current Linux result: **380 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
 their model directory is supplied.
 
 <details>

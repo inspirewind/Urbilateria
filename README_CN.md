@@ -19,7 +19,7 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="仅 CPU 运行时">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="五个模型家族">
-<img src="https://img.shields.io/badge/tests-379_passing-2e7d32?style=flat-square" alt="379 项测试通过">
+<img src="https://img.shields.io/badge/tests-380_passing-2e7d32?style=flat-square" alt="380 项测试通过">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT 许可证"></a>
 </p>
 
@@ -28,7 +28,7 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 <td align="center"><b>2.78T</b><br><sub>最大支持参数</sub></td>
 <td align="center"><b>6</b><br><sub>模型适配器</sub></td>
 <td align="center"><b>6</b><br><sub>公开生成路径</sub></td>
-<td align="center"><b>379</b><br><sub>默认测试通过</sub></td>
+<td align="center"><b>380</b><br><sub>默认测试通过</sub></td>
 <td align="center"><b>0</b><br><sub>所需 GPU</sub></td>
 </tr>
 </table>
@@ -394,7 +394,7 @@ argmax 和相同的 top 20 token。在全部 248,320 个 logits 上，余弦相�
 cargo test --all-targets --locked
 ```
 
-当前 Linux 结果：**379 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
+当前 Linux 结果：**380 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
 模型目录。
 
 <details>

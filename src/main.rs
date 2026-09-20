@@ -2367,10 +2367,48 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("urbilateria_cli_{}_{}", std::process::id(), nonce));
-        fs::create_dir_all(&path).unwrap();
-        path
+        model_dir_with_nonce(nonce)
+    }
+
+    fn model_dir_with_nonce(nonce: u128) -> PathBuf {
+        // Wall-clock timestamps may repeat across parallel tests. Atomically claim a directory
+        // rather than accepting another test's existing directory with create_dir_all.
+        let mut attempt = 0_u64;
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "urbilateria_cli_{}_{nonce}_{attempt}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
+                Err(error) => panic!("cannot create fixture {}: {error}", path.display()),
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_model_fixtures_do_not_share_directories_when_timestamps_repeat() {
+        let barrier = std::sync::Barrier::new(8);
+        let paths = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        model_dir_with_nonce(0)
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique = paths.iter().collect::<std::collections::BTreeSet<_>>();
+        for path in &unique {
+            fs::remove_dir_all(path).unwrap();
+        }
+        assert_eq!(unique.len(), paths.len());
     }
 
     fn add_f32_tensor(

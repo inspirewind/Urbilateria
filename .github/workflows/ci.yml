@@ -75,6 +75,9 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
 
+      - name: Test terminal harness
+        run: python3 -B -m unittest discover -s tests -p 'test_tui_smoke.py' -v
+
       - name: Run all model-free tests
         run: cargo +${{ matrix.toolchain }} test --locked --all-targets
 

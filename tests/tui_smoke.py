@@ -15,6 +15,7 @@ import select
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -23,32 +24,93 @@ import time
 ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def terminal_attributes(fd):
+    attributes = termios.tcgetattr(fd)
+    # c_cc entries may be bytes or integers, depending on canonical mode and Python version.
+    return attributes[:6] + [[value[0] if isinstance(value, bytes) else value
+                              for value in attributes[6]]]
+
+
+def run_pty_session(report_fd, command):
+    """Keep the session leader alive until the tested child has exited and been inspected.
+
+    macOS revokes the controlling terminal when its session leader exits. A separate leader
+    lets us capture the child's actual terminal state before that happens, just like a shell.
+    """
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    original = termios.tcgetattr(0)
+    try:
+        with os.fdopen(report_fd, "w", buffering=1) as report:
+            child = subprocess.Popen(command)
+            report.write(json.dumps({"pid": child.pid}) + "\n")
+            returncode = child.wait()
+            report.write(json.dumps({
+                "returncode": returncode,
+                "attributes": terminal_attributes(0),
+            }) + "\n")
+    finally:
+        # Capture above must precede harness cleanup, so missing application cleanup still fails.
+        termios.tcsetattr(0, termios.TCSANOW, original)
+
+
 class Terminal:
     def __init__(self, command):
         self.master, self.slave = pty.openpty()
-        self.original = termios.tcgetattr(self.slave)
+        self.original = terminal_attributes(self.slave)
         self.output = bytearray()
+        self.status = {}
+        self.status_buffer = bytearray()
+        self.status_fd, report_fd = os.pipe()
+        self.readers = {self.master, self.status_fd}
+        self.closed = False
         self.width = 110
         self.height = 36
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.height, self.width, 0, 0))
-        self.process = subprocess.Popen(
-            command,
-            stdin=self.slave, stdout=self.slave, stderr=self.slave,
-            start_new_session=True,
-            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0),
-            env={**os.environ, "TERM": "xterm-256color"},
-        )
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--pty-session", str(report_fd), *command],
+                stdin=self.slave, stdout=self.slave, stderr=self.slave,
+                start_new_session=True,
+                pass_fds=(report_fd,),
+                env={**os.environ, "TERM": "xterm-256color"},
+            )
+        except BaseException:
+            for fd in (self.master, self.slave, self.status_fd):
+                os.close(fd)
+            raise
+        finally:
+            os.close(report_fd)
 
     def read(self, timeout=0.05):
-        if select.select([self.master], [], [], timeout)[0]:
+        ready = select.select(list(self.readers), [], [], timeout)[0]
+        for fd in ready:
             try:
-                self.output.extend(os.read(self.master, 65536))
+                data = os.read(fd, 65536)
             except OSError as error:
                 if error.errno != errno.EIO:
                     raise
+                data = b""
+            if not data:
+                self.readers.discard(fd)
+            elif fd == self.master:
+                self.output.extend(data)
+            else:
+                self.status_buffer.extend(data)
+                while b"\n" in self.status_buffer:
+                    line, _, rest = self.status_buffer.partition(b"\n")
+                    self.status.update(json.loads(line))
+                    self.status_buffer = bytearray(rest)
+        return bool(ready)
 
     def send(self, data):
         os.write(self.master, data)
+
+    def send_signal(self, number):
+        deadline = time.monotonic() + 5
+        while "pid" not in self.status and self.process.poll() is None and time.monotonic() < deadline:
+            self.read()
+        assert "pid" in self.status, ("PTY child did not start", self.output[-3000:])
+        os.kill(self.status["pid"], number)
 
     def resize(self, width, height):
         self.width = width
@@ -73,26 +135,47 @@ class Terminal:
 
     def assert_running(self):
         assert self.process.poll() is None, self.output
+        assert "returncode" not in self.status, self.status
 
     def finish(self):
         deadline = time.monotonic() + 5
         while self.process.poll() is None and time.monotonic() < deadline:
             self.read()
-        assert self.process.poll() == 0, (self.process.poll(), self.output[-3000:])
-        self.read(0.1)
-        assert termios.tcgetattr(self.slave) == self.original, "terminal attributes not restored"
+        assert self.process.poll() == 0, ("PTY session failed or timed out", self.process.poll(), self.output[-3000:])
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and self.read(0.05):
+            pass
+        assert self.status.get("returncode") == 0, ("PTY child failed", self.status, self.output[-3000:])
+        assert self.status.get("attributes") == self.original, "terminal attributes not restored"
         assert b"\x1b[?1049l" in self.output, "alternate screen not restored"
         assert b"\x1b[?2004l" in self.output, "bracketed paste not disabled"
         assert b"\x1b[?25h" in self.output, "cursor not restored"
 
     def close(self):
-        if self.process.poll() is None:
-            self.process.kill()
-            self.process.wait()
-        # Restore the test PTY even on an assertion failure.
-        termios.tcsetattr(self.slave, termios.TCSANOW, self.original)
-        os.close(self.master)
-        os.close(self.slave)
+        if self.closed:
+            return
+        try:
+            self.read(0)
+            if self.process.poll() is None and "pid" in self.status and "returncode" not in self.status:
+                try:
+                    os.kill(self.status["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 2
+                while self.process.poll() is None and time.monotonic() < deadline:
+                    self.read()
+            if self.process.poll() is None or "returncode" not in self.status:
+                # This isolated process group contains only the helper and its test child.
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self.process.wait(timeout=5)
+        finally:
+            # macOS may already have revoked the slave; closing descriptors is still valid.
+            for fd in (self.master, self.slave, self.status_fd):
+                os.close(fd)
+            self.closed = True
 
 
 def fixture(path, complete=False):
@@ -273,7 +356,7 @@ def exit_modes(binary):
             elif mode == "ctrl-d":
                 terminal.send(b"\x04")
             else:
-                terminal.process.send_signal(signal.SIGTERM if mode == "sigterm" else signal.SIGHUP)
+                terminal.send_signal(signal.SIGTERM if mode == "sigterm" else signal.SIGHUP)
             terminal.finish()
         finally:
             terminal.close()
@@ -344,4 +427,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 2 and sys.argv[1] == "--pty-session":
+        run_pty_session(int(sys.argv[2]), sys.argv[3:])
+    else:
+        main()
