@@ -2756,6 +2756,8 @@ mod tests {
             assert!(resources["samples"].as_array().unwrap().len() >= 2);
             assert!(resources["summary"]["peak_rss_bytes"].as_u64().unwrap() > 0);
         }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(profile.get("resources"), Some(&serde_json::Value::Null));
         let stages = profile["stages"].as_array().unwrap();
         assert!(stages
             .iter()
@@ -2771,9 +2773,13 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event["ph"] == "X" && event["name"] == "generate.total"));
+        // Resource counters require Linux procfs; span events remain available on macOS.
+        #[cfg(target_os = "linux")]
         assert!(events
             .iter()
             .any(|event| event["ph"] == "C" && event["name"] == "RSS MiB"));
+        #[cfg(not(target_os = "linux"))]
+        assert!(events.iter().all(|event| event["ph"] != "C"));
         fs::remove_dir_all(dir).unwrap();
     }
 }
