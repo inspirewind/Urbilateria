@@ -460,11 +460,19 @@ mod tests {
         assert_eq!(parsed.cpu_ticks, 22);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn samples_current_linux_process() {
         let snapshot = RawSnapshot::capture().unwrap();
         assert!(snapshot.rss_bytes > 0);
         assert!(snapshot.thread_count > 0);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn resource_sampling_is_unavailable_on_unsupported_platforms() {
+        assert!(RawSnapshot::capture().is_none());
+        assert!(ResourceMonitor::start().is_none());
     }
 
     #[test]

@@ -808,8 +808,18 @@ mod tests {
         assert_eq!(kernel["args"]["cache_hit"], true);
         assert_eq!(kernel["args"]["flow_id"], 99);
         assert_eq!(kernel["args"]["batch_tokens"], 1);
-        assert!(events
-            .iter()
-            .any(|event| event["ph"] == "C" && event["name"] == "CPU cores"));
+        // Span timing is portable; process-resource counters currently require Linux procfs.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(report.resources.is_some());
+            assert!(events
+                .iter()
+                .any(|event| event["ph"] == "C" && event["name"] == "CPU cores"));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(report.resources.is_none());
+            assert!(events.iter().all(|event| event["ph"] != "C"));
+        }
     }
 }
