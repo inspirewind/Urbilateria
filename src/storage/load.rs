@@ -573,18 +573,9 @@ mod tests {
     use crate::profiling::{ProfileSession, ProfileStage};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_dir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "urbilateria_reference_loader_{}_{}",
-            std::process::id(),
-            nonce
-        ))
+        crate::test_support::temp_dir("urbilateria_reference_loader")
     }
 
     fn write_fixture(path: &Path) {

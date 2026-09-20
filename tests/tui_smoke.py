@@ -31,6 +31,26 @@ def terminal_attributes(fd):
                               for value in attributes[6]]]
 
 
+def terminal_attribute_differences(expected, actual):
+    """Compare settings, excluding Darwin's kernel-maintained pending-input state."""
+    differences = []
+    for index, name in enumerate(("iflag", "oflag", "cflag", "lflag", "ispeed", "ospeed", "cc")):
+        before, after = expected[index], actual[index]
+        if name == "lflag" and sys.platform == "darwin":
+            # XNU sets PENDIN when tcsetattr restores ICANON without flushing input.
+            # It is queue state, not a failure to restore raw-mode settings. Keep every
+            # other bit (including ICANON, ECHO, ISIG and IEXTEN) in the comparison.
+            # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/tty.c
+            before &= ~termios.PENDIN
+            after &= ~termios.PENDIN
+        if before != after:
+            if index < 4:
+                differences.append(f"{name}: {before:#x} -> {after:#x} (xor {before ^ after:#x})")
+            else:
+                differences.append(f"{name}: {before!r} -> {after!r}")
+    return differences
+
+
 def run_pty_session(report_fd, command):
     """Keep the session leader alive until the tested child has exited and been inspected.
 
@@ -41,8 +61,11 @@ def run_pty_session(report_fd, command):
     original = termios.tcgetattr(0)
     try:
         with os.fdopen(report_fd, "w", buffering=1) as report:
+            # Both snapshots belong to the initialized controlling terminal, and neither
+            # reads the parent's slave descriptor after the session has been revoked.
+            baseline = terminal_attributes(0)
             child = subprocess.Popen(command)
-            report.write(json.dumps({"pid": child.pid}) + "\n")
+            report.write(json.dumps({"pid": child.pid, "original": baseline}) + "\n")
             returncode = child.wait()
             report.write(json.dumps({
                 "returncode": returncode,
@@ -56,7 +79,6 @@ def run_pty_session(report_fd, command):
 class Terminal:
     def __init__(self, command):
         self.master, self.slave = pty.openpty()
-        self.original = terminal_attributes(self.slave)
         self.output = bytearray()
         self.status = {}
         self.status_buffer = bytearray()
@@ -146,7 +168,12 @@ class Terminal:
         while time.monotonic() < deadline and self.read(0.05):
             pass
         assert self.status.get("returncode") == 0, ("PTY child failed", self.status, self.output[-3000:])
-        assert self.status.get("attributes") == self.original, "terminal attributes not restored"
+        assert "original" in self.status and "attributes" in self.status, ("missing terminal snapshots", self.status)
+        differences = terminal_attribute_differences(self.status["original"], self.status["attributes"])
+        assert not differences, (
+            f"terminal attributes not restored on {sys.platform}: {'; '.join(differences)}; "
+            f"before={self.status['original']!r}; after={self.status['attributes']!r}"
+        )
         assert b"\x1b[?1049l" in self.output, "alternate screen not restored"
         assert b"\x1b[?2004l" in self.output, "bracketed paste not disabled"
         assert b"\x1b[?25h" in self.output, "cursor not restored"

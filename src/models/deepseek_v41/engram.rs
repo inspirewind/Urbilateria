@@ -549,22 +549,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TableFixture(PathBuf);
 
     impl TableFixture {
         fn new(scales_first: bool) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "urb_engram_rows_{}_{}",
-                std::process::id(),
-                nonce
-            ));
-            fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::temp_dir("urb_engram_rows");
             let values = (0..6)
                 .flat_map(|row| std::iter::repeat_n(if row == 3 { 0x7f } else { 0x38 + row }, 64))
                 .collect::<Vec<u8>>();

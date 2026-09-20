@@ -73,23 +73,33 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
+        id: rust
         run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
 
       - name: Test terminal harness
-        run: python3 -B -m unittest discover -s tests -p 'test_tui_smoke.py' -v
+        run: |
+          python3 --version
+          python3 -B -m unittest discover -s tests -p 'test_tui_smoke.py' -v
 
+      # Keep independent checks running after a failure so one run reports all problems.
+      # These are still required checks: no step uses continue-on-error.
       - name: Run all model-free tests
-        run: cargo +${{ matrix.toolchain }} test --locked --all-targets
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo +${{ matrix.toolchain }} test --locked --all-targets --no-fail-fast
 
       - name: Test without the UI dependencies
-        run: cargo +${{ matrix.toolchain }} test --locked --no-default-features --all-targets
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo +${{ matrix.toolchain }} test --locked --no-default-features --all-targets --no-fail-fast
 
       - name: Build UI binary and terminal cleanup test
+        id: ui_build
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: |
           cargo +${{ matrix.toolchain }} build --locked --features ui --bin urb
           cargo +${{ matrix.toolchain }} test --locked --features ui --bin urb --no-run --message-format=json > "$RUNNER_TEMP/urb-ui-tests.jsonl"
 
       - name: Smoke-test UI in a pseudo-terminal
+        if: ${{ !cancelled() && steps.ui_build.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import json

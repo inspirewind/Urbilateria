@@ -1647,7 +1647,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ExpertFixture {
         directory: PathBuf,
@@ -1668,16 +1667,7 @@ mod tests {
             text.num_hidden_layers = 2;
             text.n_routed_experts = 4;
             text.num_experts_per_tok = 2;
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let directory = std::env::temp_dir().join(format!(
-                "urb_v41_expert_batch_{}_{}",
-                std::process::id(),
-                nonce
-            ));
-            fs::create_dir_all(&directory).unwrap();
+            let directory = crate::test_support::temp_dir("urb_v41_expert_batch");
             let mut header = serde_json::Map::new();
             let mut payload = Vec::new();
             for layer in 0..text.num_hidden_layers {

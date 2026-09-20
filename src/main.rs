@@ -45,6 +45,9 @@ use urbilateria::{
 #[cfg(feature = "ui")]
 mod ui;
 
+#[cfg(test)]
+mod test_support;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -2358,33 +2361,11 @@ fn human_count(count: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_SPLIT_PATTERN: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     fn empty_model_dir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        model_dir_with_nonce(nonce)
-    }
-
-    fn model_dir_with_nonce(nonce: u128) -> PathBuf {
-        // Wall-clock timestamps may repeat across parallel tests. Atomically claim a directory
-        // rather than accepting another test's existing directory with create_dir_all.
-        let mut attempt = 0_u64;
-        loop {
-            let path = std::env::temp_dir().join(format!(
-                "urbilateria_cli_{}_{nonce}_{attempt}",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return path,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
-                Err(error) => panic!("cannot create fixture {}: {error}", path.display()),
-            }
-        }
+        test_support::temp_dir("urbilateria_cli")
     }
 
     #[test]
@@ -2395,7 +2376,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        model_dir_with_nonce(0)
+                        test_support::temp_dir_with_nonce("urbilateria_cli", 0)
                     })
                 })
                 .collect::<Vec<_>>();

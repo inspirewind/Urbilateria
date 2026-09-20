@@ -1452,18 +1452,9 @@ fn invalid<T>(path: &Path, reason: impl Into<String>) -> Result<T, SafetensorErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "urbilateria_{name}_{}_{}",
-            std::process::id(),
-            nonce
-        ))
+        crate::test_support::temp_dir(&format!("urbilateria_{name}"))
     }
 
     fn write_fixture(path: &Path) {

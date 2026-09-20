@@ -294,7 +294,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const WIDTH: usize = 32;
     const TINY_EXPERT_BYTES: u64 = 1_632;
@@ -304,15 +303,7 @@ mod tests {
     }
 
     fn fixture_dir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "urbilateria_kimi_k3_moe_runtime_{}_{}",
-            std::process::id(),
-            nonce
-        ))
+        crate::test_support::temp_dir("urbilateria_kimi_k3_moe_runtime")
     }
 
     fn append_tensor(

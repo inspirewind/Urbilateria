@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 use urbilateria::analysis::{
     analyze_checkpoint, build_resource_plan, explain_checkpoint, inspect_checkpoint, list_tensors,
     plan_checkpoint, preflight_checkpoint, InspectionReport, ListOptions, PlanOptions,
@@ -10,17 +9,14 @@ use urbilateria::analysis::{
 use urbilateria::models::glm::runtime::GlmRuntimeModel;
 use urbilateria::GlmConfig;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("urb-inspect-{}-{nonce} 中文", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
+        let path = test_support::temp_dir("urb-inspect 中文");
         let config = serde_json::json!({
             "model_type": "glm_moe_dsa", "hidden_size": 8, "num_hidden_layers": 2,
             "num_attention_heads": 2, "vocab_size": 16, "intermediate_size": 12,

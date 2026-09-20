@@ -19,6 +19,9 @@ pub mod runtime;
 pub mod storage;
 pub mod tokenizer;
 
+#[cfg(test)]
+mod test_support;
+
 pub use config::{
     CommonModelConfig, DeepseekV41Config, DeepseekV4Config, GlmConfig, Hy4Config, KimiK3Config,
     ModelConfig, ModelFamily, Qwen38Config,

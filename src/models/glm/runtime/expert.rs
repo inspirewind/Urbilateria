@@ -339,18 +339,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_dir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "urbilateria_expert_store_{}_{}",
-            std::process::id(),
-            nonce
-        ))
+        crate::test_support::temp_dir("urbilateria_expert_store")
     }
 
     fn write_experts(path: &std::path::Path) {

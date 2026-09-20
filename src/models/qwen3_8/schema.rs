@@ -885,17 +885,8 @@ mod tests {
     #[test]
     fn hf_index_reader_rejects_metadata_over_64_mib() {
         use std::fs::{self, File};
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "urbilateria-qwen38-index-bound-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&directory).unwrap();
+        let directory = crate::test_support::temp_dir("urbilateria-qwen38-index-bound");
         let path = directory.join("model.safetensors.index.json");
         File::create(&path)
             .unwrap()

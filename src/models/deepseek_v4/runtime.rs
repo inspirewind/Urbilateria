@@ -4110,7 +4110,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug, Deserialize)]
     struct TinyOracle {
@@ -4293,15 +4292,7 @@ mod tests {
     }
 
     fn fixture_dir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "urbilateria_deepseek_runtime_{}_{}",
-            std::process::id(),
-            nonce
-        ))
+        crate::test_support::temp_dir("urbilateria_deepseek_runtime")
     }
 
     fn add_f32(
