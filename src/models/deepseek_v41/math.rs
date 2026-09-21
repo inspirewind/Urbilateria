@@ -17,17 +17,56 @@ pub use crate::models::deepseek_v4::math::{
 
 /// V4.1 uses 32-wide dynamic activation blocks for every native MX matrix.
 pub fn linear(weight: &WeightMatrix, input: &[f32]) -> Result<Vec<f32>, DeepseekMathError> {
-    let quantized_input;
+    if weight.uses_mx_activation_quantization() {
+        let quantized = prepare_mx_activation(input)?;
+        linear_with_mx_activation(weight, input, &quantized)
+    } else {
+        Ok(weight.matvec_fp32_accum(input)?)
+    }
+}
+
+/// Materializes the release's 32-wide activation transform once for sibling MX projections.
+pub(super) fn prepare_mx_activation(input: &[f32]) -> Result<Vec<f32>, DeepseekMathError> {
+    simulate_e4m3_activation(input, 32).map_err(|error| {
+        DeepseekMathError::Invalid(format!("V4.1 activation quantization failed: {error}"))
+    })
+}
+
+/// Applies a matrix using a previously prepared MX activation while retaining the original input
+/// for BF16/F32 fixtures and reference weights.
+pub(super) fn linear_with_mx_activation(
+    weight: &WeightMatrix,
+    input: &[f32],
+    mx_input: &[f32],
+) -> Result<Vec<f32>, DeepseekMathError> {
     let uses_mx_quantization = weight.uses_mx_activation_quantization();
-    let input = if uses_mx_quantization {
-        quantized_input = simulate_e4m3_activation(input, 32).map_err(|error| {
-            DeepseekMathError::Invalid(format!("V4.1 activation quantization failed: {error}"))
-        })?;
-        &quantized_input
+    let mut output = weight.matvec_fp32_accum(if uses_mx_quantization {
+        mx_input
     } else {
         input
-    };
-    let mut output = weight.matvec_fp32_accum(input)?;
+    })?;
+    if uses_mx_quantization {
+        round_to_bf16_in_place(&mut output)?;
+    }
+    Ok(output)
+}
+
+/// Batched counterpart of [`linear_with_mx_activation`] with V4.1's FP32 accumulation boundary.
+pub(super) fn linear_with_mx_activation_batch(
+    weight: &WeightMatrix,
+    input: &[f32],
+    mx_input: &[f32],
+    batch: usize,
+) -> Result<Vec<f32>, DeepseekMathError> {
+    let uses_mx_quantization = weight.uses_mx_activation_quantization();
+    let mut output = weight.matmul_rows_fp32_accum(
+        if uses_mx_quantization {
+            mx_input
+        } else {
+            input
+        },
+        batch,
+    )?;
     if uses_mx_quantization {
         round_to_bf16_in_place(&mut output)?;
     }

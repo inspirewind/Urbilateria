@@ -40,9 +40,15 @@ pub struct DeepseekV41Requirements {
     pub engram_logical_parameters: u64,
     pub vision_logical_parameters: u64,
     pub dspark_logical_parameters: u64,
+    /// Largest native non-expert layer payload used by the streaming fallback.
     pub streamed_layer_bytes: u64,
+    /// Exact native bytes required to retain all 40 CED backbone layers.
+    pub backbone_layer_bytes: u64,
+    pub backbone_layer_count: usize,
     pub streamed_embedding_bytes: u64,
     pub streamed_lm_head_bytes: u64,
+    /// Resident BF16 representation used when the vocabulary projection is pinned.
+    pub lm_head_resident_bytes: u64,
     pub engram_table_bytes: u64,
     pub engram_lookup_bytes_per_token: u64,
     pub maximum_expert_bytes: u64,
@@ -59,6 +65,31 @@ pub struct DeepseekV41Requirements {
     pub kv_source_layer_count: usize,
     pub index_source_layer_count: usize,
     pub approximate_replay_window: usize,
+}
+
+impl DeepseekV41Requirements {
+    /// Number of leading CED layers that fit above the mandatory one-layer streaming allowance.
+    /// Partial residency is conservatively rounded by the largest layer; complete residency uses
+    /// the exact sum because Engram and CSA2 ownership make individual layer sizes non-uniform.
+    pub fn cached_backbone_layers_for_resident_budget(&self, resident_budget: u64) -> usize {
+        let cache_budget = resident_budget.saturating_sub(self.streamed_layer_bytes);
+        if cache_budget >= self.backbone_layer_bytes {
+            self.backbone_layer_count
+        } else {
+            cache_budget
+                .checked_div(self.streamed_layer_bytes)
+                .unwrap_or(0)
+                .min(self.backbone_layer_count as u64) as usize
+        }
+    }
+
+    pub fn caches_lm_head_for_resident_budget(&self, resident_budget: u64) -> bool {
+        resident_budget
+            >= self
+                .streamed_layer_bytes
+                .saturating_add(self.backbone_layer_bytes)
+                .saturating_add(self.lm_head_resident_bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +223,12 @@ pub fn inspect_requirements(
         .checked_mul(expert_slots_per_layer as u64)
         .and_then(|bytes| bytes.checked_mul(text.num_hidden_layers as u64))
         .ok_or_else(|| SchemaError::Invalid("expert cache bytes overflow".to_owned()))?;
-    let streamed_layer_bytes = layer_bytes.into_iter().max().unwrap_or(0);
+    let streamed_layer_bytes = layer_bytes.iter().copied().max().unwrap_or(0);
+    let backbone_layer_bytes = layer_bytes.into_iter().try_fold(0u64, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| SchemaError::Invalid("backbone layer bytes overflow".to_owned()))
+    })?;
     let global_kv_cache_bytes = global_kv_cache_bytes(config, context_limit)?;
     let sliding_window_cache_bytes = sliding_window_cache_bytes(config)?;
     let kv_cache_bytes = add(
@@ -225,8 +261,11 @@ pub fn inspect_requirements(
         vision_logical_parameters: vision_params,
         dspark_logical_parameters: dspark_params,
         streamed_layer_bytes: streamed_layer_bytes.max(roots),
+        backbone_layer_bytes,
+        backbone_layer_count: text.num_hidden_layers,
         streamed_embedding_bytes: index.require("embed.weight")?.data_len,
         streamed_lm_head_bytes: index.require("head.weight")?.data_len,
+        lm_head_resident_bytes: index.require("head.weight")?.data_len,
         engram_table_bytes,
         engram_lookup_bytes_per_token,
         maximum_expert_bytes,

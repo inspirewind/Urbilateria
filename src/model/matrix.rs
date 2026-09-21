@@ -103,6 +103,63 @@ impl DenseMatrix {
         self.matvec_rows_fp32(0, self.rows, input)
     }
 
+    /// Applies the FP32-accumulating kernel to consecutive input rows while traversing each
+    /// resident weight row only once. Every token accumulator observes columns in the same order
+    /// as [`Self::matvec_fp32`].
+    pub(crate) fn matmul_rows_fp32(
+        &self,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, MatrixError> {
+        let expected = batch
+            .checked_mul(self.cols)
+            .ok_or_else(|| MatrixError::InvalidShape("batch * cols overflows usize".to_owned()))?;
+        if batch == 0 || input.len() != expected {
+            return Err(MatrixError::InputLength {
+                expected,
+                got: input.len(),
+            });
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(MatrixError::NonFinite);
+        }
+        let work = batch.saturating_mul(self.rows).saturating_mul(self.cols);
+        let mut output_by_row = vec![0.0f32; self.rows.saturating_mul(batch)];
+        let compute = |row: &[f32], output: &mut [f32]| {
+            for (column, &weight) in row.iter().enumerate() {
+                for (token, output) in output.iter_mut().enumerate() {
+                    *output += weight * input[token * self.cols + column];
+                }
+            }
+        };
+        if should_parallelize(self.rows, work) {
+            install(|| {
+                self.data
+                    .par_chunks_exact(self.cols)
+                    .zip(output_by_row.par_chunks_mut(batch))
+                    .for_each(|(row, output)| compute(row, output));
+            });
+        } else {
+            for (row, output) in self
+                .data
+                .chunks_exact(self.cols)
+                .zip(output_by_row.chunks_mut(batch))
+            {
+                compute(row, output);
+            }
+        }
+        let mut output = vec![0.0f32; batch.saturating_mul(self.rows)];
+        for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
+            for (token, &value) in values.iter().enumerate() {
+                output[token * self.rows + row] = value;
+            }
+        }
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(MatrixError::NonFinite);
+        }
+        Ok(output)
+    }
+
     pub(crate) fn matvec_rows_fp32(
         &self,
         start: usize,
@@ -313,5 +370,35 @@ mod tests {
             matrix.matmul_rows(&[1.0, 2.0, 3.0, 4.0], 2).unwrap(),
             vec![1.0, 4.0, 3.0, 8.0]
         );
+    }
+
+    #[test]
+    fn fp32_batched_rows_match_independent_accumulation_bits() {
+        let rows = 17;
+        let cols = 97;
+        let batch = 12;
+        let matrix = DenseMatrix::new(
+            rows,
+            cols,
+            (0..rows * cols)
+                .map(|index| ((index * 29 % 257) as f32 - 128.0) / 64.0)
+                .collect(),
+        )
+        .unwrap();
+        let input = (0..batch * cols)
+            .map(|index| ((index * 17 % 127) as f32 - 63.0) / 32.0)
+            .collect::<Vec<_>>();
+        let expected = input
+            .chunks_exact(cols)
+            .flat_map(|input| matrix.matvec_fp32(input).unwrap())
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        let actual = matrix
+            .matmul_rows_fp32(&input, batch)
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 }

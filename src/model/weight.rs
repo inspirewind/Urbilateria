@@ -219,6 +219,76 @@ impl WeightMatrix {
         }
     }
 
+    /// Batched form of [`Self::matvec_fp32_accum`]. F32 and native MX formats use batch kernels
+    /// that preserve their respective scalar accumulation order; other formats retain per-token
+    /// dispatch until an equivalent batch kernel exists.
+    pub(crate) fn matmul_rows_fp32_accum(
+        &self,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, WeightError> {
+        let expected = batch
+            .checked_mul(self.cols())
+            .ok_or_else(|| MatrixError::InvalidShape("batch * cols overflows usize".to_owned()))?;
+        if batch == 0 || input.len() != expected {
+            return Err(MatrixError::InputLength {
+                expected,
+                got: input.len(),
+            }
+            .into());
+        }
+        if let Self::F32(matrix) = self {
+            let chunks = batch.div_ceil(12);
+            let base_batch = batch / chunks;
+            let larger_chunks = batch % chunks;
+            let mut output = Vec::with_capacity(batch.saturating_mul(matrix.rows()));
+            let mut token = 0usize;
+            for chunk in 0..chunks {
+                let chunk_batch = base_batch + usize::from(chunk < larger_chunks);
+                let start = token.saturating_mul(matrix.cols());
+                let end = start.saturating_add(chunk_batch.saturating_mul(matrix.cols()));
+                output.extend(matrix.matmul_rows_fp32(&input[start..end], chunk_batch)?);
+                token += chunk_batch;
+            }
+            return Ok(output);
+        }
+        if let Self::MxFp8(matrix) = self {
+            let chunks = batch.div_ceil(12);
+            let base_batch = batch / chunks;
+            let larger_chunks = batch % chunks;
+            let mut output = Vec::with_capacity(batch.saturating_mul(matrix.rows()));
+            let mut token = 0usize;
+            for chunk in 0..chunks {
+                let chunk_batch = base_batch + usize::from(chunk < larger_chunks);
+                let start = token.saturating_mul(matrix.cols());
+                let end = start.saturating_add(chunk_batch.saturating_mul(matrix.cols()));
+                output.extend(matrix.matmul_rows(&input[start..end], chunk_batch)?);
+                token += chunk_batch;
+            }
+            return Ok(output);
+        }
+        if let Self::MxFp4(matrix) = self {
+            let chunks = batch.div_ceil(12);
+            let base_batch = batch / chunks;
+            let larger_chunks = batch % chunks;
+            let mut output = Vec::with_capacity(batch.saturating_mul(matrix.rows()));
+            let mut token = 0usize;
+            for chunk in 0..chunks {
+                let chunk_batch = base_batch + usize::from(chunk < larger_chunks);
+                let start = token.saturating_mul(matrix.cols());
+                let end = start.saturating_add(chunk_batch.saturating_mul(matrix.cols()));
+                output.extend(matrix.matmul_rows_fp32(&input[start..end], chunk_batch)?);
+                token += chunk_batch;
+            }
+            return Ok(output);
+        }
+        let mut output = Vec::with_capacity(batch.saturating_mul(self.rows()));
+        for token in input.chunks_exact(self.cols()) {
+            output.extend(self.matvec_fp32_accum(token)?);
+        }
+        Ok(output)
+    }
+
     pub(crate) fn matvec_rows_fp32(
         &self,
         start: usize,
@@ -395,6 +465,39 @@ mod tests {
             .collect::<Vec<_>>();
         let actual = matrix
             .matmul_rows(&input, batch)
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn mxfp8_fp32_accum_batches_split_without_changing_token_order() {
+        let matrix = WeightMatrix::MxFp8(
+            MxFp8Matrix::from_packed(
+                3,
+                8,
+                2,
+                8,
+                (0..24)
+                    .map(|index| [0x00, 0x20, 0x38, 0xb8][index % 4])
+                    .collect(),
+                vec![127, 126],
+            )
+            .unwrap(),
+        );
+        let batch = 25usize;
+        let input = (0..batch * matrix.cols())
+            .map(|index| ((index * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect::<Vec<_>>();
+        let expected = input
+            .chunks_exact(matrix.cols())
+            .flat_map(|input| matrix.matvec_fp32_accum(input).unwrap())
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        let actual = matrix
+            .matmul_rows_fp32_accum(&input, batch)
             .unwrap()
             .into_iter()
             .map(f32::to_bits)

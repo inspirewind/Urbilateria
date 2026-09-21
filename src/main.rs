@@ -1644,12 +1644,25 @@ fn run_generate_deepseek_v41<W: Write>(
     }
     let expert_slots = usize::try_from(plan.expert_slots_per_sparse_layer)
         .map_err(|_| "planned expert slots do not fit usize")?;
+    let cached_layers =
+        zero_cache.cached_backbone_layers_for_resident_budget(plan.resident_core_bytes);
+    let lm_head_mode = if zero_cache.caches_lm_head_for_resident_budget(plan.resident_core_bytes) {
+        "cached"
+    } else {
+        "streamed"
+    };
+    if cached_layers < text.num_hidden_layers {
+        enable_streamed_weight_allocation_reuse();
+    }
     eprintln!(
-        "preflight: DeepSeek-V4.1 prompt={} tokens, context={}, RAM={}, streamed-layer peak={}, packed KV={}, expert slots/layer={}, suppressed LM-head rows={}, CPU workers={} (scalar base runtime; tokenwise prefill)",
+        "preflight: DeepSeek-V4.1 prompt={} tokens, context={}, RAM={}, resident core={} (cached CED layers={}/{}, LM head={}), packed KV={}, expert slots/layer={}, suppressed LM-head rows={}, CPU workers={} (scalar base runtime; 32-token layer-major prefill)",
         prompt_tokens.len(),
         required_context,
         human_bytes(effective_ram),
         human_bytes(plan.resident_core_bytes),
+        cached_layers,
+        text.num_hidden_layers,
+        lm_head_mode,
         human_bytes(plan.kv_cache_bytes),
         expert_slots,
         suppressed_rows,
@@ -2082,8 +2095,13 @@ fn print_deepseek_v41_manifest(report: &deepseek_v41_schema::DeepseekV41Requirem
         report.approximate_replay_window
     );
     println!(
-        "  streamed layer      {} peak · expert {} each",
+        "  CED layers          {} streamed peak · {} all resident",
         human_bytes(report.streamed_layer_bytes),
+        human_bytes(report.backbone_layer_bytes)
+    );
+    println!(
+        "  LM head             {} resident/streamed · expert {} each",
+        human_bytes(report.lm_head_resident_bytes),
         human_bytes(report.maximum_expert_bytes)
     );
     println!(

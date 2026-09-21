@@ -8,7 +8,7 @@ use serde::Serialize;
 
 const MIB: u64 = 1024 * 1024;
 
-/// Plans the V4.1 layer-streamed runtime using its trained mixed-precision cache layout. The
+/// Plans the memory-adaptive V4.1 runtime using its trained mixed-precision cache layout. The
 /// `kv_state_bytes` field is zero because main KV, indexer K, and SWA use distinct packed formats.
 pub fn build_deepseek_v41_resource_plan(
     config: &DeepseekV41Config,
@@ -21,7 +21,8 @@ pub fn build_deepseek_v41_resource_plan(
     let expert_count = sparse_layers.saturating_mul(text.n_routed_experts as u64);
     let maximum_expert = requirements.maximum_expert_bytes;
     let all_experts = maximum_expert.saturating_mul(expert_count);
-    let resident_core = requirements.streamed_layer_bytes;
+    let transient_expert = maximum_expert;
+    let base_resident = requirements.streamed_layer_bytes;
     let safety = (ram_budget_bytes / 10).max(512 * MIB);
     // This is the initial bounded chunk arena. Runtime construction will derive its prompt chunk
     // size from this allowance rather than retaining four F32 hidden streams for the full prompt.
@@ -43,22 +44,48 @@ pub fn build_deepseek_v41_resource_plan(
             .unwrap_or(u64::MAX)
     };
     let fixed = safety
-        .saturating_add(resident_core)
+        .saturating_add(base_resident)
         .saturating_add(kv_bytes)
         .saturating_add(scratch);
-    let raw_expert_budget = ram_budget_bytes.saturating_sub(fixed);
-    let expert_budget = raw_expert_budget.min(all_experts);
+    let working = ram_budget_bytes.saturating_sub(fixed);
+    let discretionary = working.saturating_sub(transient_expert);
+    let expert_bytes_per_slot = maximum_expert.saturating_mul(sparse_layers);
+    let minimum_expert_slots = (text.num_experts_per_tok as u64).min(text.n_routed_experts as u64);
+    let minimum_expert_cache = expert_bytes_per_slot.saturating_mul(minimum_expert_slots);
+    let available_layer_cache = discretionary.saturating_sub(minimum_expert_cache);
+    let layer_cache_bytes = if available_layer_cache >= requirements.backbone_layer_bytes {
+        requirements.backbone_layer_bytes
+    } else {
+        available_layer_cache
+            .checked_div(requirements.streamed_layer_bytes)
+            .unwrap_or(0)
+            .saturating_mul(requirements.streamed_layer_bytes)
+    };
+    let remaining_after_layers = discretionary.saturating_sub(layer_cache_bytes);
+    let lm_head_cache_bytes = if layer_cache_bytes == requirements.backbone_layer_bytes
+        && remaining_after_layers
+            >= minimum_expert_cache.saturating_add(requirements.lm_head_resident_bytes)
+    {
+        requirements.lm_head_resident_bytes
+    } else {
+        0
+    };
+    let resident_core = base_resident
+        .saturating_add(layer_cache_bytes)
+        .saturating_add(lm_head_cache_bytes);
+    let expert_working = remaining_after_layers.saturating_sub(lm_head_cache_bytes);
+    let expert_budget = expert_working.min(all_experts);
     let slots_total = expert_budget
         .checked_div(maximum_expert)
         .unwrap_or(0)
         .min(expert_count);
     let slots_per_layer = slots_total.checked_div(sparse_layers).unwrap_or(0);
-    let unused_after_full = raw_expert_budget.saturating_sub(expert_budget);
+    let unused_after_full = expert_working.saturating_sub(expert_budget);
     let before_kv = ram_budget_bytes
         .saturating_sub(safety)
-        .saturating_sub(resident_core)
+        .saturating_sub(base_resident)
         .saturating_sub(scratch)
-        .saturating_sub(maximum_expert);
+        .saturating_sub(transient_expert);
     let mut low = 0usize;
     let mut high = text.max_position_embeddings;
     while low < high {
@@ -78,13 +105,23 @@ pub fn build_deepseek_v41_resource_plan(
     let within_context = context_tokens > 0
         && context_tokens <= text.max_position_embeddings as u64
         && context_usize != usize::MAX;
-    let transient_fits = raw_expert_budget >= maximum_expert;
+    let transient_fits = working >= transient_expert;
     let feasible = ram_budget_bytes >= fixed
         && transient_fits
         && within_context
         && context_tokens <= maximum_context_under_budget;
     let mut notes = vec![
         "V4.1 keeps native 32x32 MXFP8 trunk weights, packed E2M1 experts, E2M1/E4M3 global KV, and E4M3/E8M0 SWA KV".to_owned(),
+        format!(
+            "V4.1 pins {} of {} CED backbone layers, {} the BF16 LM head, and streams embedding rows",
+            requirements.cached_backbone_layers_for_resident_budget(resident_core),
+            requirements.backbone_layer_count,
+            if requirements.caches_lm_head_for_resident_budget(resident_core) {
+                "caches"
+            } else {
+                "streams"
+            }
+        ),
         format!(
             "Engram's {} table payload remains on storage; the base transient lookup is {} bytes/token before I/O alignment or row caching",
             requirements.engram_table_bytes, requirements.engram_lookup_bytes_per_token
@@ -126,7 +163,7 @@ pub fn build_deepseek_v41_resource_plan(
         maximum_context_under_budget,
         average_expert_bytes: maximum_expert,
         maximum_expert_bytes: maximum_expert,
-        transient_expert_bytes: maximum_expert,
+        transient_expert_bytes: transient_expert,
         expert_slots_total: slots_total,
         expert_slots_per_sparse_layer: slots_per_layer,
         expert_capacity_fraction: (slots_per_layer as f64 / text.n_routed_experts as f64).min(1.0),

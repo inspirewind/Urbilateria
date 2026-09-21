@@ -1,6 +1,7 @@
 //! Opt-in correctness gates for the native DeepSeek-V4.1-Flash release.
 
 use std::path::PathBuf;
+use urbilateria::generation::CausalDecoder;
 use urbilateria::models::deepseek_v41::engram::{EngramTable, NgramHashState};
 use urbilateria::models::deepseek_v41::runtime::DeepseekV41RuntimeModel;
 use urbilateria::models::deepseek_v41::schema;
@@ -245,4 +246,60 @@ fn real_checkpoint_executes_one_complete_base_token() {
             "token {token}: {actual} versus {expected}"
         );
     }
+}
+
+#[test]
+#[ignore = "executes four real tokens twice to compare layer-major prefill with tokenwise state"]
+fn layerwise_prefill_matches_tokenwise_execution_exactly() {
+    let directory = checkpoint_dir();
+    let config = ModelConfig::load(&directory)
+        .unwrap()
+        .as_deepseek_v41()
+        .unwrap()
+        .clone();
+    let index = TensorIndex::open(&directory).unwrap();
+    let requirements = schema::inspect_requirements(&config, &index, 4, 8).unwrap();
+    drop(index);
+    let resident_budget = requirements
+        .streamed_layer_bytes
+        .saturating_add(requirements.backbone_layer_bytes)
+        .saturating_add(requirements.lm_head_resident_bytes);
+    let runtime = DeepseekV41RuntimeModel::load(
+        &directory,
+        RuntimeLoadOptions {
+            resident_budget_bytes: resident_budget,
+            expert_cache_budget_bytes: requirements.expert_cache_bytes,
+            kv_cache_budget_bytes: requirements.kv_cache_bytes,
+            expert_slots_per_layer: 8,
+            maximum_expert_bytes: requirements.maximum_expert_bytes,
+            context_limit: 4,
+        },
+    )
+    .unwrap();
+    let tokens = [0, 5, 100_000, 42];
+
+    let mut sequential_state = runtime.new_state().unwrap();
+    let mut sequential = None;
+    for &token in &tokens {
+        sequential = Some(runtime.forward_token(token, &mut sequential_state).unwrap());
+    }
+    let mut layerwise_state = runtime.new_state().unwrap();
+    let layerwise = runtime
+        .prefill_tokens(&tokens, &mut layerwise_state)
+        .unwrap();
+
+    assert_eq!(layerwise, sequential.unwrap());
+    assert_eq!(layerwise_state.position(), sequential_state.position());
+    assert_eq!(
+        layerwise_state.expert_telemetry(),
+        sequential_state.expert_telemetry()
+    );
+    assert_eq!(
+        layerwise_state.cache_bytes(),
+        sequential_state.cache_bytes()
+    );
+    assert_eq!(
+        CausalDecoder::prefill(&runtime, &tokens, &mut runtime.new_state().unwrap()).unwrap(),
+        layerwise.logits
+    );
 }

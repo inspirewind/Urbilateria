@@ -1560,6 +1560,103 @@ impl MxFp4Matrix {
         Ok(output)
     }
 
+    /// Applies consecutive inputs with the FP32 accumulation boundary used by DeepSeek-V4.1.
+    /// Packed weights are decoded once for two through twelve inputs, while every token retains
+    /// the exact scalar product and addition order of [`Self::matvec_fp32`].
+    pub(crate) fn matmul_rows_fp32(
+        &self,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, MxError> {
+        let expected = batch
+            .checked_mul(self.cols)
+            .ok_or_else(|| MxError::Shape("batch * columns overflows usize".to_owned()))?;
+        if batch == 0 || input.len() != expected {
+            return Err(MxError::Shape(format!(
+                "batched FP32 matvec expects a non-zero batch and {expected} inputs, got {}",
+                input.len()
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(MxError::NonFinite);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ordered_avx2 = (2..=12).contains(&batch)
+                && self.group_size >= 8
+                && self.group_size % 2 == 0
+                && std::arch::is_x86_feature_detected!("avx2");
+            if ordered_avx2 {
+                let work = batch.saturating_mul(self.rows).saturating_mul(self.cols);
+                let _profile = span_with_work(ProfileStage::MatvecMxFp4, work);
+                let row_bytes = self.cols.div_ceil(2);
+                let groups = self.cols.div_ceil(self.group_size);
+                let mut output_by_row = vec![0.0f32; self.rows.saturating_mul(batch)];
+                let compute_row = |row: usize, output: &mut [f32]| {
+                    let packed = &self.packed[row * row_bytes..(row + 1) * row_bytes];
+                    let scales = &self.scale_bytes[row * groups..(row + 1) * groups];
+                    macro_rules! compute_batch {
+                        ($batch:literal) => {
+                            dot_e2m1_e8m0_batch_fp32_ordered_avx2::<$batch>(
+                                packed,
+                                scales,
+                                input,
+                                self.cols,
+                                self.group_size,
+                                output,
+                            )
+                        };
+                    }
+                    // SAFETY: dispatch proves AVX2 support and validated slices cover every input,
+                    // packed nibble, and scale group. Batch is statically bounded to 2..=12.
+                    unsafe {
+                        match batch {
+                            2 => compute_batch!(2),
+                            3 => compute_batch!(3),
+                            4 => compute_batch!(4),
+                            5 => compute_batch!(5),
+                            6 => compute_batch!(6),
+                            7 => compute_batch!(7),
+                            8 => compute_batch!(8),
+                            9 => compute_batch!(9),
+                            10 => compute_batch!(10),
+                            11 => compute_batch!(11),
+                            12 => compute_batch!(12),
+                            _ => unreachable!("MXFP4 FP32 batch is limited to two through twelve"),
+                        }
+                    }
+                };
+                if should_parallelize(self.rows, work) {
+                    install(|| {
+                        output_by_row
+                            .par_chunks_mut(batch)
+                            .enumerate()
+                            .for_each(|(row, output)| compute_row(row, output));
+                    });
+                } else {
+                    for (row, output) in output_by_row.chunks_mut(batch).enumerate() {
+                        compute_row(row, output);
+                    }
+                }
+                let mut output = vec![0.0f32; batch.saturating_mul(self.rows)];
+                for (row, values) in output_by_row.chunks_exact(batch).enumerate() {
+                    for (token, &value) in values.iter().enumerate() {
+                        output[token * self.rows + row] = value;
+                    }
+                }
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(MxError::NonFinite);
+                }
+                return Ok(output);
+            }
+        }
+        let mut output = Vec::with_capacity(batch.saturating_mul(self.rows));
+        for input in input.chunks_exact(self.cols) {
+            output.extend(self.matvec_fp32(input)?);
+        }
+        Ok(output)
+    }
+
     pub(crate) fn matvec_fp32(&self, input: &[f32]) -> Result<Vec<f32>, MxError> {
         self.matvec_rows_fp32(0, self.rows, input)
     }
@@ -1956,6 +2053,81 @@ unsafe fn dot_e2m1_e8m0_batch_f64_ordered_avx2<const BATCH: usize>(
     for (output, sum) in output.iter_mut().zip(sums) {
         *output = sum as f32;
     }
+}
+
+/// Batched FP32 counterpart of [`dot_e2m1_e8m0_fp32_ordered_avx2`]. Decoding is shared, but each
+/// token keeps an independent FP32 accumulator and observes products in original column order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_e2m1_e8m0_batch_fp32_ordered_avx2<const BATCH: usize>(
+    packed: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    columns: usize,
+    group_size: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert!((2..=12).contains(&BATCH));
+    debug_assert_eq!(group_size % 2, 0);
+    debug_assert_eq!(packed.len(), columns.div_ceil(2));
+    debug_assert_eq!(scales.len(), columns.div_ceil(group_size));
+    debug_assert_eq!(input.len(), BATCH * columns);
+    debug_assert_eq!(output.len(), BATCH);
+    let magnitudes = _mm256_loadu_ps(E2M1_TABLE.as_ptr());
+    let magnitude_mask = _mm256_set1_epi32(7);
+    let sign_mask = _mm256_set1_epi32(8);
+    let mut sums = [0.0f32; BATCH];
+    let mut products = [0.0f32; 8];
+    let mut column = 0usize;
+    for (group, &scale_byte) in scales.iter().enumerate() {
+        let group_end = ((group + 1) * group_size).min(columns);
+        let group_columns = group_end - column;
+        let scale = _mm256_set1_ps(decode_e8m0_unchecked(scale_byte));
+        let complete = group_columns / 8 * 8;
+        for offset in (0..complete).step_by(8) {
+            let bytes = _mm_cvtsi32_si128(
+                packed
+                    .as_ptr()
+                    .add((column + offset) / 2)
+                    .cast::<i32>()
+                    .read_unaligned(),
+            );
+            let nibbles = _mm_unpacklo_epi8(bytes, _mm_srli_epi16(bytes, 4));
+            let codes = _mm256_cvtepu8_epi32(nibbles);
+            let indices = _mm256_and_si256(codes, magnitude_mask);
+            let magnitude = _mm256_permutevar8x32_ps(magnitudes, indices);
+            let signs = _mm256_slli_epi32(_mm256_and_si256(codes, sign_mask), 28);
+            let signs =
+                _mm256_and_si256(signs, _mm256_cmpgt_epi32(indices, _mm256_setzero_si256()));
+            let weights =
+                _mm256_mul_ps(_mm256_xor_ps(magnitude, _mm256_castsi256_ps(signs)), scale);
+            for (token, sum) in sums.iter_mut().enumerate() {
+                let inputs = _mm256_loadu_ps(input.as_ptr().add(token * columns + column + offset));
+                _mm256_storeu_ps(products.as_mut_ptr(), _mm256_mul_ps(weights, inputs));
+                for product in products {
+                    *sum += product;
+                }
+            }
+        }
+        let scalar_scale = decode_e8m0_unchecked(scale_byte);
+        for offset in complete..group_columns {
+            let absolute = column + offset;
+            let byte = packed[absolute / 2];
+            let code = if absolute % 2 == 0 {
+                byte & 15
+            } else {
+                byte >> 4
+            };
+            let weight = decode_e2m1(code) * scalar_scale;
+            for (token, sum) in sums.iter_mut().enumerate() {
+                *sum += weight * input[token * columns + absolute];
+            }
+        }
+        column = group_end;
+    }
+    output.copy_from_slice(&sums);
 }
 
 /// SIMD decodes and multiplies eight weights at a time, then adds their products in the
@@ -2447,6 +2619,43 @@ mod tests {
                 .collect::<Vec<_>>();
             let actual = matrix
                 .matmul_rows(&input, batch)
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "batch={batch}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mxfp4_batched_fp32_avx2_matches_independent_fp32_bits() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let rows = 17usize;
+        let cols = 129usize;
+        let group_size = 32usize;
+        let row_bytes = cols.div_ceil(2);
+        let groups = cols.div_ceil(group_size);
+        let packed = (0..rows * row_bytes)
+            .map(|index| (index.wrapping_mul(83).wrapping_add(11)) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..rows * groups)
+            .map(|index| 118 + (index.wrapping_mul(7) % 19) as u8)
+            .collect::<Vec<_>>();
+        let matrix = MxFp4Matrix::from_packed(rows, cols, group_size, packed, scales).unwrap();
+        for batch in 1..=12 {
+            let input = (0..batch * cols)
+                .map(|index| ((index.wrapping_mul(29) % 127) as f32 - 63.0) / 131.0)
+                .collect::<Vec<_>>();
+            let expected = input
+                .chunks_exact(cols)
+                .flat_map(|input| matrix.matvec_fp32(input).unwrap())
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            let actual = matrix
+                .matmul_rows_fp32(&input, batch)
                 .unwrap()
                 .into_iter()
                 .map(f32::to_bits)
