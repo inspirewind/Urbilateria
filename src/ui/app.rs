@@ -1,7 +1,10 @@
-use super::commands::{clean_text, parse, takes_arguments, Command, COMMANDS};
+use super::chat::{ChatSettings, History, PendingTurn};
+use super::commands::{clean_text, parse, takes_arguments, Command, GenerateOptions, COMMANDS};
+use super::generate::{Event as GenerationEvent, Outcome, Stream};
 use super::report::{
     decode_entry, explain_entry, help_entry, inspection_entry, list_entry, plan_entry,
-    preflight_entry, probe_entry, tokenize_entry, Detail, Entry, Kind,
+    preflight_entry, probe_entry, tokenize_entry, Detail, Entry, GenerationTranscript, Kind,
+    ModelSummary, RuntimeInfo,
 };
 use super::worker::{Finished, Report, Request, Task};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -12,11 +15,18 @@ use std::time::Instant;
 
 const INPUT_LIMIT: usize = 16_384;
 const HISTORY_LIMIT: usize = 100;
+// Also bound long generation transcripts. Together with each entry's line limit, this keeps
+// wrapped output within Paragraph's u16 scroll range at the minimum supported terminal width.
+const TRANSCRIPT_BYTES: usize = 512 * 1024;
 
 pub struct Pending {
     pub id: u64,
     pub started: Instant,
     pub task: Task,
+    pub cancelling: bool,
+    path: PathBuf,
+    output: Option<GenerationTranscript>,
+    turn: Option<PendingTurn>,
 }
 
 pub struct App {
@@ -24,8 +34,17 @@ pub struct App {
     pub entries: VecDeque<Entry>,
     pub model_path: Option<PathBuf>,
     pub model_family: Option<String>,
+    pub model_summary: Option<ModelSummary>,
+    pub runtime: Option<RuntimeInfo>,
+    pub runtime_open: bool,
+    pub runtime_scroll: Option<usize>,
+    pub runtime_max_scroll: usize,
+    pub runtime_page_size: usize,
+    pub settings: ChatSettings,
+    pub conversation: History,
     pub pending: Option<Pending>,
     pub quit: bool,
+    pub cancel_requested: bool,
     /// None follows the latest output; Some anchors a row from the start.
     pub scroll: Option<usize>,
     pub max_scroll: usize,
@@ -45,8 +64,17 @@ impl App {
             entries: VecDeque::new(),
             model_path,
             model_family: None,
+            model_summary: None,
+            runtime: None,
+            runtime_open: false,
+            runtime_scroll: None,
+            runtime_max_scroll: 0,
+            runtime_page_size: 1,
+            settings: ChatSettings::default(),
+            conversation: History::default(),
             pending: None,
             quit: false,
+            cancel_requested: false,
             scroll: None,
             max_scroll: 0,
             page_size: 10,
@@ -62,7 +90,7 @@ impl App {
             "Welcome to Urbilateria",
             vec![
                 Detail::text("Explore your model checkpoints from the terminal."),
-                Detail::text("Type / for commands, or /help for keyboard shortcuts."),
+                Detail::text("Type a message to chat, / for commands, or /help for keyboard shortcuts."),
                 Detail::text(match &app.model_path {
                     Some(path) => format!(
                         "Current path: {}\nRun /inspect to read its metadata.",
@@ -96,6 +124,9 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.runtime_open {
+            return;
+        }
         let remaining = INPUT_LIMIT.saturating_sub(self.input_len());
         self.editor.insert_str(clean_text(text, remaining));
         self.edited();
@@ -106,6 +137,51 @@ impl App {
             return None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The full runtime view works on narrow terminals too, without inserting logs into chat.
+        match key.code {
+            KeyCode::F(2) => {
+                self.runtime_open = !self.runtime_open;
+                return None;
+            }
+            KeyCode::Esc if self.runtime_open => {
+                self.runtime_open = false;
+                return None;
+            }
+            KeyCode::PageUp if self.runtime_open => {
+                self.runtime_scroll = Some(
+                    self.runtime_scroll
+                        .unwrap_or(self.runtime_max_scroll)
+                        .saturating_sub(self.runtime_page_size),
+                );
+                return None;
+            }
+            KeyCode::PageDown if self.runtime_open => {
+                let row = self
+                    .runtime_scroll
+                    .unwrap_or(self.runtime_max_scroll)
+                    .saturating_add(self.runtime_page_size);
+                self.runtime_scroll = (row < self.runtime_max_scroll).then_some(row);
+                return None;
+            }
+            KeyCode::Home if ctrl && self.runtime_open => {
+                self.runtime_scroll = Some(0);
+                return None;
+            }
+            KeyCode::End if ctrl && self.runtime_open => {
+                self.runtime_scroll = None;
+                return None;
+            }
+            _ => {}
+        }
+        if self.runtime_open {
+            if ctrl
+                && (key.code == KeyCode::Char('c')
+                    || (key.code == KeyCode::Char('d') && self.input().is_empty()))
+            {
+                self.quit = true;
+            }
+            return None;
+        }
         let completions = self.completions();
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
@@ -119,7 +195,17 @@ impl App {
                 self.newline()
             }
             KeyCode::Enter => return self.submit(),
-            KeyCode::Esc => self.completion_dismissed = true,
+            KeyCode::Esc => {
+                if completions.is_empty() {
+                    if let Some(pending) = &mut self.pending {
+                        if matches!(pending.task, Task::Generate(_)) && !pending.cancelling {
+                            pending.cancelling = true;
+                            self.cancel_requested = true;
+                        }
+                    }
+                }
+                self.completion_dismissed = true;
+            }
             KeyCode::Tab if !completions.is_empty() => {
                 let (name, _) = completions[self.completion_index % completions.len()];
                 self.editor = editor(&format!(
@@ -225,9 +311,13 @@ impl App {
     }
 
     pub fn submit(&mut self) -> Option<Request> {
-        let input = self.input();
-        let input = input.trim();
-        if input.is_empty() {
+        let original = self.input();
+        let input = if original.trim_start().starts_with('/') {
+            original.trim()
+        } else {
+            original.as_str()
+        };
+        if input.trim().is_empty() {
             return None;
         }
         if self.history.back().is_none_or(|last| last != input) {
@@ -242,6 +332,25 @@ impl App {
         self.scroll = None;
         self.push(Entry::message(Kind::Input, "You", input));
         match parse(input) {
+            Ok(Command::Message(text)) => {
+                if self.model_path.is_none() {
+                    self.error("No model selected. Use /inspect MODEL_DIR first (quote paths with spaces).");
+                } else if let Some(pending) = &self.pending {
+                    self.error(format!("{} is already running. Wait for it to finish, or press Esc to stop generation.", pending.task.command()));
+                } else {
+                    match self.settings.generation(&text) {
+                        Ok(options) => return self.start_generation(None, options, false),
+                        Err(error) => self.error(error),
+                    }
+                }
+            }
+            Ok(Command::Settings(update)) => {
+                self.settings.update(update);
+                self.push(Entry::message(Kind::Info, "Conversation settings", format!(
+                    "{}\nSend plain text to chat. Options: --ram-gib N|auto --max-new-tokens N --threads N|auto --thinking | --no-thinking.",
+                    self.settings.describe()
+                )));
+            }
             Ok(Command::Help) => self.push(help_entry()),
             Ok(Command::Version) => self.push(Entry::message(
                 Kind::Info,
@@ -251,6 +360,16 @@ impl App {
             Ok(Command::Clear) => {
                 self.entries.clear();
                 self.scroll = None;
+                self.conversation.clear();
+                if let Some(runtime) = &mut self.runtime {
+                    runtime.clear_log();
+                }
+                self.runtime_scroll = None;
+                if let Some(pending) = &mut self.pending {
+                    if let Some(output) = &mut pending.output {
+                        *output = GenerationTranscript::default();
+                    }
+                }
             }
             Ok(Command::Quit) => self.quit = true,
             Ok(Command::Inspect(path)) => return self.start(path, Task::Inspect),
@@ -269,9 +388,48 @@ impl App {
             Ok(Command::Decode(path, ids, skip_special)) => {
                 return self.start(path, Task::Decode { ids, skip_special })
             }
+            Ok(Command::Generate(path, options)) => {
+                return self.start_generation(path, options, true)
+            }
             Err(error) => self.error(error),
         }
         None
+    }
+
+    fn start_generation(
+        &mut self,
+        path: Option<PathBuf>,
+        mut options: GenerateOptions,
+        remember: bool,
+    ) -> Option<Request> {
+        let path = path.or_else(|| self.model_path.clone());
+        if self.pending.is_some() || path.is_none() {
+            return self.start(path, Task::Generate(options));
+        }
+        let remembered = options.clone();
+        if !options.flag("--raw-prompt") {
+            if let Some(prompt) = options.take_prompt() {
+                options.conversation = Some(
+                    self.conversation
+                        .conversation(prompt, path == self.model_path),
+                );
+            }
+        }
+        let request = self.start(path, Task::Generate(options));
+        if request.is_some() && remember {
+            self.settings.remember(&remembered);
+        }
+        request
+    }
+
+    fn select_model(&mut self, path: PathBuf) {
+        if self.model_path.as_ref() != Some(&path) {
+            self.conversation.clear();
+            self.model_summary = None;
+            self.model_family = None;
+            self.runtime = None;
+        }
+        self.model_path = Some(path);
     }
 
     fn start(&mut self, path: Option<PathBuf>, task: Task) -> Option<Request> {
@@ -282,11 +440,42 @@ impl App {
             ));
         } else if let Some(path) = path.or_else(|| self.model_path.clone()) {
             self.next_id += 1;
+            if matches!(task, Task::Generate(_)) {
+                self.runtime = Some(RuntimeInfo::new(&path));
+                self.runtime_scroll = None;
+            }
             self.pending = Some(Pending {
                 id: self.next_id,
                 started: Instant::now(),
                 task: task.clone(),
+                path: path.clone(),
+                cancelling: false,
+                output: matches!(task, Task::Generate(_)).then(GenerationTranscript::default),
+                turn: match &task {
+                    Task::Generate(options) => {
+                        options.conversation.as_ref().map(|chat| PendingTurn {
+                            user: chat.prompt.clone(),
+                            thinking: !options.flag("--no-thinking"),
+                            epoch: self.conversation.epoch,
+                            response: String::new(),
+                            overflow: false,
+                        })
+                    }
+                    _ => None,
+                },
             });
+            if let Some(output) = self
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.output.as_ref())
+            {
+                self.push(output.entry(
+                    self.next_id,
+                    Kind::Info,
+                    "Generating · Esc to stop".into(),
+                    None,
+                ));
+            }
             return Some(Request {
                 id: self.next_id,
                 path,
@@ -308,17 +497,27 @@ impl App {
         {
             return;
         }
+        if matches!(self.pending.as_ref().unwrap().task, Task::Generate(_)) {
+            // A process-spawn failure arrives through the same path as other submission errors.
+            if let Err(error) = event.result {
+                self.generation_event(event.id, GenerationEvent::Finished(Outcome::Failed(error)));
+            }
+            return;
+        }
         let pending = self.pending.take().expect("matching pending analysis");
         match event.result {
             Ok(report) => {
                 let (path, family) = report.identity();
-                if family.is_some() || self.model_path.as_deref() != Some(path) {
+                self.select_model(path.to_owned());
+                if family.is_some() {
                     self.model_family = family.map(|family| family.to_string());
                 }
-                self.model_path = Some(path.to_owned());
                 let elapsed = pending.started.elapsed();
-                self.push(match report {
-                    Report::Inspection(result) => inspection_entry(&result, elapsed),
+                let entry = match report {
+                    Report::Inspection(result) => {
+                        self.model_summary = Some(ModelSummary::from_inspection(&result));
+                        inspection_entry(&result, elapsed)
+                    }
                     Report::Planning(result) => plan_entry(&result, elapsed),
                     Report::Preflight(result) => preflight_entry(&result, elapsed),
                     Report::Listing(result) => list_entry(&result, elapsed),
@@ -326,9 +525,119 @@ impl App {
                     Report::Probe(result) => probe_entry(&result, elapsed),
                     Report::Tokenization(result) => tokenize_entry(&result, elapsed),
                     Report::Decoding(result) => decode_entry(&result, elapsed),
-                });
+                };
+                self.push(entry);
             }
             Err(error) => self.error(error),
+        }
+    }
+
+    pub fn generation_event(&mut self, id: u64, event: GenerationEvent) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        if pending.id != id {
+            self.pending = Some(pending);
+            return;
+        }
+        let Some(output) = &mut pending.output else {
+            self.pending = Some(pending);
+            return;
+        };
+        if let GenerationEvent::Progress(snapshot) = event {
+            if let Some(runtime) = &mut self.runtime {
+                runtime.metrics = snapshot;
+            }
+            self.pending = Some(pending);
+            return;
+        }
+        let mut history_warning = false;
+        let (kind, title, error, finished): (Kind, String, Option<String>, bool) = match event {
+            GenerationEvent::Output(stream, text) => {
+                if stream == Stream::Text {
+                    if let Some(turn) = &mut pending.turn {
+                        turn.append(&text);
+                    }
+                }
+                if stream == Stream::Log {
+                    if let Some(runtime) = &mut self.runtime {
+                        runtime.append(&text);
+                    }
+                    self.pending = Some(pending);
+                    return;
+                }
+                output.append(stream, &text);
+                (
+                    Kind::Info,
+                    "Generating · Esc to stop".to_owned(),
+                    None,
+                    false,
+                )
+            }
+            GenerationEvent::Finished(outcome) => {
+                if let Some(runtime) = &mut self.runtime {
+                    if runtime.metrics.status == crate::progress::Status::Running {
+                        runtime.metrics.elapsed_seconds = runtime
+                            .metrics
+                            .elapsed_seconds
+                            .max(pending.started.elapsed().as_secs_f64());
+                    }
+                    runtime.status = match &outcome {
+                        Outcome::Complete => "Complete",
+                        Outcome::Cancelled => "Cancelled",
+                        Outcome::Failed(_) => "Failed",
+                    };
+                    if let Outcome::Failed(error) = &outcome {
+                        runtime.append(&format!("\n{error}"));
+                    }
+                }
+                let (kind, title, error) = match outcome {
+                    Outcome::Complete => {
+                        let turn = pending.turn.take().filter(|turn| turn.epoch == self.conversation.epoch);
+                        let runtime = self.runtime.take();
+                        self.select_model(pending.path.clone());
+                        self.runtime = runtime;
+                        if let Some(turn) = turn {
+                            if turn.overflow { history_warning = true; }
+                            else { self.conversation.commit(turn.finish()); }
+                        }
+                        (Kind::Success, "Generation complete", None)
+                    }
+                    Outcome::Cancelled => (Kind::Warning, "Generation cancelled", Some(
+                        "Partial text kept. Model resources released; profile files may be incomplete.".into()
+                    )),
+                    Outcome::Failed(_) => (Kind::Error, "Generation failed", Some(
+                        "See Runtime (F2) for details.".into()
+                    )),
+                };
+                (
+                    kind,
+                    format!("{title} · {:.2}s", pending.started.elapsed().as_secs_f64()),
+                    error,
+                    true,
+                )
+            }
+            GenerationEvent::Progress(_) => unreachable!("progress is handled separately"),
+        };
+        let entry = output.entry(id, kind, title, error.as_deref());
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.task_id == Some(id))
+        {
+            *existing = entry;
+        } else {
+            self.push(entry); // /clear or history eviction removed the previous display block.
+        }
+        self.trim_transcript();
+        if finished {
+            self.cancel_requested = false;
+            if history_warning {
+                self.push(Entry::message(Kind::Warning, "Conversation history",
+                    "This response exceeded the history limit and was not added to the next prompt."));
+            }
+        } else {
+            self.pending = Some(pending);
         }
     }
 
@@ -337,19 +646,33 @@ impl App {
     }
 
     pub fn push(&mut self, entry: Entry) {
-        if self.entries.len() == HISTORY_LIMIT {
+        self.entries.push_back(entry);
+        self.trim_transcript();
+    }
+
+    fn trim_transcript(&mut self) {
+        let size = |entry: &Entry| {
+            entry.title.len()
+                + entry
+                    .details
+                    .iter()
+                    .map(|detail| detail.text.len() + detail.label.map_or(0, str::len))
+                    .sum::<usize>()
+        };
+        let mut bytes: usize = self.entries.iter().map(size).sum();
+        while self.entries.len() > HISTORY_LIMIT || bytes > TRANSCRIPT_BYTES {
+            bytes -= size(self.entries.front().expect("nonempty transcript"));
             self.entries.pop_front();
             // Recompute from the oldest retained entry after eviction.
             self.scroll = self.scroll.map(|_| 0);
         }
-        self.entries.push_back(entry);
     }
 }
 
 fn editor(text: &str) -> TextArea<'static> {
     let mut editor = TextArea::from(text.split('\n'));
     editor.set_wrap_mode(WrapMode::Glyph);
-    editor.set_placeholder_text("Type / for commands");
+    editor.set_placeholder_text("Message the model, or / for commands");
     editor.move_cursor(CursorMove::Bottom);
     editor.move_cursor(CursorMove::End);
     editor
@@ -357,10 +680,362 @@ fn editor(text: &str) -> TextArea<'static> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::generate::Stream;
     use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn message(app: &mut App, text: &str) -> Request {
+        app.paste(text);
+        app.submit().expect("message starts generation")
+    }
+
+    fn finish_reply(app: &mut App, id: u64, text: &str, outcome: Outcome) {
+        app.generation_event(id, GenerationEvent::Output(Stream::Text, text.into()));
+        app.generation_event(
+            id,
+            GenerationEvent::Output(Stream::Log, "diagnostics".into()),
+        );
+        app.generation_event(id, GenerationEvent::Finished(outcome));
+    }
+
+    fn chat_app() -> App {
+        let mut app = App::new(Some("/model".into()));
+        app.paste("/settings --ram-gib 2 --max-new-tokens 128 --no-thinking");
+        app.submit();
+        app.model_summary = Some(ModelSummary {
+            name: "model".into(),
+            family: "GLM-5.2".into(),
+            path: "/model".into(),
+            fields: vec![],
+        });
+        app
+    }
+
+    #[test]
+    fn runtime_metrics_ignore_stale_events_and_reset_with_each_generation() {
+        let mut app = chat_app();
+        let request = message(&mut app, "hello");
+        let snapshot = crate::progress::Snapshot {
+            prompt_tokens: Some(6),
+            generated_tokens: 3,
+            total_tokens: Some(9),
+            elapsed_seconds: 4.0,
+            ttft_seconds: Some(2.0),
+            decode_tokens_per_second: Some(1.0),
+            ..Default::default()
+        };
+        app.generation_event(request.id + 1, GenerationEvent::Progress(snapshot.clone()));
+        assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 0);
+        app.generation_event(request.id, GenerationEvent::Progress(snapshot.clone()));
+        assert_eq!(app.runtime.as_ref().unwrap().metrics, snapshot);
+        app.key(key(KeyCode::F(2)));
+        assert!(app.runtime_open);
+        app.key(key(KeyCode::Esc));
+        assert!(!app.runtime_open);
+        assert!(!app.cancel_requested);
+        finish_reply(&mut app, request.id, "reply\n", Outcome::Cancelled);
+        assert_eq!(app.runtime.as_ref().unwrap().status, "Cancelled");
+        assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 3);
+        assert!(app.runtime.as_ref().unwrap().text().contains("diagnostics"));
+        let next = message(&mut app, "retry");
+        assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 0);
+        assert_eq!(app.runtime.as_ref().unwrap().metrics.ttft_seconds, None);
+        assert_eq!(
+            app.runtime.as_ref().unwrap().text(),
+            "Waiting for runtime diagnostics…"
+        );
+        app.generation_event(request.id, GenerationEvent::Progress(snapshot));
+        assert_eq!(app.pending.as_ref().unwrap().id, next.id);
+        assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 0);
+    }
+
+    #[test]
+    fn plain_input_reuses_complete_responses_without_display_truncation_or_logs() {
+        let mut app = chat_app();
+        let first = message(&mut app, "  don't quote \"this\n中文🙂  ");
+        let Task::Generate(options) = &first.task else {
+            panic!("expected generation")
+        };
+        assert!(options.value("--prompt").is_none());
+        assert_eq!(
+            options.conversation.as_ref().unwrap().prompt,
+            "  don't quote \"this\n中文🙂  "
+        );
+        assert!(options.conversation.as_ref().unwrap().turns.is_empty());
+        let response = format!("START{}END\n", "中".repeat(20_000));
+        finish_reply(&mut app, first.id, &response, Outcome::Complete);
+        assert!(!app.entries.back().unwrap().details[0]
+            .text
+            .contains("START"));
+        assert_eq!(
+            app.conversation.turns[0].assistant,
+            response.strip_suffix('\n').unwrap()
+        );
+        let second = message(&mut app, "What was my question?");
+        let Task::Generate(options) = &second.task else {
+            panic!("expected generation")
+        };
+        let chat = options.conversation.as_ref().unwrap();
+        assert_eq!(chat.turns.len(), 1);
+        assert!(chat.turns[0].assistant.starts_with("START"));
+        assert!(!chat.turns[0].assistant.contains("diagnostics"));
+        assert_eq!(options.value("--max-new-tokens"), Some("128"));
+        finish_reply(&mut app, second.id, "unfinished", Outcome::Cancelled);
+        assert_eq!(app.conversation.turns.len(), 1);
+        let third = message(&mut app, "Retry");
+        finish_reply(
+            &mut app,
+            third.id,
+            "partial",
+            Outcome::Failed("runtime failure".into()),
+        );
+        assert_eq!(app.conversation.turns.len(), 1);
+        assert_eq!(app.model_summary.as_ref().unwrap().name, "model");
+    }
+
+    #[test]
+    fn clear_during_generation_starts_a_new_context_and_keeps_the_model_card() {
+        let mut app = chat_app();
+        let first = message(&mut app, "first");
+        finish_reply(&mut app, first.id, "answer\n", Outcome::Complete);
+        let second = message(&mut app, "second");
+        app.paste("/clear");
+        app.submit();
+        finish_reply(
+            &mut app,
+            second.id,
+            "answer after clear\n",
+            Outcome::Complete,
+        );
+        assert!(app.conversation.turns.is_empty());
+        assert!(app.model_summary.is_some());
+        let third = message(&mut app, "new topic");
+        let Task::Generate(options) = third.task else {
+            panic!("expected generation")
+        };
+        assert!(options.conversation.unwrap().turns.is_empty());
+    }
+
+    #[test]
+    fn model_changes_commit_only_on_success_and_raw_prompts_do_not_join_history() {
+        let mut app = chat_app();
+        let first = message(&mut app, "first");
+        finish_reply(&mut app, first.id, "answer\n", Outcome::Complete);
+        let failed = message(
+            &mut app,
+            "/generate next --model /other --ram-gib 2 --allow-large-model",
+        );
+        let Task::Generate(options) = failed.task else {
+            panic!("expected generation")
+        };
+        assert!(options.conversation.unwrap().turns.is_empty());
+        finish_reply(
+            &mut app,
+            failed.id,
+            "",
+            Outcome::Failed("missing model".into()),
+        );
+        assert_eq!(app.conversation.turns.len(), 1);
+        assert!(app.model_summary.is_some());
+        let raw = message(
+            &mut app,
+            "/generate raw --ram-gib 2 --allow-large-model --raw-prompt",
+        );
+        let Task::Generate(options) = &raw.task else {
+            panic!("expected generation")
+        };
+        assert!(options.conversation.is_none());
+        finish_reply(&mut app, raw.id, "raw output\n", Outcome::Complete);
+        assert_eq!(app.conversation.turns.len(), 1);
+        let switched = message(
+            &mut app,
+            "/generate next --model /other --ram-gib 2 --allow-large-model --no-thinking",
+        );
+        finish_reply(&mut app, switched.id, "new answer\n", Outcome::Complete);
+        assert_eq!(app.model_path, Some("/other".into()));
+        assert!(app.model_summary.is_none());
+        assert_eq!(app.conversation.turns.len(), 1);
+        assert_eq!(app.conversation.turns[0].user, "next");
+    }
+
+    #[test]
+    fn overflowing_reply_is_not_added_to_history_and_ordinary_text_needs_a_model() {
+        let mut app = App::new(None);
+        app.paste("hello");
+        assert!(app.submit().is_none());
+        assert!(app.entries.back().unwrap().details[0]
+            .text
+            .contains("No model selected"));
+        let mut app = chat_app();
+        let request = message(&mut app, "hello");
+        finish_reply(
+            &mut app,
+            request.id,
+            &"x".repeat(super::super::chat::HISTORY_BYTES),
+            Outcome::Complete,
+        );
+        assert!(app.conversation.turns.is_empty());
+        assert!(app.entries.back().unwrap().details[0]
+            .text
+            .contains("not added"));
+    }
+
+    fn generate(app: &mut App, options: &str) -> Request {
+        app.paste(&format!(
+            "/generate hello --ram-gib 2 --allow-large-model {options}"
+        ));
+        app.submit().unwrap()
+    }
+
+    #[test]
+    fn generation_updates_one_block_and_keeps_partial_output_on_cancel() {
+        let mut app = App::new(Some("/original".into()));
+        let request = generate(&mut app, "--model /new");
+        app.generation_event(
+            request.id + 1,
+            GenerationEvent::Output(Stream::Text, "stale".into()),
+        );
+        app.generation_event(
+            request.id,
+            GenerationEvent::Output(Stream::Text, "中文".into()),
+        );
+        app.paste("/version");
+        app.submit();
+        app.generation_event(
+            request.id,
+            GenerationEvent::Output(Stream::Text, "🙂".into()),
+        );
+        app.generation_event(
+            request.id,
+            GenerationEvent::Output(Stream::Log, "preflight: ready".into()),
+        );
+        assert_eq!(
+            app.entries
+                .iter()
+                .filter(|entry| entry.task_id == Some(request.id))
+                .count(),
+            1
+        );
+        let output = app
+            .entries
+            .iter()
+            .find(|entry| entry.task_id == Some(request.id))
+            .unwrap();
+        assert_eq!(output.details[0].text, "中文🙂");
+        assert_eq!(output.details.len(), 1);
+        assert_eq!(app.runtime.as_ref().unwrap().text(), "preflight: ready");
+        app.key(key(KeyCode::Esc));
+        assert!(app.cancel_requested);
+        assert!(!app.quit);
+        app.generation_event(request.id, GenerationEvent::Finished(Outcome::Cancelled));
+        assert!(app.pending.is_none());
+        assert_eq!(app.model_path, Some("/original".into()));
+        let output = app
+            .entries
+            .iter()
+            .find(|entry| entry.task_id == Some(request.id))
+            .unwrap();
+        assert_eq!(output.details[0].text, "中文🙂");
+        assert!(output.title.starts_with("Generation cancelled"));
+        let next = generate(&mut app, "--model /new");
+        app.generation_event(request.id, GenerationEvent::Finished(Outcome::Complete));
+        assert_eq!(app.pending.as_ref().unwrap().id, next.id);
+        app.generation_event(next.id, GenerationEvent::Finished(Outcome::Complete));
+        assert_eq!(app.model_path, Some("/new".into()));
+    }
+
+    #[test]
+    fn generation_handles_clear_spawn_failure_and_completion_menu_escape() {
+        let mut app = App::new(Some("/model".into()));
+        let request = generate(&mut app, "");
+        app.generation_event(
+            request.id,
+            GenerationEvent::Output(Stream::Text, "old".into()),
+        );
+        app.paste("/clear");
+        app.submit();
+        assert!(app.entries.is_empty());
+        app.generation_event(
+            request.id,
+            GenerationEvent::Output(Stream::Text, "new".into()),
+        );
+        assert_eq!(app.entries.back().unwrap().details[0].text, "new");
+        app.paste("/");
+        app.key(key(KeyCode::Esc));
+        assert!(!app.cancel_requested); // First Escape dismisses the command menu.
+        app.key(key(KeyCode::Esc));
+        assert!(app.cancel_requested);
+        app.generation_event(
+            request.id,
+            GenerationEvent::Finished(Outcome::Failed("runtime error".into())),
+        );
+        assert!(app.pending.is_none());
+        assert!(app
+            .entries
+            .back()
+            .unwrap()
+            .title
+            .starts_with("Generation failed"));
+        app.key(key(KeyCode::Backspace));
+        let request = generate(&mut app, "");
+        app.finished(Finished {
+            id: request.id,
+            result: Err("spawn failed".into()),
+        });
+        assert!(app.pending.is_none());
+        assert!(app
+            .runtime
+            .as_ref()
+            .unwrap()
+            .text()
+            .contains("spawn failed"));
+        assert!(app
+            .entries
+            .back()
+            .unwrap()
+            .details
+            .iter()
+            .any(|detail| detail.text.contains("F2")));
+    }
+
+    #[test]
+    fn long_generation_history_remains_scrollable_at_the_minimum_width() {
+        let mut app = App::new(Some("/model".into()));
+        for _ in 0..25 {
+            let request = generate(&mut app, "");
+            app.generation_event(
+                request.id,
+                GenerationEvent::Output(
+                    Stream::Text,
+                    format!("{}latest text", "long line ".repeat(4000)),
+                ),
+            );
+            app.generation_event(request.id, GenerationEvent::Finished(Outcome::Complete));
+        }
+        let bytes: usize = app
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.details)
+            .map(|detail| detail.text.len())
+            .sum();
+        assert!(bytes <= TRANSCRIPT_BYTES);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(36, 10)).unwrap();
+        terminal
+            .draw(|frame| super::super::view::draw(frame, &mut app))
+            .unwrap();
+        assert!(app.max_scroll < usize::from(u16::MAX));
+        let display: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(display.contains("latest text"));
     }
 
     #[test]

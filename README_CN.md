@@ -19,7 +19,7 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="仅 CPU 运行时">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="五个模型家族">
-<img src="https://img.shields.io/badge/tests-380_passing-2e7d32?style=flat-square" alt="380 项测试通过">
+<img src="https://img.shields.io/badge/tests-415_passing-2e7d32?style=flat-square" alt="415 项测试通过">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT 许可证"></a>
 </p>
 
@@ -28,7 +28,7 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 <td align="center"><b>2.78T</b><br><sub>最大支持参数</sub></td>
 <td align="center"><b>6</b><br><sub>模型适配器</sub></td>
 <td align="center"><b>6</b><br><sub>公开生成路径</sub></td>
-<td align="center"><b>380</b><br><sub>默认测试通过</sub></td>
+<td align="center"><b>415</b><br><sub>默认测试通过</sub></td>
 <td align="center"><b>0</b><br><sub>所需 GPU</sub></td>
 </tr>
 </table>
@@ -48,7 +48,8 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 > Urbilateria 是一个实验性的学习与模型取证项目。其标量运行时优先考虑行为的可读性和
 > 可运行性，而非生产吞吐量。GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4
 > 已可进行大检查点生成，但数值精度、输出质量、内存占用和速度不保证生产性能。
-> DeepSeek-V4.1 提供了标量基础文本生成路径，并已通过独立真实权重 BOS 预言机验证；其逐 token 提示词预填充用于正确性研究，速度较慢。
+> DeepSeek-V4.1 提供了标量基础文本生成路径，并已通过独立真实权重 BOS 预言机验证；
+> 支持批量提示词预填充，并在 RAM 预算内规划权重常驻。
 
 ## 为什么选择 Urbilateria？
 
@@ -61,7 +62,7 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 从源码构建需要 Rust 1.88 或更新版本。使用 rustup 时，仓库会通过 `rust-toolchain.toml` 自动选择
 Rust 1.88.0，并包含 rustfmt 和 Clippy。
 
-0.2.0 引入交互式 TUI，完整变更见 [CHANGELOG.md](CHANGELOG.md)。正式发布后，
+0.2.1 加入 TUI 多轮对话和实时生成统计，完整变更见 [CHANGELOG.md](CHANGELOG.md)。正式发布后，
 [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) 将提供 Linux x86_64
 （glibc 2.35+）与 Apple Silicon macOS（部署目标 13+，在 15 上测试）的预编译程序，
 默认包含 UI，运行无需安装 Rust。压缩包内容与校验方法见 [RELEASING.md](RELEASING.md)。
@@ -81,11 +82,13 @@ cargo build --release --locked
 ```
 
 界面提供可滚动的结果区、多行 Unicode 输入、会话历史、斜杠命令补全，以及带耗时显示的后台
-模型分析和分词。支持 `/inspect`、`/plan`、`/preflight`、`/list`、`/explain`、`/probe`、
-`/tokenize`、`/decode`，以及 `/help`、`/version`、`/clear`、`/quit`。
+模型分析、分词和流式生成。支持 `/inspect`、`/plan`、`/preflight`、`/list`、`/explain`、`/probe`、
+`/tokenize`、`/decode`、`/generate`、`/settings`，以及 `/help`、`/version`、`/clear`、`/quit`。
 **Enter** 执行，**Ctrl+J** 或 **Alt+Enter** 换行，**Tab** 补全，输入首行/末行的
 **↑/↓** 浏览历史，**PgUp/PgDn** 滚动结果，**Ctrl+C** 退出。粘贴只进入编辑框，提交后才执行。
 包含空格的路径需要加引号；终端最小尺寸为 36 列 × 10 行。
+`/inspect` 成功后，模型信息卡片常驻右上角，不随结果区滚动或清空而消失；
+窄窗口会在顶部保留模型名称和家族。
 
 在界面中依次执行：
 
@@ -105,9 +108,9 @@ cargo build --release --locked
 `/inspect`、`/plan`、`/preflight`、`/explain` 接受可选的 `MODEL_DIR`；
 `/list [FILTER]`、`/probe TENSOR_NAME`、`/tokenize "TEXT"`、`/decode TOKEN_IDS`
 使用 `--model "/path/to/model"` 指定其他目录，避免与文本或张量名混淆。
-省略目录会复用当前模型，命令成功后更新模型选择；参数仅对本次命令生效。
+省略目录会复用当前模型，命令成功后更新模型选择；分析命令的参数仅对本次命令生效。
 `/list` 按名称子串筛选，默认返回 100 条，`--limit` 范围为 1–100,000。
-`/probe` 默认采样 8,192 个值，`--samples` 范围为 1–10,000,000；只有它会读取采样所需的张量 payload。
+`/probe` 默认采样 8,192 个值，`--samples` 范围为 1–10,000,000；仅读取采样所需的张量 payload。
 `/tokenize` 默认编码原始文本；`--chat` 使用原生聊天模板，`--no-thinking` 必须与它一起使用，
 是否支持取决于模型（Qwen3.8 必须保留 thinking）。包含空格或换行的文本需要引号；
 以 `-` 开头的正文可放在 `--` 后。`/decode` 默认保留特殊 token。
@@ -119,11 +122,67 @@ Qwen3.8 通过 `/preflight` 查看混合状态内存需求，不支持 `/plan`�
 Kimi-K3 的 preflight 仅检查 schema，context/cache 参数不影响检查；`--partial` 用于传输过程中
 验证可见的 decoder 层，不代表整个检查点完整。
 
+选择模型后，直接输入普通文本即可生成回复，无需 `/generate` 或给正文加引号。
+引号及多行文本按原样保留；系统会将之前成功完成的对话轮次按模型原生聊天模板拼接。
+默认每轮最多生成 512 个新 token，启用 thinking，Linux 自动检测可用 RAM。
+macOS 需要先设置 RAM 预算；Linux 也可用同一设置限制内存：
+
+```text
+/settings --ram-gib 32 --max-new-tokens 512
+请解释一下 MoE 的工作原理。
+它会怎样影响内存使用？
+```
+
+`/settings` 查看当前设置，可修改 `--threads N|auto`、`--ram-gib N|auto`、
+`--max-new-tokens N`、`--thinking` / `--no-thinking`（是否支持取决于模型）。
+提交普通文本会请求加载权重，并执行与 CLI 相同的 RAM 和 runtime 检查。
+成功切换模型会开启新的对话，切换失败则保留原模型及上下文。
+`/clear` 同时清空显示和聊天上下文，保留模型卡片与设置；清空时仍在运行的回复不会进入新上下文。
+
+会话最多保留 32 组完整问答，文本总量不超过 512 KiB，与界面显示的截断互不影响。
+取消或失败的回复不进入后续上下文；单轮回复超过历史上限时仍显示正文，但会提示不纳入历史。
+生成前按实际 token 数从最早的完整问答开始裁剪，为本轮输出预留空间；运行日志显示采用和裁剪的轮数。
+若当前问题本身也放不下，则报错并提示缩短问题或减少输出 token 数。历史仅在当前 TUI 会话中保留。
+
+也可以继续使用显式参数生成：
+
+```text
+/generate "请解释一下 MoE 的工作原理" --ram-gib 32 --allow-large-model --max-new-tokens 128
+```
+
+可以用 `--model MODEL_DIR` 切换模型，也可用 `--prompt "TEXT"` 指定正文。
+RAM 数值是显式预算，不代表模型一定能放入内存。生成复用 `urb generate` 的实验性 runtime、
+检查及默认值（省略 `--max-new-tokens` 时只生成 1 个 token），支持 `--threads`、`--raw-prompt`、
+`--no-thinking`、`--profile`、`--profile-json` 和 `--profile-trace`。
+普通 `/generate` 参与当前对话；`--raw-prompt` 为独立请求，不加入历史。
+受理 `/generate` 时会记住其 RAM、输出 token 数、线程数和 thinking 设置，供之后的普通输入使用，
+但不会记住 profile 文件路径。
+主对话区域只显示生成正文，Runtime 日志移至右侧模型卡片下方。
+**F2** 展开运行日志，窄窗口也可使用；**PgUp/PgDn** 滚动，**F2/Esc** 关闭。
+底栏实时显示已生成及合计 token 数、解码速率和 TTFT；结束后保留本轮指标，下次生成时重置。
+**Esc** 停止生成并保留部分正文；若日志视图或补全菜单打开，先按一次 Esc 关闭。
+退出界面也会终止生成进程并释放其模型资源；取消时 profile 文件可能不完整。
+`/clear` 也会清除运行日志，后台任务继续，后续输出会重新出现。长输出保留最近的 32 KiB/256 个换行的正文
+和 8 KiB/64 个换行的日志，并显示截断提示；完整输出可用普通 CLI 重定向保存。
+历史结果最多保留 100 条，文本总量上限为 512 KiB，超出会移除较早的结果。
+每次请求都通过同一个 `urb` 可执行文件启动独立生成进程，携带保留的文本对话重新构建上下文，
+暂不复用已加载权重和 KV 状态，无需额外运行时。
+
+普通 `urb generate` 无需开启 `--profile`，结束时会向 stderr 输出 `metrics:` 汇总。
+加 `--progress` 可周期输出可读统计；`--progress-json` 输出带 `URB_PROGRESS ` 前缀的结构化统计，
+这两个选项互斥。TUI 读取同一套结构化数据，stdout 始终只输出生成正文。
+输入 token 数包括原生模板和保留的历史；合计为输入加已生成的 token ID 数，EOS 也计入。
+TTFT 从请求开始到选出首 token，包含权重加载和 prefill，与 profiler 中仅统计引擎阶段的
+`generation.time_to_first_token` 不同。解码速率为 `(已生成 token 数 - 1) / (末 token 时间 - 首 token 时间)`，
+不混入加载及首 token 的耗时。首 token 前 TTFT 显示 `—`，不足两个 token 时不计算解码速率。
+实时统计在 token 边界更新，JSON 最多 10 Hz、文本最多 1 Hz，另有初始、首 token 和结束事件；
+取消后保留最后收到的指标。
+
 界面使用 Rust、Ratatui 和 Crossterm 实现。编译需要 Rust 和系统链接器，macOS 可安装
 Xcode Command Line Tools；运行编译好的程序不需要 Rust、Python 或 Node.js。
 二进制需要与操作系统及 CPU 架构匹配，终端需要支持 ANSI 控制序列与 UTF-8。
 `ui` 要求标准输入和输出连接交互式终端；普通 CLI 命令仍可用于管道和 `--json` 输出。
-第一版未接入依赖 Linux 的运行时性能计数器。若不需要界面，可使用
+性能分析沿用 CLI 在各平台上可用的计数器。若不需要界面，可使用
 `cargo build --release --locked --no-default-features` 构建。
 
 从元数据开始。以下命令无需读取完整张量 payload：
@@ -190,10 +249,9 @@ flowchart LR
 | **序列状态** | MLA KV、KDA/DeltaNet 循环状态、卷积、GQA KV | 根据准确的家族几何和请求的上下文计算 |
 | **暂存空间** | 激活、量化块、批量提示词工作区 | 在开始读取 payload 前纳入 preflight |
 
-大型 matvec 输出行在一个持久 CPU worker 池上运行。DeepSeek-V4、Kimi-K3、Hy4 和
+大型 matvec 输出行在一个持久 CPU worker 池上运行。DeepSeek-V4/V4.1、Kimi-K3、Hy4 和
 Qwen3.8 库运行时按层摄取提示词：一个解码器层为整个提示词加载一次，只有最后一个
-提示 token 会进入词表大小的 LM head。DeepSeek-V4.1 当前在提示词预填充与 decode
-中都使用精确的逐 token 路径。
+提示 token 会进入词表大小的 LM head。
 需要流式读取 BF16 词表 head 的适配器会使用固定常驻量、感知队列深度的流水线：最多
 8 个 I/O worker 读取相邻子块，同时 CPU 池计算当前子块；全部原始缓冲合计仍处于原先
 单块预算内，并随窗口推进持续复用。
@@ -254,10 +312,10 @@ safetensors 头部、E8M0 scale sidecar、MXFP8 矩阵，以及低半字节优�
 
 **DeepSeek-V4.1。** 独立适配器验证 40 层 CED 图、CSA2 所有权、32×32 MXFP8 ABI、
 384 路专家、两个 Engram 表、视觉塔和三个 DSpark 阶段。公开的标量文本生成会执行完整的
-逐层流式 CED/CSA2/Engram/mHC 基础路径，包括训练得到的压缩缓存、精确的有界 Engram
-读取、top-6 MoE 和流式 LM head。独立的 PyTorch 真实权重 BOS 预言机会验证全部 40 层
-的路由和最终 top-16 logits。提示词预填充仍为逐 token；视觉与 DSpark 仍仅进行
-schema 验证。
+CED/CSA2/Engram/mHC 基础路径，包括训练得到的压缩缓存、精确的有界 Engram 读取和
+top-6 MoE。解码器层和 LM head 在 RAM 预算内常驻，预算不足时按需流式读取。
+独立的 PyTorch 真实权重 BOS 预言机会验证全部 40 层的路由和最终 top-16 logits。
+提示词预填充按层批量执行投影，并让相邻层读取与计算重叠；视觉与 DSpark 仍仅进行 schema 验证。
 
 **Kimi-K3。** 文本运行时以流式方式执行 92 个稀疏层中的 896 路原生 MXFP4 路由专家，
 使紧凑的 BF16 主干受层边界约束，并保留循环 KDA 与压缩 MLA 状态。XTML 由可信结构
@@ -377,7 +435,7 @@ Urbilateria 将“文件看起来合理”与“模型生成正确 logits”区�
 | --- | --- | --- |
 | GLM-5.2 | 微型完整模型预言机；真实转换检查点 token 回归 | 吞吐量优化 |
 | DeepSeek-V4 | 独立微型预言机；真实层/token 与 tokenizer 回归 | 持续性能工作 |
-| DeepSeek-V4.1 | 精确头部、原生 MX payload、完整 Engram/CSA2/mHC 基础 forward 与公开生成、真实 40 层 BOS 路由与 top-16-logit 预言机 | 按层预填充、视觉与 DSpark 执行 |
+| DeepSeek-V4.1 | 精确头部、原生 MX payload、完整 Engram/CSA2/mHC 基础 forward 与公开生成、按层预填充、真实 40 层 BOS 路由与 top-16-logit 预言机 | 视觉与 DSpark 执行 |
 | Kimi-K3 | 独立全栈 logits 一致性和已知的 `Paris` 延续 | 持续性能和逐版本验证 |
 | Qwen3.8 | 独立微型 FP32/BF16 图、真实 FP8 专家 payload 和真实 92 层完整 logits 预言机 | 持续性能和发布版本多 token 验证 |
 | Hy4 | 上游 iHC/Gated-MLA 语义；精确 schema/MXFP8/专家 payload 门禁；真实 78 层 token 与公开 CLI 生成 smoke | 独立完整 logits 一致性和超过 2,048 token 的 IndexCache 执行 |
@@ -394,7 +452,7 @@ argmax 和相同的 top 20 token。在全部 248,320 个 logits 上，余弦相�
 cargo test --all-targets --locked
 ```
 
-当前 Linux 结果：**380 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
+当前 Linux 结果：**415 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
 模型目录。
 
 <details>
@@ -426,7 +484,7 @@ HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
 
 | 命令 | 用途 | 模型支持 |
 | --- | --- | --- |
-| `ui [MODEL_DIR]` | 带历史、补全及后台模型分析、张量浏览与分词的交互式终端；12 个命令 | Linux/macOS；模型覆盖与对应 CLI 命令一致；`generate` 仍使用普通 CLI |
+| `ui [MODEL_DIR]` | 带历史、补全及后台模型分析、张量浏览、分词与流式生成的交互式终端；13 个命令 | Linux/macOS；模型覆盖及生成限制与对应 CLI 命令一致 |
 | `inspect` | 构建静态参数、量化、张量与路由透视 | 全部六个适配器 |
 | `plan` | 估算常驻、KV、暂存空间与专家缓存预算 | GLM、DeepSeek、Kimi、Hy4 |
 | `preflight` | 不读取 payload，验证精确运行时张量与内存 | 全部六个适配器 |
@@ -539,8 +597,9 @@ cargo build --release --locked
 
 CI 在 Linux（Ubuntu 24.04）和 Apple Silicon macOS（macOS 15）上，分别使用 Rust 1.88.0
 和 stable 测试启用和关闭 `ui` 的构建；暂不覆盖 Intel Mac。格式与两种 feature 配置的 Clippy
-固定使用 Rust 1.88.0。终端冒烟测试使用 Python 标准库驱动伪终端，覆盖全部 12 个命令、
-粘贴、缩放、阻塞中的后台任务、正常/信号退出及 panic 清理。Linux release 构建还会运行
+固定使用 Rust 1.88.0。终端冒烟测试使用 Python 标准库驱动伪终端，覆盖全部 13 个命令、
+真实 tiny 模型生成、Unicode 流式输出、取消与子进程清理、粘贴、缩放、阻塞中的后台任务、
+正常/信号退出及 panic 清理。Linux release 构建还会运行
 CLI 帮助及 TUI 交互检查。CI 的 Cargo 构建与测试均使用 `--locked` 固定依赖版本。
 发布工具使用 Python 标准库测试。推送版本标签后会再次运行 CI、打包两个受支持平台，
 并创建 GitHub Release 草稿；完整发布流程见 [RELEASING.md](RELEASING.md)。
@@ -557,7 +616,7 @@ CLI 帮助及 TUI 交互检查。CI 的 Cargo 构建与测试均使用 `--locked
 - 没有服务器 API、Web UI、CUDA 或 Metal 后端。
 - GLM 路径支持转换后的 Colibri 容器，而不是任意官方 FP8 版本。
 - DeepSeek-V4/V4.1 DSpark 推测解码会进行 schema 验证，但已被禁用；V4.1 视觉塔也仅
-  进行 schema 验证，且其提示词预填充仍为逐 token。
+  进行 schema 验证。
 - Kimi-K3 仅支持文本生成；MoonViT 和 projector 张量会被验证，但不会执行。
 - 与已测试版本不同的 Kimi 检查点必须单独进行 logits 与性能验证，才能继承输出质量声明。
 - Qwen3.8 MTP 张量会进行 schema 验证，但推测解码被禁用；标量生成路径适合正确性研究，

@@ -1,4 +1,5 @@
 use super::commands::clean_text;
+use super::generate::Stream;
 use urbilateria::analysis::{
     Decoding, Explanation, Inspection, InspectionReport, NumericStats, Planning, Preflight,
     PreflightReport, ProbeReport, TensorListing, Tokenization,
@@ -46,9 +47,66 @@ impl Detail {
 }
 
 pub struct Entry {
+    pub task_id: Option<u64>,
     pub kind: Kind,
     pub title: String,
     pub details: Vec<Detail>,
+}
+
+/// A compact, owned inspection snapshot, independent of scrollback and generation state.
+pub struct ModelSummary {
+    pub name: String,
+    pub family: String,
+    pub path: String,
+    pub fields: Vec<Detail>,
+}
+
+impl ModelSummary {
+    pub fn from_inspection(inspection: &Inspection) -> Self {
+        let report = inspection_entry(inspection, std::time::Duration::ZERO);
+        let quantization: Vec<_> = report
+            .details
+            .iter()
+            .filter(|detail| detail.label == Some("Quantization"))
+            .filter_map(|detail| detail.text.split(" · ").next().map(str::to_owned))
+            .collect();
+        let mut fields: Vec<_> = report
+            .details
+            .into_iter()
+            .filter(|detail| {
+                matches!(
+                    detail.label,
+                    Some(
+                        "Architecture"
+                            | "Max context"
+                            | "Checkpoint"
+                            | "Manifest"
+                            | "Parameters"
+                            | "Experts"
+                            | "Base tensors"
+                            | "Exact context ceiling"
+                    )
+                )
+            })
+            .collect();
+        if !quantization.is_empty() {
+            fields.push(Detail::field("Quantization", quantization.join(" / ")));
+        }
+        Self {
+            name: clean_text(
+                &inspection
+                    .model_path
+                    .file_name()
+                    .unwrap_or(inspection.model_path.as_os_str())
+                    .to_string_lossy(),
+                256,
+            )
+            .replace('\n', " "),
+            family: inspection.model.family.to_string(),
+            path: clean_text(&inspection.model_path.display().to_string(), 1024).replace('\n', " "),
+            fields,
+        }
+    }
 }
 
 impl Entry {
@@ -79,6 +137,7 @@ impl Entry {
             ));
         }
         Self {
+            task_id: None,
             kind,
             title: clean_text(&title.into(), 1024).replace('\n', " "),
             details: bounded,
@@ -87,6 +146,110 @@ impl Entry {
 
     pub fn message(kind: Kind, title: &str, text: impl Into<String>) -> Self {
         Self::new(kind, title, vec![Detail::text(text)])
+    }
+}
+
+/// Keep generated text separate from runtime diagnostics; only this text enters the transcript.
+#[derive(Default)]
+pub struct GenerationTranscript {
+    text: Tail,
+}
+
+impl GenerationTranscript {
+    pub fn append(&mut self, stream: Stream, text: &str) {
+        match stream {
+            Stream::Text => self.text.append(text, 32_768, 256),
+            Stream::Log => {}
+        }
+    }
+
+    pub fn entry(&self, id: u64, kind: Kind, title: String, error: Option<&str>) -> Entry {
+        let mut details = vec![Detail::field(
+            "Text",
+            if self.text.text.is_empty() {
+                "(no generated text yet)".into()
+            } else {
+                self.text.display()
+            },
+        )];
+        if let Some(error) = error {
+            details.push(Detail::text(clean_text(error, 1024)));
+        }
+        // Already sanitized and bounded per stream; bypass the smaller static-report budget.
+        Entry {
+            task_id: Some(id),
+            kind,
+            title,
+            details,
+        }
+    }
+}
+
+/// Latest generation's diagnostics are independent of chat scrollback and remain visible
+/// after completion, failure or cancellation until the next generation/model change.
+pub struct RuntimeInfo {
+    pub path: String,
+    pub status: &'static str,
+    pub metrics: crate::progress::Snapshot,
+    log: Tail,
+}
+
+impl RuntimeInfo {
+    pub fn new(path: &std::path::Path) -> Self {
+        Self {
+            path: clean_text(&path.display().to_string(), 1024).replace('\n', " "),
+            status: "Generating",
+            metrics: crate::progress::Snapshot::default(),
+            log: Tail::default(),
+        }
+    }
+
+    pub fn append(&mut self, text: &str) {
+        self.log.append(text, 8_192, 64);
+    }
+
+    pub fn text(&self) -> String {
+        if self.log.text.is_empty() {
+            "Waiting for runtime diagnostics…".into()
+        } else {
+            self.log.display()
+        }
+    }
+
+    pub fn clear_log(&mut self) {
+        self.log = Tail::default();
+    }
+}
+
+#[derive(Default)]
+struct Tail {
+    text: String,
+    clipped: bool,
+}
+
+impl Tail {
+    fn append(&mut self, text: &str, bytes: usize, lines: usize) {
+        self.text.push_str(&clean_text(text, usize::MAX));
+        let mut start = self.text.len().saturating_sub(bytes);
+        while !self.text.is_char_boundary(start) {
+            start += 1;
+        }
+        if let Some((index, _)) = self.text.match_indices('\n').rev().nth(lines) {
+            start = start.max(index + 1);
+        }
+        self.clipped |= start != 0;
+        self.text.drain(..start);
+    }
+
+    fn display(&self) -> String {
+        if self.clipped {
+            format!(
+                "[Earlier output omitted; showing recent output]\n{}",
+                self.text
+            )
+        } else {
+            self.text.clone()
+        }
     }
 }
 
@@ -774,7 +937,8 @@ fn token_ids_text(ids: &[u32]) -> String {
 
 pub fn help_entry() -> Entry {
     Entry::new(Kind::Info, "Commands & keys", vec![
-        Detail::field("/inspect [MODEL_DIR]", "Inspect model metadata; omit the path to reuse the current model. Quote paths with spaces."),
+        Detail::field("Message", "Plain text generates a reply with previous successful turns. Default: 512 new tokens, automatic RAM on Linux. macOS: set /settings --ram-gib N first."),
+        Detail::field("/inspect [MODEL_DIR]", "Inspect and pin model metadata at the upper right. Omit the path to reuse the current model; quote paths with spaces."),
         Detail::field("/plan [MODEL_DIR]", "Memory estimates: --ram-gib N --context N --kv-bytes 2|4. Defaults: detected RAM, 2048 tokens, 4-byte state. macOS requires --ram-gib."),
         Detail::field("/preflight [MODEL_DIR]", "Schema/runtime check: --context N --expert-slots N [--partial]. Defaults: 1 token, 0 cache slots. --partial is Kimi-K3 only."),
         Detail::field("/list [FILTER]", "Find tensors by name fragment: --limit N (default 100; max 100000)."),
@@ -782,19 +946,24 @@ pub fn help_entry() -> Entry {
         Detail::field("/probe TENSOR_NAME", "Sample one exact tensor: --samples N (default 8192; max 10000000). Reads bounded weight data."),
         Detail::field("/tokenize \"TEXT\"", "Encode raw text, or add --chat [--no-thinking] for a model-native user turn."),
         Detail::field("/decode TOKEN_IDS", "Decode comma-separated IDs; --skip-special removes special tokens."),
-        Detail::text("Omit the model path to reuse the current model. /list, /probe, /tokenize and /decode accept --model MODEL_DIR. Quote paths/text with spaces. Use -- before a literal argument starting with '-'. Options apply only to this command."),
+        Detail::field("/generate \"TEXT\"", "Reply with explicit options: --ram-gib N --allow-large-model required. --max-new-tokens N (default 1), --threads N, --raw-prompt or --no-thinking. --prompt TEXT also works."),
+        Detail::field("/settings", "Show/change chat defaults: --ram-gib N|auto --max-new-tokens N --threads N|auto --thinking | --no-thinking. /generate also remembers its RAM/token/thread/thinking settings."),
+        Detail::text("Generation accepts --profile, --profile-json PATH and --profile-trace PATH (not remembered). Esc stops generation. Cancelled/failed replies and raw prompts stay out of chat history. Oldest turns are dropped when context is full. Weights reload for each request."),
+        Detail::text("Omit paths to reuse the model. /list, /probe, /tokenize, /decode and /generate accept --model MODEL_DIR. Quote command arguments with spaces; plain messages need no quotes. Use -- before a literal command argument starting with '-'."),
         Detail::text("Example: /plan --ram-gib 32 --context 2048; then /preflight --context 2048 --expert-slots 8 (run separately)."),
         Detail::text("Qwen3.8 uses /preflight for hybrid memory requirements; /plan is unsupported. Kimi preflight validates schema only."),
         Detail::field("/help", "Show this guide"),
         Detail::field("/version", "Show the program version (no model needed)"),
-        Detail::field("/clear", "Clear the transcript (a running analysis will still finish)"),
+        Detail::field("/clear", "Clear transcript and chat context; keep model and settings. Running output can reappear but will not enter the new context."),
         Detail::field("/quit", "Return to your shell"),
-        Detail::field("Enter / Ctrl+J", "Run command / insert newline (Alt+Enter also works)"),
-        Detail::field("Tab / Esc", "Complete command / dismiss suggestions"),
+        Detail::field("Enter / Ctrl+J", "Send message or run command / insert newline (Alt+Enter also works)"),
+        Detail::field("Tab / Esc", "Complete command / dismiss suggestions; Esc with no suggestions stops generation"),
+        Detail::field("F2", "Expand/close Runtime logs (also in narrow terminals). PgUp/PgDn scroll this view; Esc closes it before stopping generation."),
         Detail::field("Up / Down", "History at the first/last input line; Ctrl+P / Ctrl+N always browse history"),
         Detail::field("PgUp / PgDn", "Scroll output; Ctrl+Home / Ctrl+End jump to top / follow latest"),
-        Detail::field("Ctrl+C", "Quit; Ctrl+D also quits when input is empty"),
-        Detail::text("Model commands run in the background. Only /probe reads sampled tensor payloads; tokenizer commands read tokenizer files. Use the plain CLI for generate and --json output."),
+        Detail::field("Ctrl+C", "Quit and stop generation; Ctrl+D also quits when input is empty"),
+        Detail::text("Runtime logs stay in the right panel. The footer shows output/total token counts, decode tok/s and request TTFT (includes loading and prefill). EOS counts as a token; rates need at least two tokens. Metrics remain after completion."),
+        Detail::text("Model commands run in the background. /generate loads weights after RAM/runtime checks; /probe reads bounded samples. Use the plain CLI for --json or full output; generation supports --progress and --progress-json on stderr."),
     ])
 }
 
@@ -804,6 +973,27 @@ mod tests {
     use std::time::Duration;
     use urbilateria::models::kimi_k3::schema::KimiK3PartialLayers;
     use urbilateria::{CommonModelConfig, ModelFamily};
+
+    #[test]
+    fn generation_limits_streams_independently_and_keeps_final_diagnostics() {
+        let mut output = GenerationTranscript::default();
+        output.append(Stream::Text, &"中文🙂".repeat(10_000));
+        output.append(Stream::Text, "\u{1b}\0tail");
+        let mut runtime = RuntimeInfo::new(std::path::Path::new("/model"));
+        runtime.append(&"verbose profile\n".repeat(1000));
+        runtime.append("error: failed");
+        let entry = output.entry(1, Kind::Error, "Generation failed".into(), None);
+        assert!(entry.details[0].text.contains("Earlier output omitted"));
+        assert!(entry.details[0].text.ends_with("tail"));
+        assert!(entry.details[0].text.len() < 33_000);
+        assert_eq!(entry.details.len(), 1);
+        assert!(runtime.text().lines().count() < 67);
+        assert!(runtime.text().ends_with("error: failed"));
+        assert!(entry
+            .details
+            .iter()
+            .all(|detail| !detail.text.contains(['\u{1b}', '\0'])));
+    }
 
     #[test]
     fn probe_marks_nonfinite_samples_and_sanitizes_tensor_names() {

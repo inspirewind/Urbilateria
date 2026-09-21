@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+## [0.2.1]
+
+### Interactive generation
+
+- Move TUI runtime diagnostics beneath the model card; add an expandable F2 log view.
+- Add CLI generation metrics for prompt/output/total token counts, request TTFT and decode
+  throughput, with optional live text or JSON snapshots. Reuse them in the TUI footer.
+- Pin inspected model metadata at the upper right; retain model identity in narrow terminals.
+- Generate from plain text with model-native multi-turn context. Add `/settings` for session RAM,
+  token, thread and thinking defaults; preserve completed turns independently of display clipping.
+- Bound conversation memory and drop oldest complete turns to fit the runtime token limit.
+  Clear context with `/clear` or a successful model change; exclude cancelled/failed and raw replies.
+- Pass structured conversations over stdin to the existing generation process, avoiding argv limits.
+- Add `/generate` to the TUI with streamed Unicode text, separate runtime diagnostics,
+  explicit RAM/weight-loading authorization, and the existing CLI's generation/profile options.
+- Stop generation with Esc; preserve partial output and reap the model process on cancellation,
+  normal UI exit, handled termination signals, or UI errors. Each request uses an independent process.
+- Bound streaming queues and displayed text/logs; keep the terminal responsive during loading
+  and generation. Add tiny-model PTY tests for generation, errors, cancellation and process cleanup.
+- Parse CLI generation options without treating literal prompt values as flags.
+- Detect terminal size changes while idle even when a resize notification is lost.
+
+### DeepSeek-V4.1 runtime
+
+- Batch prompt prefill by layer and cache decoder layers and the LM head within the RAM budget.
+- Batch attention, router and grouped expert projections; overlap adjacent layer reads with
+  computation and add bit-exact F32, MXFP8 and MXFP4 batch kernels.
+
 ## [0.2.0]
 
 ### Interactive terminal
@@ -57,5 +87,6 @@
 - Include model adapters, bounded-memory execution, tokenizer and chat-template support,
   runtime validation, profiling, and an interactive profile-trace viewer.
 
+[0.2.1]: https://github.com/inspirewind/Urbilateria/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/inspirewind/Urbilateria/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/inspirewind/Urbilateria/releases/tag/v0.1.0

@@ -7,6 +7,7 @@ import argparse
 import errno
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -279,7 +280,7 @@ def browsing_and_text(binary, model):
 
         def run(command, *expected, paste=False):
             terminal.send(b"/clear\r")
-            terminal.expect("Type / to get started")
+            terminal.expect("Type a message")
             terminal.output.clear()
             data = command.encode()
             terminal.send((b"\x1b[200~" + data + b"\x1b[201~" if paste else data) + b"\r")
@@ -309,6 +310,262 @@ def browsing_and_text(binary, model):
         terminal.close()
 
 
+def generation_fixture(path, chat=False):
+    """A tiny real GLM checkpoint: A -> UTF-8 bytes of 中文🙂 -> EOS.
+
+    Zero attention/MLP leaves the residual embedding unchanged. Unit-circle embeddings
+    and matching LM-head rows make the next byte the unique greedy winner.
+    """
+    fixture(path, complete=True)
+    config_file = path / "config.json"
+    config = json.loads(config_file.read_text())
+    config["eos_token_id"] = [67]
+    if chat:
+        config["max_position_embeddings"] = 256
+    config_file.write_text(json.dumps(config), encoding="utf-8")
+    weights = path / "model.safetensors"
+    data = bytearray(weights.read_bytes())
+    header_length = struct.unpack_from("<Q", data)[0]
+    header = json.loads(data[8:8 + header_length])
+
+    def write(name, index, value):
+        offset = 8 + header_length + header[name]["data_offsets"][0] + 4 * index
+        struct.pack_into("<f", data, offset, value)
+
+    for name, tensor in header.items():
+        if "norm.weight" in name:
+            for index in range(tensor["shape"][0]):
+                write(name, index, 1.0)
+    tokens = [65, *"中文🙂".encode(), 67]
+    assert len(set(tokens)) == len(tokens)
+    for index, (source, target) in enumerate(zip(tokens, tokens[1:])):
+        angle = 2 * math.pi * index / (len(tokens) - 1)
+        for dimension, value in enumerate((math.cos(angle), math.sin(angle))):
+            write("model.embed_tokens.weight", source * 8 + dimension, value)
+            write("lm_head.weight", target * 8 + dimension, value)
+    if chat:
+        # Native GLM assistant prefixes end in ">"; start the same deterministic reply.
+        write("model.embed_tokens.weight", ord(">") * 8, 1.0)
+    weights.write_bytes(data)
+
+
+def conversation(binary, root):
+    model = root / "chat-model"
+    generation_fixture(model, chat=True)
+    options = ["--ram-gib", "2", "--allow-large-model", "--max-new-tokens", "16",
+               "--threads", "1", "--no-thinking", "--chat-stdin"]
+    chat = {"turns": [{"user": "first", "assistant": "中文🙂", "thinking": False}], "prompt": "follow-up"}
+    cli = subprocess.run([binary, "generate", str(model), *options],
+                         input=json.dumps(chat), capture_output=True, text=True, timeout=30)
+    assert cli.returncode == 0, cli.stderr
+    assert cli.stdout == "中文🙂\n", (cli.stdout, cli.stderr)
+    assert "chat: history=1 turns, dropped=0 turns" in cli.stderr, cli.stderr
+    chat["turns"].insert(0, {"user": "old " * 100, "assistant": "old answer", "thinking": False})
+    cli = subprocess.run([binary, "generate", str(model), *options],
+                         input=json.dumps(chat), capture_output=True, text=True, timeout=30)
+    assert cli.returncode == 0, cli.stderr
+    assert "history=1 turns, dropped=1 turns" in cli.stderr, cli.stderr
+    assert cli.stdout == "中文🙂\n", cli.stdout
+    for invalid in ({"turns": [], "prompt": "x" * 300}, {"turns": [], "prompt": " "}):
+        cli = subprocess.run([binary, "generate", str(model), *options],
+                             input=json.dumps(invalid), capture_output=True, text=True, timeout=30)
+        assert cli.returncode != 0, cli.stderr
+        assert not cli.stdout, cli.stdout
+        assert "preflight:" not in cli.stderr, cli.stderr  # rejected before loading weights
+
+    terminal = Terminal([binary, "ui"])
+    try:
+        terminal.resize(110, 64)
+        terminal.expect("Welcome to Urbilateria")
+        terminal.send(f'/inspect "{model}"\r'.encode())
+        terminal.expect("Inspection complete")
+        terminal.expect("/inspect for details")
+        # Exercise Linux's automatic RAM selection; Darwin uses the explicit budget path.
+        ram_option = " --ram-gib 2" if sys.platform == "darwin" else ""
+        terminal.send(f"/settings{ram_option} --max-new-tokens 16 --threads 1 --no-thinking\r".encode())
+        terminal.expect("Conversation settings")
+        terminal.send(b"/clear\r")
+        terminal.expect("Type a message")
+        terminal.output.clear()
+        terminal.send(b'\x1b[200~don\'t close "the quote\n--profile\x1b[201~\r')
+        terminal.expect("Generation complete")
+        terminal.expect("Text  中文🙂")
+        terminal.expect("history=0 turns")
+        terminal.expect("1 turns")
+        terminal.output.clear()
+        terminal.send("继续刚才的回答\r".encode())
+        terminal.expect("Generation complete")
+        terminal.expect("history=1 turns")
+        terminal.expect("2 turns")
+        terminal.send(b"/clear\r")
+        terminal.expect("Type a message")
+        terminal.output.clear()
+        # Force a redraw so presence below proves the model survives clearing scrollback.
+        terminal.resize(111, 64)
+        terminal.expect("chat-model")
+        terminal.expect("/inspect for details")
+        terminal.send(b"New topic\r")
+        terminal.expect("Generation complete")
+        terminal.expect("history=0 turns")
+        terminal.send(b"/quit\r")
+        terminal.finish()
+    finally:
+        terminal.close()
+
+
+def generation(binary, root):
+    model = root / "generation model 中文"
+    generation_fixture(model)
+    options = '--ram-gib 2 --allow-large-model --raw-prompt --max-new-tokens 16'
+    cli = subprocess.run([
+        binary, "generate", str(model), "--prompt", "[gMASK]<sop>A",
+        *options.split(), "--threads", "1",
+    ], capture_output=True, text=True, timeout=30)
+    assert cli.returncode == 0, cli.stderr
+    assert cli.stdout == "中文🙂\n", (cli.stdout, cli.stderr)
+    assert "metrics: input=13" in cli.stderr and "output=11" in cli.stderr, cli.stderr
+    assert "total=24 tok" in cli.stderr and "TTFT " in cli.stderr, cli.stderr
+    assert "URB_PROGRESS " not in cli.stderr, cli.stderr
+    metrics = subprocess.run([
+        binary, "generate", str(model), "--prompt", "[gMASK]<sop>A",
+        *options.split(), "--threads", "1", "--progress-json",
+    ], capture_output=True, text=True, timeout=30)
+    assert metrics.returncode == 0, metrics.stderr
+    assert metrics.stdout == cli.stdout
+    snapshots = [json.loads(line.removeprefix("URB_PROGRESS "))
+                 for line in metrics.stderr.splitlines() if line.startswith("URB_PROGRESS ")]
+    assert len(snapshots) >= 4, metrics.stderr
+    assert snapshots[0]["generated_tokens"] == 0 and snapshots[0]["ttft_seconds"] is None
+    first = next(snapshot for snapshot in snapshots if snapshot["generated_tokens"])
+    assert first["generated_tokens"] == 1, snapshots  # A token ID, even before a full Unicode character.
+    final = snapshots[-1]
+    assert final["status"] == "complete" and final["generated_tokens"] == 11, final
+    assert final["total_tokens"] == 24 and final["prompt_tokens"] == 13, final
+    assert 0 <= final["ttft_seconds"] <= final["elapsed_seconds"], final
+    assert final["decode_tokens_per_second"] > 0, final
+    # Immediate EOS counts as one selected token but has no post-first-token decode rate.
+    eos = subprocess.run([
+        binary, "generate", str(model), "--prompt", "[gMASK]<sop>🙂",
+        *options.split(), "--threads", "1", "--progress-json",
+    ], capture_output=True, text=True, timeout=30)
+    assert eos.returncode == 0 and eos.stdout == "\n", (eos.stdout, eos.stderr)
+    final = json.loads(next(line.removeprefix("URB_PROGRESS ")
+                           for line in reversed(eos.stderr.splitlines()) if line.startswith("URB_PROGRESS ")))
+    assert final["generated_tokens"] == 1 and final["decode_tokens_per_second"] is None, final
+    assert final["ttft_seconds"] is not None, final
+    live = subprocess.run([
+        binary, "generate", str(model), "--prompt", "[gMASK]<sop>A",
+        *options.split(), "--threads", "1", "--progress",
+    ], capture_output=True, text=True, timeout=30)
+    assert live.returncode == 0 and live.stdout == cli.stdout, (live.stdout, live.stderr)
+    assert live.stderr.count("metrics:") >= 4 and "\x1b" not in live.stderr, live.stderr
+    terminal = Terminal([binary, "ui"])
+    try:
+        terminal.resize(110, 64)
+        terminal.expect("Welcome to Urbilateria")
+
+        def run(command, *expected):
+            terminal.send(b"/clear\r")
+            terminal.expect("Type a message")
+            terminal.output.clear()
+            terminal.send(command.encode() + b"\r")
+            for text in expected:
+                terminal.expect(text, timeout=15)
+            terminal.assert_running()
+
+        run('/generate hi --ram-gib 2', 'requires --allow-large-model')
+        run('/generate hi --allow-large-model', 'requires an explicit --ram-gib')
+        run(f'/gen\t"[gMASK]<sop>A" --model "{model}" {options} --threads 1',
+            "Generation complete", "Text  中文🙂", "preflight:", "new_tokens=11", "stop=eos:67",
+            "out 11", "total 24 tok", "tok/s", "TTFT", "F2 expand")
+        terminal.send(b"\x1bOQ")  # F2 opens a full runtime view with independent scrolling.
+        terminal.expect("F2/Esc close")
+        terminal.expect("preflight:")
+        terminal.output.clear()
+        terminal.send(b"\x1b")
+        terminal.expect("Message the model")
+        run('/generate hi --model /nonexistent/urb-tui-checkpoint --ram-gib 2 --allow-large-model',
+            "Generation failed", "error:", "/nonexistent/urb-tui-checkpoint")
+        profile = root / "generation profile.json"
+        trace = root / "generation trace.json"
+        # A successful command selects the model; a failed one keeps it. Each request can
+        # choose a different CPU pool size because generation runs in its own process.
+        run(f'/generate --prompt "[gMASK]<sop>A" {options} --threads 2 --profile '
+            f'--profile-json "{profile}" --profile-trace "{trace}"',
+            "Generation complete", "Text  中文🙂", "out 11")
+        terminal.send(b"\x1bOQ\x1b[1;5H")  # F2 + Ctrl+Home: inspect earlier logs above the profile.
+        terminal.expect("F2/Esc close")
+        terminal.expect("stop=eos:67")
+        terminal.output.clear()
+        terminal.send(b"\x1bOQ")
+        terminal.expect("Message the model")
+        assert json.loads(profile.read_text())
+        assert "traceEvents" in json.loads(trace.read_text())
+        run('/generate "[gMASK]<sop>A" --ram-gib 0.001 --allow-large-model --raw-prompt',
+            "Generation failed", "RAM plan is infeasible")
+        run('/tokenize hello', "Tokenization complete", "GLM-5.2")
+        terminal.send(b"/quit\r")
+        terminal.finish()
+    finally:
+        terminal.close()
+
+
+def generation_cancel_and_exit(binary, root):
+    model = root / "blocked-generation"
+    model.mkdir()
+    fifo = model / "config.json"
+    os.mkfifo(fifo)
+    command = b'/generate hello --ram-gib 2 --allow-large-model\r'
+    for mode in ("escape", "quit", "ctrl-c", "ctrl-d", "sigterm", "sighup"):
+        terminal = Terminal([binary, "ui", str(model)])
+        writer = None
+        try:
+            terminal.resize(110, 64)
+            terminal.expect("Welcome to Urbilateria")
+            terminal.send(command)
+            terminal.expect("Generating")
+            terminal.expect("TTFT")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
+                    terminal.read()
+            assert writer is not None, "generation child never opened the FIFO"
+            terminal.send(b"/clear\r/help\r")
+            terminal.send(b"\x1b[1;5H")  # help wraps beside Runtime; scroll to its heading
+            terminal.expect("Commands & keys")
+            terminal.send(b"/version\r")
+            terminal.expect("Version")
+            if mode == "escape":
+                terminal.send(b"\x1b")
+                terminal.expect("Generation cancelled")
+                terminal.assert_running()
+                terminal.send(b"/quit\r")
+            elif mode == "quit":
+                terminal.send(b"/quit\r")
+            elif mode == "ctrl-c":
+                terminal.send(b"\x03")
+            elif mode == "ctrl-d":
+                terminal.send(b"\x04")
+            else:
+                terminal.send_signal(signal.SIGTERM if mode == "sigterm" else signal.SIGHUP)
+            terminal.finish()
+            try:
+                os.write(writer, b" ")
+            except BrokenPipeError:
+                pass
+            else:
+                raise AssertionError("generation child survived cancellation/exit")
+        finally:
+            terminal.close()
+            if writer is not None:
+                os.close(writer)
+
+
 def planning_and_preflight(binary, model, complete_model):
     terminal = Terminal([binary, "ui", str(model)])
     try:
@@ -326,12 +583,12 @@ def planning_and_preflight(binary, model, complete_model):
         terminal.expect("16 requested")
         terminal.expect("2 persistent slots")
         terminal.send(b"/clear\r")
-        terminal.expect("Type / to get started")
+        terminal.expect("Type a message")
         terminal.output.clear()
         terminal.send(b"/plan --ram-gib 0.001 --context 16\r")
         terminal.expect("NOT FEASIBLE")  # a budget failure is a visible result, not a UI crash
         terminal.send(b"/clear\r")
-        terminal.expect("Type / to get started")
+        terminal.expect("Type a message")
         terminal.output.clear()
         terminal.send(b"/preflight --context 8\r")  # successful preflight selected the complete model
         terminal.expect("Preflight complete")
@@ -446,11 +703,14 @@ def main():
         fixture(complete_model, complete=True)
         planning_and_preflight(args.binary, model, complete_model)
         browsing_and_text(args.binary, complete_model)
+        generation(args.binary, root)
+        conversation(args.binary, root)
+        generation_cancel_and_exit(args.binary, root)
         exit_modes(args.binary)
         busy_exit(args.binary, root)
     if args.panic_test:
         panic_cleanup(args.panic_test)
-    print("TUI PTY smoke passed: all 12 commands, editing, paste, resize, busy exit, terminal restoration")
+    print("TUI PTY smoke passed: all 14 commands, pinned model, Runtime panel, CLI/TUI token metrics, multi-turn chat, context trimming, generation, cancellation, editing, paste, resize, busy exit, terminal restoration")
 
 
 if __name__ == "__main__":

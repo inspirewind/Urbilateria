@@ -1,7 +1,9 @@
+use super::commands::GenerateOptions;
+use super::generate::{self, Generation, Outcome};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use urbilateria::analysis::{
     decode_tokens, explain_checkpoint, inspect_checkpoint, list_tensors, plan_checkpoint,
@@ -30,6 +32,7 @@ pub enum Task {
         ids: Vec<u32>,
         skip_special: bool,
     },
+    Generate(GenerateOptions),
 }
 
 impl Task {
@@ -43,6 +46,7 @@ impl Task {
             Self::Probe { .. } => "Sampling",
             Self::Tokenize { .. } => "Tokenizing",
             Self::Decode { .. } => "Decoding",
+            Self::Generate(_) => "Generating",
         }
     }
 
@@ -56,6 +60,7 @@ impl Task {
             Self::Probe { .. } => "/probe",
             Self::Tokenize { .. } => "/tokenize",
             Self::Decode { .. } => "/decode",
+            Self::Generate(_) => "/generate",
         }
     }
 }
@@ -97,9 +102,15 @@ pub struct Finished {
     pub result: Result<Report, String>,
 }
 
+pub enum Event {
+    Analysis(Finished),
+    Generation { id: u64, event: generate::Event },
+}
+
 pub struct Worker {
     requests: SyncSender<Request>,
-    pub results: Receiver<Finished>,
+    results: Receiver<Finished>,
+    generation: Option<Generation>,
 }
 
 impl Worker {
@@ -137,6 +148,8 @@ impl Worker {
                             decode_tokens(&request.path, ids, skip_special)
                                 .map(|report| Report::Decoding(Box::new(report)))
                         }
+                        // submit() routes generation to a process owned by the UI thread.
+                        Task::Generate(_) => unreachable!("generation is not an analysis request"),
                     }
                     .map_err(|error| error.to_string());
                     if done
@@ -150,12 +163,56 @@ impl Worker {
                     }
                 }
             })?;
-        Ok(Self { requests, results })
+        Ok(Self {
+            requests,
+            results,
+            generation: None,
+        })
     }
 
-    pub fn submit(&self, request: Request) -> Result<(), String> {
+    pub fn submit(&mut self, request: Request) -> Result<(), String> {
+        if let Task::Generate(options) = &request.task {
+            if self.generation.is_some() {
+                return Err("Generation is already running.".into());
+            }
+            self.generation = Some(
+                Generation::start(request.id, &request.path, options)
+                    .map_err(|error| format!("Cannot start generation: {error}"))?,
+            );
+            return Ok(());
+        }
         self.requests
             .try_send(request)
             .map_err(|error| format!("Cannot start analysis: {error}"))
+    }
+
+    pub fn poll(&mut self) -> Result<Option<Event>, String> {
+        if let Some(generation) = &mut self.generation {
+            let id = generation.id;
+            let event = match generation.poll() {
+                Ok(event) => event,
+                Err(error) => Some(generate::Event::Finished(Outcome::Failed(
+                    error.to_string(),
+                ))),
+            };
+            if matches!(event, Some(generate::Event::Finished(_))) {
+                self.generation = None;
+            }
+            return Ok(event.map(|event| Event::Generation { id, event }));
+        }
+        match self.results.try_recv() {
+            Ok(event) => Ok(Some(Event::Analysis(event))),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err("analysis worker stopped unexpectedly".into()),
+        }
+    }
+
+    pub fn cancel_generation(&mut self) -> Result<(), String> {
+        if let Some(generation) = &mut self.generation {
+            generation
+                .cancel()
+                .map_err(|error| format!("Cannot stop generation: {error}"))?;
+        }
+        Ok(())
     }
 }

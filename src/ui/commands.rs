@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use urbilateria::analysis::{
     parse_token_ids, ListOptions, PlanOptions, PreflightOptions, TokenizeOptions,
 };
 
-pub const COMMANDS: [(&str, &str); 12] = [
+pub const COMMANDS: [(&str, &str); 14] = [
     ("/help", "Commands and keyboard shortcuts"),
     ("/inspect", "Inspect checkpoint metadata"),
     ("/plan", "Estimate memory and expert-cache budgets"),
@@ -17,13 +18,19 @@ pub const COMMANDS: [(&str, &str); 12] = [
     ("/probe", "Sample a tensor and inspect numeric statistics"),
     ("/tokenize", "Encode text or a model-native chat prompt"),
     ("/decode", "Decode comma-separated token IDs"),
+    ("/generate", "Stream a response with an explicit RAM budget"),
+    (
+        "/settings",
+        "Show or change conversation generation settings",
+    ),
     ("/version", "Show the program version"),
-    ("/clear", "Clear the transcript"),
+    ("/clear", "Clear the transcript and conversation context"),
     ("/quit", "Return to your shell"),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    Message(String),
     Help,
     Inspect(Option<PathBuf>),
     Plan(Option<PathBuf>, PlanOptions),
@@ -33,9 +40,61 @@ pub enum Command {
     Probe(Option<PathBuf>, String, usize),
     Tokenize(Option<PathBuf>, String, TokenizeOptions),
     Decode(Option<PathBuf>, Vec<u32>, bool),
+    Generate(Option<PathBuf>, GenerateOptions),
+    Settings(SettingsUpdate),
     Version,
     Clear,
     Quit,
+}
+
+/// Validated CLI arguments, passed directly to the current executable without a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateOptions {
+    pub args: Vec<OsString>,
+    pub conversation: Option<crate::chat::Conversation>,
+}
+
+impl GenerateOptions {
+    fn index(&self, name: &str) -> Option<usize> {
+        let mut index = 0;
+        while index < self.args.len() {
+            if self.args[index] == name {
+                return Some(index);
+            }
+            index += if matches!(
+                self.args[index].to_str(),
+                Some("--allow-large-model" | "--raw-prompt" | "--no-thinking" | "--profile")
+            ) {
+                1
+            } else {
+                2
+            };
+        }
+        None
+    }
+
+    pub fn flag(&self, name: &str) -> bool {
+        self.index(name).is_some()
+    }
+
+    pub fn value(&self, name: &str) -> Option<&str> {
+        self.args.get(self.index(name)? + 1)?.to_str()
+    }
+
+    pub fn take_prompt(&mut self) -> Option<String> {
+        let index = self.index("--prompt")?;
+        let text = self.args[index + 1].to_str()?.to_owned();
+        self.args.drain(index..index + 2);
+        Some(text)
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SettingsUpdate {
+    pub ram_gib: Option<Option<String>>,
+    pub threads: Option<Option<usize>>,
+    pub max_new_tokens: Option<usize>,
+    pub thinking: Option<bool>,
 }
 
 pub fn takes_arguments(name: &str) -> bool {
@@ -43,6 +102,9 @@ pub fn takes_arguments(name: &str) -> bool {
 }
 
 pub fn parse(input: &str) -> Result<Command, String> {
+    if !input.trim_start().starts_with('/') {
+        return Ok(Command::Message(input.to_owned()));
+    }
     let words = shlex::split(input)
         .ok_or("Unclosed quote. Put paths and text with spaces inside quotes.")?;
     let (name, words) = words
@@ -161,8 +223,158 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 args.flags.contains("--skip-special"),
             ))
         }
+        "/generate" => parse_generate(words),
+        "/settings" => {
+            let args = parse_options(
+                words,
+                &["--ram-gib", "--max-new-tokens", "--threads"],
+                &["--thinking", "--no-thinking"],
+            )?;
+            if args.positional.is_some() {
+                return Err("/settings takes options only.".into());
+            }
+            let ram_gib = args
+                .values
+                .get("--ram-gib")
+                .map(|value| {
+                    if value == "auto" {
+                        return Ok(None);
+                    }
+                    let ram = value
+                        .parse::<f64>()
+                        .map_err(|_| "Invalid --ram-gib value.")?;
+                    if crate::gib_to_bytes(ram).map_err(|error| error.to_string())? == 0 {
+                        return Err("--ram-gib must provide at least one byte.".to_owned());
+                    }
+                    Ok(Some(value.clone()))
+                })
+                .transpose()?;
+            let threads = args
+                .values
+                .get("--threads")
+                .map(|value| {
+                    if value == "auto" {
+                        return Ok(None);
+                    }
+                    let count = value
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --threads value.")?;
+                    if count == 0 {
+                        return Err("--threads must be greater than zero.");
+                    }
+                    Ok(Some(count))
+                })
+                .transpose()?;
+            let max_new_tokens = args.number("--max-new-tokens")?;
+            if let Some(count) = max_new_tokens {
+                urbilateria::generation::GenerationConfig::greedy(count, vec![])
+                    .validate()
+                    .map_err(|e| e.to_string())?;
+            }
+            if args.flags.contains("--thinking") && args.flags.contains("--no-thinking") {
+                return Err("Choose either --thinking or --no-thinking.".into());
+            }
+            Ok(Command::Settings(SettingsUpdate {
+                ram_gib,
+                threads,
+                max_new_tokens,
+                thinking: if args.flags.contains("--thinking") {
+                    Some(true)
+                } else if args.flags.contains("--no-thinking") {
+                    Some(false)
+                } else {
+                    None
+                },
+            }))
+        }
         _ => Err("Enter a slash command. Use /help to see available commands.".into()),
     }
+}
+
+fn parse_generate(words: &[String]) -> Result<Command, String> {
+    let mut args = parse_options(
+        words,
+        &[
+            "--model",
+            "--prompt",
+            "--ram-gib",
+            "--max-new-tokens",
+            "--threads",
+            "--profile-json",
+            "--profile-trace",
+        ],
+        &[
+            "--allow-large-model",
+            "--raw-prompt",
+            "--no-thinking",
+            "--profile",
+        ],
+    )?;
+    let path = args.model()?;
+    args.values.remove("--model");
+    if let Some(prompt) = args.positional.take() {
+        if args.values.insert("--prompt".into(), prompt).is_some() {
+            return Err("Supply the prompt once: /generate \"TEXT\" [--model MODEL_DIR], or use --prompt TEXT.".into());
+        }
+    }
+    if !args.flags.contains("--allow-large-model") {
+        return Err("/generate requires --allow-large-model; no model weights were loaded.".into());
+    }
+    if args.values.get("--prompt").is_none_or(String::is_empty) {
+        return Err(
+            "Usage: /generate \"TEXT\" --ram-gib N --allow-large-model [--model MODEL_DIR]".into(),
+        );
+    }
+    let ram = args
+        .number::<f64>("--ram-gib")?
+        .ok_or("/generate requires an explicit --ram-gib N.")?;
+    if crate::gib_to_bytes(ram).map_err(|error| error.to_string())? == 0 {
+        return Err("--ram-gib must provide at least one byte.".into());
+    }
+    // Use the same token-count limits as the CLI without configuring its global CPU pool.
+    urbilateria::generation::GenerationConfig::greedy(
+        args.number("--max-new-tokens")?.unwrap_or(1),
+        vec![],
+    )
+    .validate()
+    .map_err(|error| error.to_string())?;
+    if args.number::<usize>("--threads")? == Some(0) {
+        return Err("--threads must be greater than zero.".into());
+    }
+    if args.flags.contains("--raw-prompt") && args.flags.contains("--no-thinking") {
+        return Err("--no-thinking applies to chat mode and conflicts with --raw-prompt.".into());
+    }
+    let json = args
+        .values
+        .get("--profile-json")
+        .map(|value| expand_home(value));
+    let trace = args
+        .values
+        .get("--profile-trace")
+        .map(|value| expand_home(value));
+    if json.is_some() && json == trace {
+        return Err("--profile-json and --profile-trace must use different paths.".into());
+    }
+    let mut forwarded = Vec::new();
+    for (name, value) in args.values {
+        forwarded.push(OsString::from(&name));
+        if matches!(name.as_str(), "--profile-json" | "--profile-trace") {
+            if value.is_empty() {
+                return Err(format!("{name} requires a nonempty path."));
+            }
+            forwarded.push(expand_home(&value).into_os_string());
+        } else {
+            forwarded.push(OsString::from(value));
+        }
+    }
+    forwarded.extend(args.flags.into_iter().map(OsString::from));
+    Ok(Command::Generate(
+        path,
+        GenerateOptions {
+            args: forwarded,
+            conversation: None,
+        },
+    ))
 }
 
 fn model_path(path: &str) -> Result<PathBuf, String> {
@@ -259,6 +471,92 @@ pub fn clean_text(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_messages_are_verbatim_and_settings_are_validated() {
+        for text in [
+            "hello",
+            "don't close \"the quote",
+            "  中文🙂\n--profile\n/quit  ",
+        ] {
+            assert_eq!(parse(text).unwrap(), Command::Message(text.into()));
+        }
+        assert_eq!(
+            parse("/settings").unwrap(),
+            Command::Settings(SettingsUpdate::default())
+        );
+        assert_eq!(
+            parse("/settings --ram-gib 2 --threads 3 --max-new-tokens 128 --no-thinking").unwrap(),
+            Command::Settings(SettingsUpdate {
+                ram_gib: Some(Some("2".into())),
+                threads: Some(Some(3)),
+                max_new_tokens: Some(128),
+                thinking: Some(false)
+            })
+        );
+        for text in [
+            "/settings 2",
+            "/settings --ram-gib NaN",
+            "/settings --ram-gib 0",
+            "/settings --max-new-tokens 0",
+            "/settings --max-new-tokens 1000001",
+            "/settings --threads 0",
+            "/settings --thinking --no-thinking",
+            "/settings --ram-gib 2 --ram-gib 3",
+            "/settings --profile",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn generation_preserves_literal_prompts_and_forwards_cli_options() {
+        let Command::Generate(path, options) = parse(
+            "/generate '中文\n$(echo hi)' --model '/模型/one two' --ram-gib 2 --allow-large-model --max-new-tokens 32 --threads 2 --profile --profile-json 'profile one.json' --profile-trace trace.json"
+        ).unwrap() else { panic!("expected generation"); };
+        assert_eq!(path, Some(PathBuf::from("/模型/one two")));
+        let strings: Vec<_> = options
+            .args
+            .iter()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        let forwarded = crate::GenerateArguments::parse(&strings).unwrap();
+        assert_eq!(forwarded.value("--prompt"), Some("中文\n$(echo hi)"));
+        assert_eq!(forwarded.value("--threads"), Some("2"));
+        assert_eq!(forwarded.value("--max-new-tokens"), Some("32"));
+        assert_eq!(forwarded.value("--ram-gib"), Some("2"));
+        assert_eq!(forwarded.value("--profile-json"), Some("profile one.json"));
+        assert_eq!(forwarded.value("--profile-trace"), Some("trace.json"));
+        assert!(forwarded.flag("--profile"));
+        assert!(forwarded.flag("--allow-large-model"));
+        assert!(parse("/generate --prompt hi --ram-gib 2 --allow-large-model").is_ok());
+        assert!(parse("/generate --ram-gib 2 --allow-large-model -- '--profile'").is_ok());
+    }
+
+    #[test]
+    fn generation_requires_explicit_authorization_budget_and_valid_options() {
+        for input in [
+            "/generate hello --ram-gib 2",
+            "/generate hello --allow-large-model",
+            "/generate '' --ram-gib 2 --allow-large-model",
+            "/generate hello --prompt hi --ram-gib 2 --allow-large-model",
+            "/generate hello --ram-gib NaN --allow-large-model",
+            "/generate hello --ram-gib 0.00000000001 --allow-large-model",
+            "/generate hello --ram-gib 2 --allow-large-model --max-new-tokens 0",
+            "/generate hello --ram-gib 2 --allow-large-model --max-new-tokens 1000001",
+            "/generate hello --ram-gib 2 --allow-large-model --threads 0",
+            "/generate hello --ram-gib 2 --allow-large-model --threads -1",
+            "/generate hello --ram-gib 2 --allow-large-model --raw-prompt --no-thinking",
+            "/generate hello --ram-gib 2 --allow-large-model --ram-gib 4",
+            "/generate hello --ram-gib 2 --allow-large-model --allow-large-model",
+            "/generate hello --ram-gib 2 --allow-large-model --profile-json same --profile-trace same",
+            "/generate hello --ram-gib 2 --allow-large-model --profile-json ''",
+            "/generate hello --ram-gib 2 --allow-large-model --model ''",
+            "/generate hello --ram-gib 2 --allow-large-model --json",
+        ] {
+            assert!(parse(input).is_err(), "accepted {input}");
+        }
+    }
 
     #[test]
     fn parses_quoted_unicode_paths_without_running_shell_syntax() {

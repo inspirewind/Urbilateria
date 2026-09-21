@@ -19,7 +19,7 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="CPU-only runtime">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="Five model families">
-<img src="https://img.shields.io/badge/tests-380_passing-2e7d32?style=flat-square" alt="380 tests passing">
+<img src="https://img.shields.io/badge/tests-415_passing-2e7d32?style=flat-square" alt="415 tests passing">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT License"></a>
 </p>
 
@@ -28,7 +28,7 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 <td align="center"><b>2.78T</b><br><sub>maximum parameter count</sub></td>
 <td align="center"><b>6</b><br><sub>model adapters</sub></td>
 <td align="center"><b>6</b><br><sub>public generation paths</sub></td>
-<td align="center"><b>380</b><br><sub>default tests passing</sub></td>
+<td align="center"><b>415</b><br><sub>default tests passing</sub></td>
 <td align="center"><b>0</b><br><sub>GPUs required</sub></td>
 </tr>
 </table>
@@ -49,8 +49,8 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 > readable, runnable behavior over production throughput. Large-checkpoint generation works for
 > GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4, but numerical accuracy, output quality, memory
 > use, and speed carry no production guarantees. DeepSeek-V4.1 includes a scalar base-text
-> generation path validated against an independent real-weight BOS oracle. Its tokenwise prompt
-> prefill is intended for correctness work and is slow.
+> generation path validated against an independent real-weight BOS oracle, with batched prompt
+> prefill and weight residency planned within the RAM budget.
 
 ## Why Urbilateria?
 
@@ -65,7 +65,8 @@ model weights are included in this repository.
 Building from source requires Rust 1.88 or newer. With rustup, this repository automatically selects Rust 1.88.0
 using `rust-toolchain.toml`, including rustfmt and Clippy.
 
-Version 0.2.0 introduces the interactive TUI; see [CHANGELOG.md](CHANGELOG.md) for all changes.
+Version 0.2.1 adds multi-turn TUI chat and live generation metrics; see
+[CHANGELOG.md](CHANGELOG.md) for all changes.
 After publication, [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) will
 provide binaries for Linux x86_64 (glibc 2.35+) and Apple Silicon macOS (deployment target 13+,
 tested on 15). They include the UI and need no Rust installation. See
@@ -86,12 +87,14 @@ For an interactive terminal interface on Linux or macOS:
 ```
 
 The UI provides a scrollable transcript, multiline Unicode input, session history,
-slash-command completion, and background model analysis and tokenization with elapsed time.
-Commands are `/inspect`, `/plan`, `/preflight`, `/list`, `/explain`, `/probe`, `/tokenize`, `/decode`,
+slash-command completion, and background model analysis, tokenization and streamed generation.
+Commands are `/inspect`, `/plan`, `/preflight`, `/list`, `/explain`, `/probe`, `/tokenize`, `/decode`, `/generate`, `/settings`,
 plus `/help`, `/version`, `/clear`, and `/quit`. Use **Enter** to run, **Ctrl+J** or
 **Alt+Enter** for a newline, **Tab** to complete, **Up/Down** for history at the input boundaries,
 **PgUp/PgDn** to scroll, and **Ctrl+C** to exit. Pasted text stays in the editor until submitted.
 Quote paths with spaces. The minimum terminal size is 36 columns by 10 rows.
+After `/inspect`, a model card stays at the upper right while the transcript scrolls or is cleared.
+Narrow terminals retain the model name and family in the header instead.
 
 Run these commands separately inside the UI:
 
@@ -112,9 +115,9 @@ The tensor name and token IDs above are examples; use actual values from `/list`
 For `/list [FILTER]`, `/probe TENSOR_NAME`, `/tokenize "TEXT"`, and `/decode TOKEN_IDS`,
 select a different directory with `--model "/path/to/model"` to distinguish it from the argument.
 Omitting the directory reuses the current model; a successful command updates the selection.
-Options apply only to that command. `/list` matches name substrings and returns 100 rows by default;
+Analysis options apply only to that command. `/list` matches name substrings and returns 100 rows by default;
 `--limit` accepts 1–100,000. `/probe` samples 8,192 values by default; `--samples` accepts
-1–10,000,000. Only `/probe` reads the tensor payload ranges needed for sampling.
+1–10,000,000. `/probe` reads only the tensor payload ranges needed for sampling.
 `/tokenize` encodes raw text by default; `--chat` renders a native chat prompt.
 `--no-thinking` requires `--chat` and model support (Qwen3.8 always requires thinking).
 Quote text containing spaces or newlines; use `--` before literal text starting with `-`.
@@ -129,12 +132,76 @@ Qwen3.8 uses `/preflight` for hybrid memory requirements and does not support `/
 Kimi-K3 preflight checks schema only, so context/cache options do not affect it; `--partial`
 validates visible decoder layers during a transfer without asserting checkpoint completeness.
 
+After selecting a model, type ordinary text directly to chat. Quotes and multiline text are
+preserved without shell parsing. Each reply includes previous successful conversation turns,
+rendered with the selected model's native chat template. The default is 512 new tokens per turn,
+with thinking enabled and automatic RAM detection on Linux. On macOS, set a RAM budget first;
+the same setting can limit memory on Linux:
+
+```text
+/settings --ram-gib 32 --max-new-tokens 512
+Explain sparse MoE routing.
+How does that affect memory usage?
+```
+
+`/settings` shows current values. It accepts `--threads N|auto`, `--ram-gib N|auto`,
+`--max-new-tokens N` and `--thinking`/`--no-thinking` (subject to model support).
+Plain messages request weight loading using the same RAM/runtime checks as the CLI.
+Successful model changes start a new conversation; failed changes retain the previous model
+and context. `/clear` clears both displayed output and conversation context, keeping the model
+card and settings. A reply already running when cleared will not enter the new context.
+
+Conversation memory retains at most 32 complete user/assistant pairs within 512 KiB, separately
+from the displayed transcript. Cancelled/failed replies are excluded; a reply larger than the
+history limit is displayed but excluded with a notice. Before generation, the tokenizer removes
+oldest complete pairs as needed to fit the runtime context limit and reserve the requested new
+tokens; the runtime log reports the number used/dropped. A current message that cannot fit on
+its own produces an error. History is held only for this UI session.
+
+You can also generate with explicit options:
+
+```text
+/generate "Explain sparse MoE routing" --ram-gib 32 --allow-large-model --max-new-tokens 128
+```
+
+Choose a different model with `--model MODEL_DIR`; `--prompt "TEXT"` is also accepted.
+The RAM value is an explicit budget, not a guarantee the checkpoint fits. Generation uses the
+same experimental runtime, checks and defaults as `urb generate` (including one new token if
+`--max-new-tokens` is omitted). It accepts `--threads`, `--raw-prompt`, `--no-thinking`, `--profile`,
+`--profile-json` and `--profile-trace`. Non-raw `/generate` requests participate in the conversation;
+raw prompts are standalone. An accepted `/generate` remembers its RAM, token, thread and thinking
+settings for later plain messages, but never its profile destinations. Generated text stays in the
+conversation; runtime diagnostics appear beneath the model card in the right sidebar.
+**F2** expands the runtime log, including on narrow terminals; **PgUp/PgDn** scroll it and
+**F2/Esc** close it. The footer shows generated and total token counts, decode speed and TTFT.
+Metrics remain visible after completion and reset when the next request starts.
+**Esc** stops generation and keeps partial text; close an expanded runtime view or completion
+menu first. Exiting also stops the generation process and releases its model resources.
+Cancellation may leave profile files incomplete. `/clear` also clears runtime logs while background work continues.
+Long streams retain the latest 32 KiB/256 newlines of text and 8 KiB/64 newlines of
+logs with a truncation notice; use the ordinary CLI with redirection to keep full output.
+The transcript retains at most 100 entries within a 512 KiB text budget, evicting older entries.
+Each request starts an independent generation process using the same `urb` executable;
+weights and KV state are rebuilt each turn, using the retained text conversation. No extra runtime is needed.
+
+The ordinary `urb generate` CLI prints a final `metrics:` summary to stderr without requiring
+`--profile`. Add `--progress` for periodic human-readable snapshots, or `--progress-json` for
+structured snapshots prefixed with `URB_PROGRESS ` on stderr (the two flags are mutually exclusive).
+The TUI reads these same structured metrics; stdout remains generated text only.
+Input count includes the rendered prompt and retained history; total is input plus generated
+token IDs, including EOS. TTFT measures request start to first selected token, including loading
+and prefill; it differs from the profiler's engine-only `generation.time_to_first_token` span.
+Decode speed is `(generated_tokens - 1) / (last_token_time - first_token_time)`, excluding
+loading and the first token. Before the first token TTFT is `—`; fewer than two tokens have no
+decode rate. Live updates are emitted at token boundaries (at most 10 Hz for JSON, 1 Hz for text,
+plus initial/first/final snapshots). Cancelled requests retain the last received metrics.
+
 The UI is written in Rust with Ratatui and Crossterm. Building needs Rust and a system linker
 (on macOS, install Xcode Command Line Tools); running a built binary needs neither Rust nor
 Python/Node.js. Use a binary built for your OS and architecture. The terminal must support
 ANSI control sequences and UTF-8. `ui` requires interactive stdin/stdout; ordinary CLI commands
-remain suitable for pipes and `--json`. Linux-specific runtime performance counters are not
-part of this initial UI. Build without the interface using
+remain suitable for pipes and `--json`. Profiling keeps the CLI's platform-specific counter
+availability. Build without the interface using
 `cargo build --release --locked --no-default-features`.
 
 Start with metadata. These commands do not need to read the full tensor payload:
@@ -202,9 +269,8 @@ The runtime keeps the working set explicit rather than pretending the checkpoint
 | **Scratch** | activations, quantization blocks, batched prompt work | included in preflight before payload reads begin |
 
 Large matvec output rows run on one persistent CPU worker pool. Prompt ingestion is layer-wise for
-DeepSeek-V4, Kimi-K3, Hy4, and the Qwen3.8 library runtime: one decoder layer is loaded for the entire
-prompt, and only the final prompt token reaches the vocabulary-sized LM head. DeepSeek-V4.1
-currently uses its exact token-at-a-time path for prompt prefill as well as decode.
+DeepSeek-V4/V4.1, Kimi-K3, Hy4, and the Qwen3.8 library runtime: one decoder layer is loaded for the
+entire prompt, and only the final prompt token reaches the vocabulary-sized LM head.
 Adapters that stream a BF16 vocabulary head use a fixed-residency, queue-depth-aware pipeline. Up to
 eight I/O workers read adjacent subdivisions while the CPU pool computes the current one; all raw
 buffers together stay within the former single-chunk budget and are reused as the window advances.
@@ -276,10 +342,12 @@ MXFP4 experts. DSpark tensors are schema-validated but speculative decoding is d
 
 **DeepSeek-V4.1.** The separate adapter validates the 40-layer CED graph, CSA2 ownership, 32×32
 MXFP8 ABI, 384-way experts, two Engram tables, vision tower, and three DSpark stages. Public scalar
-text generation executes the complete layer-streamed CED/CSA2/Engram/mHC base path with trained
-compressed caches, exact bounded Engram reads, top-6 MoE, and a streamed LM head. An independent
+text generation executes the complete CED/CSA2/Engram/mHC base path with trained compressed
+caches, exact bounded Engram reads and top-6 MoE. Decoder layers and the LM head are retained
+within the RAM budget or streamed as needed. An independent
 PyTorch real-weight BOS oracle gates routing across all 40 layers and the final top-16 logits.
-Prompt prefill remains token-at-a-time; vision and DSpark remain schema-only.
+Prompt prefill batches projections by layer and overlaps adjacent layer reads with computation;
+vision and DSpark remain schema-only.
 
 **Kimi-K3.** The text runtime streams 92 sparse layers of 896-way native MXFP4 routed experts,
 keeps the compact BF16 trunk bounded by layer, and preserves recurrent KDA plus compressed MLA
@@ -400,7 +468,7 @@ layer of confidence has its own gate:
 | --- | --- | --- |
 | GLM-5.2 | tiny full-model oracle; real converted-checkpoint token regressions | throughput optimization |
 | DeepSeek-V4 | independent tiny oracle; real layer/token and tokenizer regressions | sustained performance work |
-| DeepSeek-V4.1 | exact headers, native MX payloads, complete Engram/CSA2/mHC base forward and public generation, real 40-layer BOS routing and top-16-logit oracle | layer-wise prefill, vision, and DSpark execution |
+| DeepSeek-V4.1 | exact headers, native MX payloads, complete Engram/CSA2/mHC base forward and public generation, layer-wise prefill, real 40-layer BOS routing and top-16-logit oracle | vision and DSpark execution |
 | Kimi-K3 | independent full-stack logits parity and known `Paris` continuation | sustained performance and revision-by-revision validation |
 | Qwen3.8 | independent tiny FP32/BF16 graph, real FP8 expert payload, and real 92-layer full-logits oracles | sustained performance and multi-token release validation |
 | Hy4 | upstream iHC/Gated-MLA semantics; exact schema/MXFP8/expert payload gates; real 78-layer token and public CLI generation smoke | independent full-logits parity and >2,048-token IndexCache execution |
@@ -418,7 +486,7 @@ The model-free suite is fast and does not need a checkpoint:
 cargo test --all-targets --locked
 ```
 
-Current Linux result: **380 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
+Current Linux result: **415 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
 their model directory is supplied.
 
 <details>
@@ -450,7 +518,7 @@ HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
 
 | Command | Purpose | Model support |
 | --- | --- | --- |
-| `ui [MODEL_DIR]` | Interactive terminal with history, completion, background analysis, tensor browsing, and tokenization; 12 commands | Linux/macOS; same model coverage as corresponding CLI commands; use the plain CLI for `generate` |
+| `ui [MODEL_DIR]` | Interactive terminal with history, completion, background analysis, tensor browsing, tokenization and streamed generation; 13 commands | Linux/macOS; same model coverage and generation limits as corresponding CLI commands |
 | `inspect` | Build a static parameter, quantization, tensor, and routing X-ray | All six adapters |
 | `plan` | Estimate resident, KV, scratch, and expert-cache budgets | GLM, DeepSeek, Kimi, Hy4 |
 | `preflight` | Validate exact runtime tensors and memory without payload reads | All six adapters |
@@ -565,7 +633,8 @@ cargo build --release --locked
 CI runs model-free tests with and without `ui` on Linux (Ubuntu 24.04) and Apple Silicon macOS
 (macOS 15), using Rust 1.88.0 and stable; Intel Macs are not currently covered. Formatting and
 Clippy for both feature configurations use Rust 1.88.0. The terminal smoke test uses Python's
-standard library to exercise all 12 commands in a PTY, including paste, resize, blocked background
+standard library to exercise all 13 commands in a PTY, including real tiny-model generation,
+Unicode streaming, cancellation and process cleanup, paste, resize, blocked background
 tasks, normal/signal exits, and panic cleanup. The Linux release build also runs CLI help and
 TUI interaction checks. CI Cargo builds and tests use `--locked` to preserve dependency versions.
 Release tooling is tested with Python's standard library. Pushing a version tag runs CI again,
@@ -585,7 +654,7 @@ readable scalar reference; a faster path is not complete until its numerical con
 - No server API, Web UI, CUDA, or Metal backend.
 - The GLM path supports the converted Colibri container, not arbitrary official FP8 releases.
 - DeepSeek-V4/V4.1 DSpark speculative decoding is schema-validated but disabled; the V4.1 vision
-  tower is also schema-only, and its prompt prefill remains token-at-a-time.
+  tower is also schema-only.
 - Kimi-K3 generation is text-only; MoonViT and projector tensors are validated but not executed.
 - A Kimi checkpoint revision other than the tested release needs its own logits and performance
   validation before inheriting output-quality claims.
