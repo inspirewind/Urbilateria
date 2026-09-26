@@ -96,6 +96,52 @@ impl Drop for Guard {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a controlling PTY; exercised by tests/tui_smoke.py"]
+    fn reads_queued_resize_and_input() {
+        use crossterm::event::{self, Event, KeyCode};
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let _session = super::Session::enter().unwrap();
+        let _ = event::poll(Duration::from_millis(1)).unwrap();
+        println!("event-reader-ready");
+        std::io::stdout().flush().unwrap();
+
+        // The PTY driver queues a resize signal and keyboard input, in both orders.
+        // A FIFO handshake holds off polling until both sources are ready, without
+        // relying on scheduler delays or adding another keypress to wake the reader.
+        let path = std::env::var_os("URB_TUI_EVENT_GATE").expect("PTY event gate is required");
+        let mut gate = std::fs::File::open(path).unwrap();
+        let mut step = [0];
+        gate.read_exact(&mut step).unwrap();
+        println!("event-reader-queued");
+        std::io::stdout().flush().unwrap();
+        gate.read_exact(&mut step).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut resized = false;
+        let mut input = String::new();
+        let mut entered = false;
+        while Instant::now() < deadline && !(resized && entered) {
+            if event::poll(Duration::from_millis(50)).unwrap() {
+                match event::read().unwrap() {
+                    Event::Resize(_, _) => resized = true,
+                    Event::Key(key) => match key.code {
+                        KeyCode::Char(ch) => input.push(ch),
+                        KeyCode::Enter => entered = true,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        assert!(resized, "queued resize event was lost");
+        assert_eq!(input, "/quit", "queued keyboard input was lost");
+        assert!(entered, "queued Enter key was lost");
+    }
+
     #[test]
     #[ignore = "requires a controlling PTY; exercised by tests/tui_smoke.py"]
     fn restores_terminal_on_panic() {

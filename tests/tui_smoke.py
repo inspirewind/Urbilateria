@@ -1,6 +1,6 @@
 """Linux/macOS PTY smoke tests; Python is a test tool, not a UI dependency.
 
-Usage: python3 tests/tui_smoke.py target/release/urb [--panic-test BIN_TEST_EXECUTABLE]
+Usage: python3 tests/tui_smoke.py target/release/urb [--ui-test-binary BIN_TEST_EXECUTABLE]
 """
 
 import argparse
@@ -78,7 +78,7 @@ def run_pty_session(report_fd, command):
 
 
 class Terminal:
-    def __init__(self, command):
+    def __init__(self, command, env=None):
         self.master, self.slave = pty.openpty()
         self.output = bytearray()
         self.status = {}
@@ -95,7 +95,7 @@ class Terminal:
                 stdin=self.slave, stdout=self.slave, stderr=self.slave,
                 start_new_session=True,
                 pass_fds=(report_fd,),
-                env={**os.environ, "TERM": "xterm-256color"},
+                env={**os.environ, "TERM": "xterm-256color", **(env or {})},
             )
         except BaseException:
             for fd in (self.master, self.slave, self.status_fd):
@@ -715,6 +715,47 @@ def busy_exit(binary, root):
             terminal.close()
 
 
+def queued_resize_and_input(test_binary):
+    with tempfile.TemporaryDirectory(prefix="urb-tui-events-") as directory:
+        for order in ("resize-first", "input-first"):
+            gate = Path(directory) / order
+            os.mkfifo(gate)
+            terminal = Terminal([
+                test_binary, "ui::terminal::tests::reads_queued_resize_and_input",
+                "--exact", "--ignored", "--nocapture",
+            ], env={"URB_TUI_EVENT_GATE": str(gate)})
+            writer = None
+            try:
+                terminal.expect("event-reader-ready")
+                # Wait for the reader without blocking forever if the child exits early.
+                deadline = time.monotonic() + 5
+                while writer is None and time.monotonic() < deadline:
+                    try:
+                        writer = os.open(gate, os.O_WRONLY | os.O_NONBLOCK)
+                    except OSError as error:
+                        if error.errno != errno.ENXIO:
+                            raise
+                        terminal.assert_running()
+                        terminal.read()
+                assert writer is not None, "event reader never opened the FIFO"
+                if order == "resize-first":
+                    terminal.send_signal(signal.SIGWINCH)
+                else:
+                    terminal.send(b"/quit\r")
+                os.write(writer, b"1")
+                terminal.expect("event-reader-queued")
+                if order == "resize-first":
+                    terminal.send(b"/quit\r")
+                else:
+                    terminal.send_signal(signal.SIGWINCH)
+                os.write(writer, b"2")
+                terminal.finish()
+            finally:
+                terminal.close()
+                if writer is not None:
+                    os.close(writer)
+
+
 def panic_cleanup(test_binary):
     terminal = Terminal([
         test_binary, "ui::terminal::tests::restores_terminal_on_panic",
@@ -730,7 +771,7 @@ def panic_cleanup(test_binary):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
-    parser.add_argument("--panic-test")
+    parser.add_argument("--ui-test-binary", "--panic-test", dest="ui_test_binary")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="urb-tui-") as directory:
         root = Path(directory)
@@ -746,8 +787,9 @@ def main():
         generation_cancel_and_exit(args.binary, root)
         exit_modes(args.binary)
         busy_exit(args.binary, root)
-    if args.panic_test:
-        panic_cleanup(args.panic_test)
+    if args.ui_test_binary:
+        queued_resize_and_input(args.ui_test_binary)
+        panic_cleanup(args.ui_test_binary)
     print("TUI PTY smoke passed: all 14 commands, pinned model, Runtime panel, CLI/TUI token metrics, multi-turn chat, context trimming, generation, cancellation, editing, paste, resize, busy exit, terminal restoration")
 
 

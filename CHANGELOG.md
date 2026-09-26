@@ -18,6 +18,11 @@
 - Release resident sessions on conversation clearing, model or RAM/thread/thinking changes,
   cancellation, and exit. Keep streamed text and diagnostics synchronized across turns.
 
+### Terminal input
+
+- Fix intermittent TUI input stalls when window resize and keyboard events arrive together.
+  Use Crossterm's file-descriptor polling backend and cover both event arrival orders in PTY tests.
+
 ### Validation and scope
 
 - Add cached-versus-fresh generation and checkpoint replay checks, plus CLI/TUI terminal tests

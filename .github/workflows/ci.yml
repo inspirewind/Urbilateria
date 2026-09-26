@@ -119,7 +119,7 @@ jobs:
           if len(tests) != 1:
               raise SystemExit(f"Expected one urb test executable, found {tests!r}")
           subprocess.run([sys.executable, "tests/tui_smoke.py", "target/debug/urb",
-                          "--panic-test", tests[0]], check=True)
+                          "--ui-test-binary", tests[0]], check=True)
           PY
 
   release-smoke:
