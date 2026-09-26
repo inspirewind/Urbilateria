@@ -5,7 +5,7 @@ mod config;
 pub mod expert;
 mod expert_store;
 pub mod linear_attention;
-mod math;
+pub(crate) mod math;
 pub mod moe;
 pub mod norm;
 pub mod prompt;

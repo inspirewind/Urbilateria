@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add experimental Qwen3.6-35B-A3B native BF16 text inference, with strict nested
+  configuration and complete 26-shard/1,045-tensor validation.
+- Stream selected experts from packed gate/up/down tensors; reuse hybrid Qwen
+  attention kernels and support bounded recurrent/GQA state and session reuse.
+- Wire CLI/TUI inspect, preflight, tokenize, chat, and generate; support the shipped
+  thinking/no-thinking template. Vision and MTP remain schema-only.
+- Add packed-expert offset/budget tests, official prompt fixtures, two-step real
+  Transformers numerical gates, and real prefill/decode consistency checks.
+
 ## [0.2.2]
 
 ### Persistent chat sessions

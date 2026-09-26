@@ -270,7 +270,7 @@ pub fn render_chat(messages: &[Message], options: PromptOptions) -> Result<Strin
     Ok(output)
 }
 
-fn validate_messages(messages: &[Message]) -> Result<(), PromptError> {
+pub(crate) fn validate_messages(messages: &[Message]) -> Result<(), PromptError> {
     for (index, message) in messages.iter().enumerate() {
         if message.role == Role::System && index != 0 {
             return Err(PromptError::SystemMessageNotFirst { index });

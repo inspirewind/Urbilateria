@@ -311,14 +311,14 @@ grouped output row range 与 compressor/indexer 投影。流式 BF16 matvec 会�
 
 ## 模型覆盖
 
-| 能力 | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 |
-| --- | --- | --- | --- | --- | --- | --- |
-| **检查点 ABI** | 转换后的 Colibri | 原生 48 分片 | 原生 48 分片；96,085 个张量 | 原生 96 分片 | 原生 213 分片 | 原生 130 分片 |
-| **Tokenizer / 聊天** | byte-BPE | 原生文本聊天 | 原生文本聊天 + 数值 effort | TikToken + XTML | 始终思考的 ChatML | 原生 reasoning/no-think |
-| **原生权重** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 |
-| **注意力路径** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA |
-| **公开 CLI 生成** | 实验性 | 实验性 | 实验性，文本基础运行时 | 实验性 | 实验性 | 实验性，≤2,048 tokens |
-| **多模态执行** | 否 | 否 | 仅 schema | 仅 schema | 否 | 否 |
+| 能力 | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 | Qwen3.6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **检查点 ABI** | 转换后的 Colibri | 原生 48 分片 | 原生 48 分片；96,085 个张量 | 原生 96 分片 | 原生 213 分片 | 原生 130 分片 | 原生 26 分片 / 1,045 张量 |
+| **Tokenizer / 聊天** | byte-BPE | 原生文本聊天 | 原生文本聊天 + 数值 effort | TikToken + XTML | 始终思考的 ChatML | 原生 reasoning/no-think | 思考/非思考 ChatML |
+| **原生权重** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 | 打包 BF16 |
+| **注意力路径** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA | DeltaNet + GQA |
+| **公开 CLI 生成** | 实验性 | 实验性 | 实验性，文本基础运行时 | 实验性 | 实验性 | 实验性，≤2,048 tokens | 实验性，仅文本 |
+| **多模态执行** | 否 | 否 | 仅 schema | 仅 schema | 否 | 否 | 仅 schema |
 
 ### “原生”的含义
 
@@ -340,6 +340,8 @@ top-6 MoE。解码器层和 LM head 在 RAM 预算内常驻，预算不足时按
 使紧凑的 BF16 主干受层边界约束，并保留循环 KDA 与压缩 MLA 状态。XTML 由可信结构
 片段组装，同时转义不可信内容。生成在 `<|end_of_msg|>`（163586）停止，而不是在
 tokenizer 元数据的 `[EOS]` token（163585）停止。
+
+**Qwen3.6-35B-A3B。** 新增原生 BF16 文本适配：40 层混合注意力、top-8/256 专家、按专家切片读取、思考/非思考聊天模板，以及 CLI/TUI 生成与预检。26 个分片的完整 schema 已验证，真实权重两步 Transformers 对比和预填充一致性测试已通过。当前属于实验性实现，存在 BF16 数值误差；视觉和 MTP 仅校验，不执行。运行方式、误差范围和内存说明见 [适配文档](src/models/qwen3_6/README.md)。
 
 **Qwen3.8。** 适配器固定到 `model_type="qwen3_5_moe_text"` 以及已发布的
 `Qwen/Qwen3.8-2.4T-A95B-FP8` ABI。它实现 92 层基础文本 forward、top-10/512

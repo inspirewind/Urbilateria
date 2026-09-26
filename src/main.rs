@@ -25,6 +25,7 @@ use urbilateria::models::hy4::runtime::Hy4RuntimeModel;
 use urbilateria::models::hy4::schema as hy4_schema;
 use urbilateria::models::kimi_k3::runtime::KimiK3RuntimeModel;
 use urbilateria::models::kimi_k3::tokenizer::KimiK3Tokenizer;
+use urbilateria::models::qwen3_6::{schema as qwen36_schema, Qwen36Config, Qwen36RuntimeModel};
 use urbilateria::models::qwen3_8::{schema as qwen38_schema, Qwen38Config, Qwen38RuntimeModel};
 use urbilateria::profiling::{span, ProfileSession, ProfileStage};
 use urbilateria::runtime::RuntimeLoadOptions;
@@ -82,6 +83,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 match &inspection.report {
                     InspectionReport::Checkpoint(report) => print_checkpoint(report),
                     InspectionReport::Qwen38(report) => print_qwen38_manifest(report),
+                    InspectionReport::Qwen36(report) => print_qwen36_manifest(report),
                     InspectionReport::Hy4(report) => print_hy4_manifest(report),
                     InspectionReport::DeepseekV41(report) => print_deepseek_v41_manifest(report),
                 }
@@ -352,7 +354,7 @@ stderr and profile JSON to the requested file, never to streamed stdout.\n\n\
 Generation metrics go to stderr: final summary by default; --progress for live text,\n\
 --progress-json for URB_PROGRESS-prefixed JSON records. Counts include EOS; total = input + output.\n\
 TTFT includes loading/prefill; tok/s measures tokens after the first. Both are independent of --profile.\n\n\
-The public `generate` path currently drives GLM, DeepSeek-V4, Kimi-K3, Qwen3.8, and Hy4 (Hy4 is
+The public `generate` path currently drives GLM, DeepSeek-V4, Kimi-K3, Qwen3.6/3.8, and Hy4 (Hy4 is
 exact through 2,048 total tokens, where DSA top-k selects the complete causal history). Qwen3.8
 supports text-only, always-thinking generation. Kimi vision inputs are not accepted."
     );
@@ -618,6 +620,21 @@ fn run_generate_inner<W: Write>(
             prompt.text().expect("raw text input"),
         )?;
     }
+    if let ModelConfig::Qwen36(config) = model_config {
+        return run_generate_qwen36(
+            model_dir,
+            config,
+            prompt,
+            requested_ram,
+            max_new_tokens,
+            raw_prompt,
+            no_thinking,
+            available_ram_override,
+            output,
+            progress,
+            cache,
+        );
+    }
     if let ModelConfig::Qwen38(config) = model_config {
         return run_generate_qwen38(
             model_dir,
@@ -863,7 +880,7 @@ fn validate_native_raw_prompt(family: ModelFamily, prompt: &str) -> Result<(), B
         ModelFamily::DeepseekV41 => "<｜begin▁of▁sentence｜>",
         ModelFamily::Hy4 => "<｜hy_start:opensource｜>",
         ModelFamily::KimiK3 => "<|open|>",
-        ModelFamily::Qwen38 => "<|im_start|>",
+        ModelFamily::Qwen38 | ModelFamily::Qwen36 => "<|im_start|>",
     };
     if prompt.starts_with(required_prefix) {
         Ok(())
@@ -873,6 +890,174 @@ fn validate_native_raw_prompt(family: ModelFamily, prompt: &str) -> Result<(), B
         )
         .into())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_generate_qwen36<W: Write>(
+    model_dir: &Path,
+    config: Qwen36Config,
+    prompt: chat::Input,
+    requested_ram: u64,
+    max_new_tokens: usize,
+    raw_prompt: bool,
+    no_thinking: bool,
+    available_ram_override: Option<u64>,
+    output: &mut W,
+    progress: &mut progress::Progress,
+    cache: &mut session::Cache,
+) -> Result<(), Box<dyn Error>> {
+    let prompt_profile = span(ProfileStage::TokenizerPrompt);
+    let tokenizer = ByteBpeTokenizer::load(model_dir)?;
+    let encoded = prompt.encode_bytes_cached(
+        &tokenizer,
+        ModelFamily::Qwen36,
+        raw_prompt,
+        !no_thinking,
+        config.max_position_embeddings,
+        max_new_tokens,
+    )?;
+    let prompt_tokens = &encoded.tokens;
+    progress.prompt(prompt_tokens.len());
+    drop(prompt_profile);
+    if prompt_tokens.is_empty() {
+        return Err("rendered prompt encoded to zero tokens".into());
+    }
+    if let Some(&token) = prompt_tokens
+        .iter()
+        .find(|&&token| token as usize >= config.vocab_size)
+    {
+        return Err(format!(
+            "tokenizer produced ID {token} outside model vocabulary {}",
+            config.vocab_size
+        )
+        .into());
+    }
+    let generation_config = urbilateria::models::qwen3_6::Qwen36GenerationConfig::load(model_dir)?;
+    let eos = generation_config.eos_token_id;
+    for &token in &eos {
+        if !tokenizer.is_decodable_token_id(token) {
+            return Err(format!(
+                "Qwen3.6 EOS token ID {token} has no tokenizer entry; refusing undecodable stop semantics"
+            )
+            .into());
+        }
+    }
+    let decodable_mask = tokenizer.decodable_token_mask(config.vocab_size);
+    let suppressed_rows = decodable_mask.iter().filter(|allowed| !**allowed).count();
+    let mut generation = GenerationConfig::greedy(max_new_tokens, eos.clone());
+    generation.allowed_token_mask = Some(decodable_mask);
+    generation.validate()?;
+    let required_context = prompt_tokens
+        .len()
+        .checked_add(max_new_tokens)
+        .ok_or("prompt + generation length overflows usize")?;
+    if required_context > config.max_position_embeddings {
+        return Err(format!(
+            "prompt ({}) + max new tokens ({max_new_tokens}) = {required_context}, exceeding Qwen3.6 limit {}",
+            prompt_tokens.len(),
+            config.max_position_embeddings
+        )
+        .into());
+    }
+
+    if let Some(live) = cache.take::<Qwen36RuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
+    let effective_ram = available_ram_override
+        .or_else(detect_available_ram)
+        .map(|available| available.min(requested_ram))
+        .unwrap_or(requested_ram);
+    let preflight_profile = span(ProfileStage::CheckpointPreflight);
+    // Start with zero retained expert slots, which is the lowest-memory correct execution mode.
+    // A later planner can trade memory for throughput without changing forward semantics.
+    let (required_context, requirements) = session::plan(
+        cache.enabled,
+        required_context,
+        config.max_position_embeddings,
+        |capacity| {
+            let requirements = Qwen36RuntimeModel::inspect_requirements(model_dir, capacity, 0)?;
+            let recurrent = requirements
+                .recurrent_state_bytes
+                .saturating_add(requirements.convolution_state_bytes);
+            let total = requirements
+                .peak_resident_bytes
+                .saturating_add(requirements.kv_cache_bytes)
+                .saturating_add(recurrent.saturating_mul(if cache.enabled { 2 } else { 1 }));
+            Ok((requirements, total <= effective_ram))
+        },
+    )?;
+    let state_bytes = requirements
+        .kv_cache_bytes
+        .checked_add(requirements.recurrent_state_bytes)
+        .and_then(|value| value.checked_add(requirements.convolution_state_bytes))
+        .ok_or("Qwen3.6 state byte count overflows")?;
+    let total_required = requirements
+        .peak_resident_bytes
+        .checked_add(state_bytes)
+        .ok_or("Qwen3.6 total resident byte count overflows")?;
+    let total_required = total_required.saturating_add(if cache.enabled {
+        requirements
+            .recurrent_state_bytes
+            .saturating_add(requirements.convolution_state_bytes)
+    } else {
+        0
+    });
+    if total_required > effective_ram {
+        return Err(format!(
+            "Qwen3.6 runtime needs at least {} for streamed layer, state, scratch, and one transient expert; effective RAM is {}",
+            human_bytes(total_required),
+            human_bytes(effective_ram)
+        )
+        .into());
+    }
+    drop(preflight_profile);
+    eprintln!(
+        "preflight: Qwen3.6 prompt={} tokens, context={}, RAM={}, streamed-layer peak={}, recurrent+conv state={}, full-GQA KV={}, expert cache slots/layer=0, transient expert={}, suppressed LM-head rows={}, CPU workers={} (scalar correctness runtime)",
+        prompt_tokens.len(),
+        required_context,
+        human_bytes(effective_ram),
+        human_bytes(requirements.streamed_layer_bytes),
+        human_bytes(
+            requirements
+                .recurrent_state_bytes
+                .saturating_add(requirements.convolution_state_bytes)
+        ),
+        human_bytes(requirements.kv_cache_bytes),
+        human_bytes(requirements.expert_bytes),
+        suppressed_rows,
+        worker_threads()
+    );
+    let model = {
+        let _profile = span(ProfileStage::ModelLoad);
+        Qwen36RuntimeModel::load(
+            model_dir,
+            RuntimeLoadOptions {
+                resident_budget_bytes: requirements.peak_resident_bytes,
+                expert_cache_budget_bytes: 0,
+                kv_cache_budget_bytes: state_bytes,
+                expert_slots_per_layer: 0,
+                maximum_expert_bytes: requirements.expert_bytes,
+                context_limit: required_context,
+            },
+        )?
+    };
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
+        &generation,
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1857,6 +2042,44 @@ fn print_preflight(report: &PreflightReport) {
                 requirements.checkpoint_shard_count
             );
         }
+        PreflightReport::Qwen36(requirements) => {
+            println!("Qwen3.6 complete text-runtime preflight");
+            println!(
+                "  checkpoint          {} tensors across {} shards ({})",
+                requirements.schema.checkpoint_tensor_count,
+                requirements.schema.checkpoint_shard_count,
+                human_bytes(requirements.schema.checkpoint_payload_bytes)
+            );
+            println!(
+                "  streamed layer      {} peak",
+                human_bytes(requirements.streamed_layer_bytes)
+            );
+            println!(
+                "  recurrent + conv    {} + {}",
+                human_bytes(requirements.recurrent_state_bytes),
+                human_bytes(requirements.convolution_state_bytes)
+            );
+            println!(
+                "  full-GQA KV         {} for {} tokens",
+                human_bytes(requirements.kv_cache_bytes),
+                requirements.context_limit
+            );
+            println!(
+                "  execution scratch   {} (includes layer-wise prompt snapshots)",
+                human_bytes(requirements.scratch_bytes)
+            );
+            println!(
+                "  routed expert       {} each · {} cache slots/layer · {} cache",
+                human_bytes(requirements.expert_bytes),
+                requirements.expert_slots_per_layer,
+                human_bytes(requirements.expert_cache_bytes)
+            );
+            println!(
+                "  resident execution  {} persistent · {} miss peak (state separate)",
+                human_bytes(requirements.resident_bytes),
+                human_bytes(requirements.peak_resident_bytes)
+            );
+        }
         PreflightReport::Qwen38(requirements) => {
             println!("Qwen3.8 complete text-runtime preflight");
             println!(
@@ -2227,6 +2450,35 @@ fn print_probe(report: &ProbeReport) {
         }
     }
     println!("  note                {}", report.sampling_note);
+}
+
+fn print_qwen36_manifest(report: &qwen36_schema::Qwen36ManifestReport) {
+    println!("Qwen3.6-35B-A3B manifest preflight");
+    println!(
+        "  schema tensors      {} required / {} indexed",
+        report.required_tensor_count, report.checkpoint_tensor_count
+    );
+    println!(
+        "  hybrid layers       {} linear attention + {} full GQA ({} base total)",
+        report.linear_attention_layer_count,
+        report.full_attention_layer_count,
+        report.base_layer_count
+    );
+    println!(
+        "  routed experts      {} per base layer; {} MTP layer",
+        report.experts_per_layer, report.mtp_layer_count
+    );
+    println!(
+        "  checkpoint payload  {} across {} indexed shards",
+        human_bytes(report.checkpoint_payload_bytes),
+        report.checkpoint_shard_count
+    );
+    println!(
+        "  logical parameters  {} (scale sidecars excluded)",
+        report.logical_parameter_count
+    );
+    println!("  generation stops    {:?}", report.stop_token_ids);
+    println!("  runtime status      experimental text-only generation; packed BF16 expert slices; vision and MTP excluded");
 }
 
 fn print_qwen38_manifest(report: &qwen38_schema::Qwen38ManifestReport) {

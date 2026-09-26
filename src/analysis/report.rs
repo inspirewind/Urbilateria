@@ -167,6 +167,7 @@ pub fn analyze_checkpoint(model_dir: &Path) -> Result<CheckpointReport, Analysis
                 .to_owned(),
         )),
         ModelConfig::KimiK3(config) => analyze_kimi_k3_index(model_dir, &config, &index),
+        ModelConfig::Qwen36(_) => Err(AnalysisError::Schema("Qwen3.6 uses a dedicated hybrid schema; use inspect/preflight".into())),
         ModelConfig::Qwen38(_) => Err(AnalysisError::Schema(
             "Qwen3.8 uses its release-specific 287,119-tensor manifest/schema report; the generic MLA-oriented CheckpointReport would mislabel hybrid recurrent/GQA state"
                 .to_owned(),

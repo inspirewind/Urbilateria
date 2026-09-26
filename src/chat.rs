@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use urbilateria::models::{deepseek_v4, deepseek_v41, glm, hy4, kimi_k3, qwen3_8};
+use urbilateria::models::{deepseek_v4, deepseek_v41, glm, hy4, kimi_k3, qwen3_6, qwen3_8};
 use urbilateria::tokenizer::ByteBpeTokenizer;
 use urbilateria::ModelFamily;
 
@@ -323,6 +323,18 @@ fn render_bytes(
                     ..Default::default()
                 },
             )
+        }
+        ModelFamily::Qwen36 => {
+            use qwen3_6::prompt as p;
+            p::render_chat(
+                &messages!(p, |content: &str, reasoning: Option<&str>| {
+                    p::Message::assistant(content, reasoning)
+                }),
+                p::PromptOptions {
+                    enable_thinking: thinking,
+                    ..Default::default()
+                },
+            )?
         }
         ModelFamily::Qwen38 => {
             use qwen3_8::prompt as p;

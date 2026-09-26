@@ -99,6 +99,7 @@ pub fn probe_tensor(
         ModelConfig::DeepseekV41(_) => deepseek_logical_shape(&index, name)?,
         ModelConfig::Hy4(_) => hy4_logical_shape(&index, name)?,
         ModelConfig::KimiK3(_) => kimi_k3_logical_shape(&index, name)?,
+        ModelConfig::Qwen36(_) => None, // Native BF16 shapes need no quantization expansion.
         ModelConfig::Qwen38(_) => qwen38_logical_shape(&index, name)?,
     };
     let (stats, quantization, sampled_bytes) = match tensor.dtype {

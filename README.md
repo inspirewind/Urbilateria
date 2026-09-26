@@ -344,14 +344,14 @@ grow with compressed history.
 
 ## Model Coverage
 
-| Capability | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 |
-| --- | --- | --- | --- | --- | --- | --- |
-| **Checkpoint ABI** | converted Colibri | native 48-shard | native 48-shard; 96,085 tensors | native 96-shard | native 213-shard | native 130-shard |
-| **Tokenizer / chat** | byte-BPE | native text chat | native text chat + numeric effort | TikToken + XTML | always-thinking ChatML | native reasoning/no-think |
-| **Native weights** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 |
-| **Attention path** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA |
-| **Public CLI generation** | Experimental | Experimental | Experimental, text base runtime | Experimental | Experimental | Experimental, ≤2,048 tokens |
-| **Multimodal execution** | No | No | Schema only | Schema only | No | No |
+| Capability | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 | Qwen3.6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **Checkpoint ABI** | converted Colibri | native 48-shard | native 48-shard; 96,085 tensors | native 96-shard | native 213-shard | native 130-shard | native 26-shard / 1,045 tensors |
+| **Tokenizer / chat** | byte-BPE | native text chat | native text chat + numeric effort | TikToken + XTML | always-thinking ChatML | native reasoning/no-think | thinking/no-thinking ChatML |
+| **Native weights** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 | packed BF16 |
+| **Attention path** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA | DeltaNet + GQA |
+| **Public CLI generation** | Experimental | Experimental | Experimental, text base runtime | Experimental | Experimental | Experimental, ≤2,048 tokens | Experimental, text only |
+| **Multimodal execution** | No | No | Schema only | Schema only | No | No | Schema only |
 
 ### What “native” means
 
@@ -375,6 +375,8 @@ vision and DSpark remain schema-only.
 keeps the compact BF16 trunk bounded by layer, and preserves recurrent KDA plus compressed MLA
 state. XTML is assembled from trusted structural segments and escaped untrusted content. Generation
 stops on `<|end_of_msg|>` (163586), not the tokenizer metadata's `[EOS]` token (163585).
+
+**Qwen3.6-35B-A3B.** Native BF16 text adapter with 40 hybrid-attention layers, top-8/256 experts, bounded expert-slice loading, thinking/no-thinking ChatML, and CLI/TUI generation and preflight. The complete 26-shard schema, two-step Transformers comparison, and prefill consistency are validated. Experimental: BF16 numerical differences remain; vision and MTP are schema-only. See [usage, memory, and validation](src/models/qwen3_6/README.md).
 
 **Qwen3.8.** The adapter is pinned to `model_type="qwen3_5_moe_text"` and the released
 `Qwen/Qwen3.8-2.4T-A95B-FP8` ABI. It implements the base 92-layer text forward, top-10/512 routed

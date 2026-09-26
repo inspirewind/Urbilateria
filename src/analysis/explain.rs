@@ -23,6 +23,7 @@ pub fn explain_checkpoint(model_dir: &Path) -> Result<Explanation, Box<dyn Error
         ModelConfig::DeepseekV41(config) => deepseek_v41_explanation(config),
         ModelConfig::Hy4(config) => hy4_explanation(config),
         ModelConfig::KimiK3(config) => kimi_k3_explanation(config),
+        ModelConfig::Qwen36(config) => vec![format!("Qwen3.6-35B-A3B: {} layers (30 Gated DeltaNet + 10 gated GQA), top-{}/{} BF16 experts + shared expert; packed expert slices, text-only runtime; vision and MTP validated but excluded.", config.num_hidden_layers, config.num_experts_per_tok, config.num_experts)],
         ModelConfig::Qwen38(config) => qwen38_explanation(config),
     };
     Ok(Explanation {

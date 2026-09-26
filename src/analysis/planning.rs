@@ -60,8 +60,8 @@ pub fn plan_checkpoint(
     options.validate()?;
     let config = ModelConfig::load(model_dir)?;
     let model = config.common();
-    if matches!(config, ModelConfig::Qwen38(_)) {
-        return Err("the generic `urb plan` report does not represent Qwen3.8 hybrid state; use `urb preflight MODEL_DIR --context N --expert-slots N` for its exact streamed-layer, recurrent, convolution, GQA-KV, scratch, and expert-cache budgets".into());
+    if matches!(config, ModelConfig::Qwen38(_) | ModelConfig::Qwen36(_)) {
+        return Err("the generic `urb plan` report does not represent Qwen3.6/3.8 hybrid state; use `urb preflight MODEL_DIR --context N --expert-slots N` for its exact streamed-layer, recurrent, convolution, GQA-KV, scratch, and expert-cache budgets".into());
     }
     let ram = options
         .ram_bytes
@@ -116,7 +116,9 @@ pub fn plan_checkpoint(
             let requirements = hy4::schema::inspect_requirements(config, &index, context_usize, 0)?;
             build_hy4_resource_plan(config, &requirements, ram, context, kv_bytes)
         }
-        ModelConfig::Qwen38(_) => unreachable!("Qwen3.8 returned before generic analysis"),
+        ModelConfig::Qwen38(_) | ModelConfig::Qwen36(_) => {
+            unreachable!("Qwen hybrid model returned before generic analysis")
+        }
     };
     Ok(Planning {
         model_path: model_dir.to_owned(),

@@ -9,3 +9,5 @@ pub mod glm;
 pub mod hy4;
 pub mod kimi_k3;
 pub mod qwen3_8;
+
+pub mod qwen3_6;

@@ -1,0 +1,238 @@
+[
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "你好，1+1？"
+      }
+    ],
+    "thinking": false,
+    "rendered": "<|im_start|>user\n你好，1+1？<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "tokens": [
+      248045,
+      846,
+      198,
+      109266,
+      3709,
+      16,
+      10,
+      16,
+      10992,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ]
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": ""
+      },
+      {
+        "role": "user",
+        "content": " Hello "
+      }
+    ],
+    "thinking": false,
+    "rendered": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "tokens": [
+      248045,
+      8678,
+      198,
+      248046,
+      198,
+      248045,
+      846,
+      198,
+      9419,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ]
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": " Be concise "
+      },
+      {
+        "role": "user",
+        "content": "first"
+      },
+      {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "reason"
+      },
+      {
+        "role": "user",
+        "content": "next"
+      }
+    ],
+    "thinking": false,
+    "rendered": "<|im_start|>system\nBe concise<|im_end|>\n<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "tokens": [
+      248045,
+      8678,
+      198,
+      3320,
+      61446,
+      248046,
+      198,
+      248045,
+      846,
+      198,
+      3765,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      8944,
+      248046,
+      198,
+      248045,
+      846,
+      198,
+      3480,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      271,
+      248069,
+      271
+    ]
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "你好，1+1？"
+      }
+    ],
+    "thinking": true,
+    "rendered": "<|im_start|>user\n你好，1+1？<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "tokens": [
+      248045,
+      846,
+      198,
+      109266,
+      3709,
+      16,
+      10,
+      16,
+      10992,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      198
+    ]
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": ""
+      },
+      {
+        "role": "user",
+        "content": " Hello "
+      }
+    ],
+    "thinking": true,
+    "rendered": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "tokens": [
+      248045,
+      8678,
+      198,
+      248046,
+      198,
+      248045,
+      846,
+      198,
+      9419,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      198
+    ]
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": " Be concise "
+      },
+      {
+        "role": "user",
+        "content": "first"
+      },
+      {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "reason"
+      },
+      {
+        "role": "user",
+        "content": "next"
+      }
+    ],
+    "thinking": true,
+    "rendered": "<|im_start|>system\nBe concise<|im_end|>\n<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "tokens": [
+      248045,
+      8678,
+      198,
+      3320,
+      61446,
+      248046,
+      198,
+      248045,
+      846,
+      198,
+      3765,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      8944,
+      248046,
+      198,
+      248045,
+      846,
+      198,
+      3480,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      198
+    ]
+  }
+]

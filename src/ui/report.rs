@@ -319,6 +319,39 @@ pub fn inspection_entry(inspection: &Inspection, elapsed: std::time::Duration) -
             details.extend(report.format_notes.iter().cloned().map(Detail::text));
             details.extend(report.warnings.iter().cloned().map(Detail::warning));
         }
+        InspectionReport::Qwen36(report) => {
+            details.extend([
+                Detail::field(
+                    "Manifest",
+                    format!(
+                        "{} shards · {} tensors · {} payload",
+                        report.checkpoint_shard_count,
+                        report.checkpoint_tensor_count,
+                        human_bytes(report.checkpoint_payload_bytes)
+                    ),
+                ),
+                Detail::field("Parameters", human_count(report.logical_parameter_count)),
+                Detail::field(
+                    "Attention",
+                    format!(
+                        "{} linear · {} full · {} MTP layers",
+                        report.linear_attention_layer_count,
+                        report.full_attention_layer_count,
+                        report.mtp_layer_count
+                    ),
+                ),
+                Detail::field(
+                    "Experts",
+                    format!(
+                        "{} per layer · {} selected/token",
+                        report.experts_per_layer, report.selected_experts_per_token
+                    ),
+                ),
+                Detail::text(
+                    "Manifest inspection only; shard headers and tensor payloads were not read.",
+                ),
+            ]);
+        }
         InspectionReport::Qwen38(report) => {
             details.extend([
                 Detail::field(
@@ -590,6 +623,58 @@ pub fn preflight_entry(preflight: &Preflight, elapsed: std::time::Duration) -> E
                         "{} full IndexCache layers · {} MTP payload (excluded from base forward)",
                         report.full_indexer_layer_count,
                         human_bytes(report.mtp_payload_bytes)
+                    ),
+                ),
+            ]);
+        }
+        PreflightReport::Qwen36(report) => {
+            details.extend([
+                Detail::field("Scope", "Complete text-runtime schema"),
+                Detail::field(
+                    "Checkpoint",
+                    format!(
+                        "{} tensors across {} shards · {} payload",
+                        report.schema.checkpoint_tensor_count,
+                        report.schema.checkpoint_shard_count,
+                        human_bytes(report.schema.checkpoint_payload_bytes)
+                    ),
+                ),
+                Detail::field("Context", report.context_limit),
+                Detail::field(
+                    "Streamed layer peak",
+                    human_bytes(report.streamed_layer_bytes),
+                ),
+                Detail::field(
+                    "Recurrent / convolution state",
+                    format!(
+                        "{} / {}",
+                        human_bytes(report.recurrent_state_bytes),
+                        human_bytes(report.convolution_state_bytes)
+                    ),
+                ),
+                Detail::field("Full-GQA KV", human_bytes(report.kv_cache_bytes)),
+                Detail::field(
+                    "Scratch",
+                    format!(
+                        "{} (includes layer-wise prompt snapshots)",
+                        human_bytes(report.scratch_bytes)
+                    ),
+                ),
+                Detail::field(
+                    "Experts",
+                    format!(
+                        "{} each · {} cache slots/layer · {} cache",
+                        human_bytes(report.expert_bytes),
+                        report.expert_slots_per_layer,
+                        human_bytes(report.expert_cache_bytes)
+                    ),
+                ),
+                Detail::field(
+                    "Persistent / miss peak",
+                    format!(
+                        "{} / {} (causal state separate)",
+                        human_bytes(report.resident_bytes),
+                        human_bytes(report.peak_resident_bytes)
                     ),
                 ),
             ]);

@@ -1,6 +1,6 @@
 //! Header-only schema/runtime preflight with each model family's original result format.
 
-use crate::models::{deepseek_v4, deepseek_v41, glm, hy4, kimi_k3, qwen3_8};
+use crate::models::{deepseek_v4, deepseek_v41, glm, hy4, kimi_k3, qwen3_6, qwen3_8};
 use crate::storage::TensorIndex;
 use crate::{CommonModelConfig, ModelConfig};
 use serde::Serialize;
@@ -49,6 +49,7 @@ pub enum PreflightReport {
     Hy4(Box<hy4::schema::Hy4Requirements>),
     KimiK3(Box<kimi_k3::schema::KimiK3Requirements>),
     KimiK3Partial(Box<kimi_k3::schema::KimiK3PartialLayers>),
+    Qwen36(Box<qwen3_6::Qwen36RuntimeRequirements>),
     Qwen38(Box<qwen3_8::Qwen38RuntimeRequirements>),
 }
 
@@ -70,7 +71,7 @@ pub fn preflight_checkpoint(
             ModelConfig::Glm52(_) | ModelConfig::DeepseekV4(_) => Some("--partial is currently specific to an in-progress Kimi-K3 transfer"),
             ModelConfig::DeepseekV41(_) => Some("DeepSeek-V4.1 preflight validates the complete native release; --partial applies only to Kimi-K3 shard transfer"),
             ModelConfig::Hy4(_) => Some("Hy4 preflight validates the complete 130-shard release; --partial is Kimi-K3-specific"),
-            ModelConfig::Qwen38(_) => Some("Qwen3.8 runtime preflight validates the complete official checkpoint; --partial applies only to Kimi-K3 shard transfer"),
+            ModelConfig::Qwen36(_) | ModelConfig::Qwen38(_) => Some("Qwen hybrid runtime preflight validates the complete official checkpoint; --partial applies only to Kimi-K3 shard transfer"),
         };
         if let Some(error) = error {
             return Err(error.into());
@@ -119,6 +120,9 @@ pub fn preflight_checkpoint(
                 )?))
             }
         }
+        ModelConfig::Qwen36(_) => PreflightReport::Qwen36(Box::new(
+            qwen3_6::Qwen36RuntimeModel::inspect_requirements(model_dir, context, expert_slots)?,
+        )),
         ModelConfig::Qwen38(_) => PreflightReport::Qwen38(Box::new(
             qwen3_8::Qwen38RuntimeModel::inspect_requirements(model_dir, context, expert_slots)?,
         )),

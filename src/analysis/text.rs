@@ -129,6 +129,13 @@ pub fn tokenize_text(
                         },
                     ),
                     ModelConfig::KimiK3(_) => unreachable!("handled above"),
+                    ModelConfig::Qwen36(_) => crate::models::qwen3_6::prompt::render_chat(
+                        &[qwen38_prompt::Message::new(qwen38_prompt::Role::User, text)],
+                        crate::models::qwen3_6::prompt::PromptOptions {
+                            enable_thinking: !no_thinking,
+                            ..Default::default()
+                        },
+                    )?,
                     ModelConfig::Qwen38(_) => {
                         if no_thinking {
                             return Err("Qwen3.8 requires thinking; --no-thinking is unsupported by the official template".into());
@@ -173,7 +180,8 @@ pub fn decode_tokens(
         | ModelConfig::DeepseekV4(_)
         | ModelConfig::DeepseekV41(_)
         | ModelConfig::Hy4(_)
-        | ModelConfig::Qwen38(_) => {
+        | ModelConfig::Qwen38(_)
+        | ModelConfig::Qwen36(_) => {
             ByteBpeTokenizer::load(model_dir)?.decode(&token_ids, skip_special)?
         }
     };

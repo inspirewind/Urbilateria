@@ -24,5 +24,5 @@ mod test_support;
 
 pub use config::{
     CommonModelConfig, DeepseekV41Config, DeepseekV4Config, GlmConfig, Hy4Config, KimiK3Config,
-    ModelConfig, ModelFamily, Qwen38Config,
+    ModelConfig, ModelFamily, Qwen36Config, Qwen38Config,
 };
