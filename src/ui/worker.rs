@@ -172,9 +172,17 @@ impl Worker {
 
     pub fn submit(&mut self, request: Request) -> Result<(), String> {
         if let Task::Generate(options) = &request.task {
-            if self.generation.is_some() {
+            if self.generation.as_ref().is_some_and(Generation::is_running) {
                 return Err("Generation is already running.".into());
             }
+            if let Some(generation) = &mut self.generation {
+                if generation.can_reuse(&request.path, options) {
+                    return generation
+                        .submit(request.id, options)
+                        .map_err(|error| error.to_string());
+                }
+            }
+            self.generation = None;
             self.generation = Some(
                 Generation::start(request.id, &request.path, options)
                     .map_err(|error| format!("Cannot start generation: {error}"))?,
@@ -195,15 +203,30 @@ impl Worker {
                     error.to_string(),
                 ))),
             };
-            if matches!(event, Some(generate::Event::Finished(_))) {
+            if matches!(event, Some(generate::Event::Finished(_)))
+                && (!generation.retain
+                    || !matches!(event, Some(generate::Event::Finished(Outcome::Complete))))
+            {
                 self.generation = None;
             }
-            return Ok(event.map(|event| Event::Generation { id, event }));
+            if event.is_some() {
+                return Ok(event.map(|event| Event::Generation { id, event }));
+            }
         }
         match self.results.try_recv() {
             Ok(event) => Ok(Some(Event::Analysis(event))),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err("analysis worker stopped unexpectedly".into()),
+        }
+    }
+
+    pub fn release_session(&mut self) {
+        if let Some(generation) = &mut self.generation {
+            if generation.is_running() {
+                generation.retain = false;
+            } else {
+                self.generation = None;
+            }
         }
     }
 

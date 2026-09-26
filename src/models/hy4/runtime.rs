@@ -685,6 +685,31 @@ impl Hy4RuntimeState {
     }
 }
 
+impl crate::runtime::session::SessionState for Hy4RuntimeState {
+    type Checkpoint = usize;
+
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn checkpoint(&self) -> usize {
+        self.position
+    }
+    fn restore(&mut self, position: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if position > self.position {
+            return Err("cannot restore a future Hy4 position".into());
+        }
+        for state in &mut self.attention {
+            state.entries.truncate(position);
+            state.next_position = position;
+        }
+        self.position = position;
+        Ok(())
+    }
+    fn expert_telemetry(&self) -> &ExpertTelemetry {
+        &self.experts.telemetry
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HcWeights {
     function: WeightMatrix,

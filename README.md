@@ -65,7 +65,7 @@ model weights are included in this repository.
 Building from source requires Rust 1.88 or newer. With rustup, this repository automatically selects Rust 1.88.0
 using `rust-toolchain.toml`, including rustfmt and Clippy.
 
-Version 0.2.1 adds multi-turn TUI chat and live generation metrics; see
+Version 0.2.2 adds automatic KV-cache reuse in TUI conversations and the interactive `urb chat` CLI; see
 [CHANGELOG.md](CHANGELOG.md) for all changes.
 After publication, [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) will
 provide binaries for Linux x86_64 (glibc 2.35+) and Apple Silicon macOS (deployment target 13+,
@@ -158,6 +158,28 @@ oldest complete pairs as needed to fit the runtime context limit and reserve the
 tokens; the runtime log reports the number used/dropped. A current message that cannot fit on
 its own produces an error. History is held only for this UI session.
 
+The TUI automatically keeps one inference child alive between replies, retaining model weights,
+expert caches and KV state. Each turn validates the actual token prefix and prefills only its
+uncached suffix. If the native template removes historical reasoning, it restores the checkpoint
+before that reply and recomputes the changed suffix. Changed/truncated history falls back to a
+fresh sequence. Context capacity is reserved ahead within the RAM budget, including checkpoint
+state; exceeding that capacity reloads the runtime with a new plan. Runtime logs report
+`kv cache: reused=... tokens, prefill=... tokens, capacity=...`.
+
+Use the same resident conversation in the plain CLI:
+
+```bash
+urb chat /path/to/model --ram-gib 32 --allow-large-model --max-new-tokens 512
+```
+
+Enter one message per line (or pipe lines to stdin). `/clear` releases the resident model and
+conversation; `/quit` or EOF exits. In the TUI, `/clear`, successful model changes, RAM/thread/
+thinking setting changes, cancellation, and exit release the session. Clearing during a reply
+releases it when that reply finishes. History and KV remain in process memory only; they are not
+saved to disk. `urb generate` remains a single-request command. Automatic RAM selection in the
+TUI keeps its initial ceiling until reset, so its own resident memory does not lower the next
+turn's budget.
+
 You can also generate with explicit options:
 
 ```text
@@ -181,13 +203,13 @@ Cancellation may leave profile files incomplete. `/clear` also clears runtime lo
 Long streams retain the latest 32 KiB/256 newlines of text and 8 KiB/64 newlines of
 logs with a truncation notice; use the ordinary CLI with redirection to keep full output.
 The transcript retains at most 100 entries within a 512 KiB text budget, evicting older entries.
-Each request starts an independent generation process using the same `urb` executable;
-weights and KV state are rebuilt each turn, using the retained text conversation. No extra runtime is needed.
+The resident child uses the same `urb` executable; no extra runtime is needed.
 
 The ordinary `urb generate` CLI prints a final `metrics:` summary to stderr without requiring
 `--profile`. Add `--progress` for periodic human-readable snapshots, or `--progress-json` for
 structured snapshots prefixed with `URB_PROGRESS ` on stderr (the two flags are mutually exclusive).
-The TUI reads these same structured metrics; stdout remains generated text only.
+The TUI reads these same structured metrics. Public `generate` and `chat` commands keep stdout
+as generated text; the TUI's internal session transport frames text and turn completion as JSON.
 Input count includes the rendered prompt and retained history; total is input plus generated
 token IDs, including EOS. TTFT measures request start to first selected token, including loading
 and prefill; it differs from the profiler's engine-only `generation.time_to_first_token` span.

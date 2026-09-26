@@ -352,6 +352,33 @@ def generation_fixture(path, chat=False):
 def conversation(binary, root):
     model = root / "chat-model"
     generation_fixture(model, chat=True)
+    # The CLI keeps one process and model alive across messages, including /clear.
+    persistent_options = ["--ram-gib", "2", "--allow-large-model", "--max-new-tokens", "16",
+                          "--threads", "1", "--no-thinking"]
+    resident = subprocess.run([binary, "chat", str(model), *persistent_options],
+                              input="first\nfollow-up\n/clear\nnew topic\n/quit\n",
+                              capture_output=True, text=True, timeout=30)
+    assert resident.returncode == 0, resident.stderr
+    assert resident.stdout == "中文🙂\n" * 3, (resident.stdout, resident.stderr)
+    reused = [int(n) for n in re.findall(r"kv cache: reused=(\d+) tokens", resident.stderr)]
+    assert len(reused) == 3 and reused[0] == reused[2] == 0 and reused[1] > 0, resident.stderr
+    assert resident.stderr.count("preflight:") == 2, resident.stderr
+
+    # Both structured requests share a single model load and produce separate completion frames.
+    requests = [
+        {"args": persistent_options, "conversation": {"turns": [], "prompt": "first"}},
+        {"args": persistent_options, "conversation": {"turns": [
+            {"user": "first", "assistant": "中文🙂", "thinking": False}], "prompt": "follow-up"}},
+    ]
+    protocol = subprocess.run([binary, "chat", str(model), "--session-json"],
+                              input="".join(json.dumps(request) + "\n" for request in requests),
+                              capture_output=True, text=True, timeout=30)
+    assert protocol.returncode == 0, protocol.stderr
+    records = [json.loads(line) for line in protocol.stdout.splitlines()]
+    assert [r for r in records if r["event"] == "finished"] == [{"event": "finished", "error": None}] * 2, records
+    assert "".join(r["text"] for r in records if r["event"] == "text") == "中文🙂\n" * 2, records
+    assert protocol.stderr.count("preflight:") == 1, protocol.stderr
+    assert protocol.stderr.count("URB_SESSION_END\n") == 2, protocol.stderr
     options = ["--ram-gib", "2", "--allow-large-model", "--max-new-tokens", "16",
                "--threads", "1", "--no-thinking", "--chat-stdin"]
     chat = {"turns": [{"user": "first", "assistant": "中文🙂", "thinking": False}], "prompt": "follow-up"}
@@ -392,13 +419,24 @@ def conversation(binary, root):
         terminal.expect("Text  中文🙂")
         terminal.expect("history=0 turns")
         terminal.expect("1 turns")
+        resident_children = None
+        if sys.platform == "linux":
+            pid = terminal.status["pid"]
+            children_path = Path(f"/proc/{pid}/task/{pid}/children")
+            resident_children = children_path.read_text().split()
+            assert len(resident_children) == 1, resident_children
         terminal.output.clear()
         terminal.send("继续刚才的回答\r".encode())
         terminal.expect("Generation complete")
         terminal.expect("history=1 turns")
         terminal.expect("2 turns")
+        assert re.search(rb"reused=[1-9]\d*", ANSI.sub(b"", terminal.output)), terminal.output[-3000:]
+        if resident_children is not None:
+            assert children_path.read_text().split() == resident_children
         terminal.send(b"/clear\r")
         terminal.expect("Type a message")
+        if resident_children is not None:
+            assert children_path.read_text().strip() == "", "clear must reap the resident child"
         terminal.output.clear()
         # Force a redraw so presence below proves the model survives clearing scrollback.
         terminal.resize(111, 64)

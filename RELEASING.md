@@ -21,7 +21,7 @@ It does not publish the draft automatically. No crates.io publication is configu
    cargo clippy --locked --all-targets -- -D warnings
    cargo clippy --locked --no-default-features --all-targets -- -D warnings
    python3 -B -m unittest discover -s .github -p 'test_release.py' -v
-   python3 .github/release.py validate --tag v0.2.1
+   python3 .github/release.py validate --tag v0.2.2
    cargo build --release --locked --features ui --bin urb
    python3 tests/tui_smoke.py target/release/urb
    ```
@@ -31,8 +31,8 @@ It does not publish the draft automatically. No crates.io publication is configu
 5. Tag the reviewed commit and push that tag:
 
    ```bash
-   git tag -a v0.2.1 -m "Urbilateria 0.2.1"
-   git push origin v0.2.1
+   git tag -a v0.2.2 -m "Urbilateria 0.2.2"
+   git push origin v0.2.2
    ```
 
 6. Wait for the **Release** workflow and inspect its draft in GitHub Releases. Check the
@@ -47,8 +47,8 @@ replace assets on an already published release. Correct published releases with 
 
 | Archive | Native builder | Runtime baseline |
 | --- | --- | --- |
-| `urb-v0.2.1-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 22.04 | Linux x86_64 with glibc 2.35+ |
-| `urb-v0.2.1-aarch64-apple-darwin.tar.gz` | macOS 15, Apple Silicon | Apple Silicon macOS 13+ |
+| `urb-v0.2.2-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 22.04 | Linux x86_64 with glibc 2.35+ |
+| `urb-v0.2.2-aarch64-apple-darwin.tar.gz` | macOS 15, Apple Silicon | Apple Silicon macOS 13+ |
 
 Archives include `urb` with the default `ui` feature, the MIT license, English/Chinese READMEs,
 the changelog, this release guide, installation instructions, and build information. The
@@ -77,7 +77,7 @@ For a local packaging rehearsal on a supported native host:
 
 ```bash
 cargo build --release --locked --features ui --bin urb
-python3 .github/release.py package --tag v0.2.1 \
+python3 .github/release.py package --tag v0.2.2 \
   --target x86_64-unknown-linux-gnu --binary target/release/urb
 ```
 

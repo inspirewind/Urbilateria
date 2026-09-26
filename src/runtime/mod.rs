@@ -3,6 +3,7 @@
 //! Model implementations and their state types live under `models::<family>::runtime`.
 
 pub(crate) mod cache;
+pub mod session;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLoadOptions {

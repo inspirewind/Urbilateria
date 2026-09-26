@@ -62,7 +62,8 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 从源码构建需要 Rust 1.88 或更新版本。使用 rustup 时，仓库会通过 `rust-toolchain.toml` 自动选择
 Rust 1.88.0，并包含 rustfmt 和 Clippy。
 
-0.2.1 加入 TUI 多轮对话和实时生成统计，完整变更见 [CHANGELOG.md](CHANGELOG.md)。正式发布后，
+0.2.2 加入 TUI 多轮对话自动 KV cache 复用与交互式 `urb chat` CLI，完整变更见
+[CHANGELOG.md](CHANGELOG.md)。正式发布后，
 [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) 将提供 Linux x86_64
 （glibc 2.35+）与 Apple Silicon macOS（部署目标 13+，在 15 上测试）的预编译程序，
 默认包含 UI，运行无需安装 Rust。压缩包内容与校验方法见 [RELEASING.md](RELEASING.md)。
@@ -144,6 +145,24 @@ macOS 需要先设置 RAM 预算；Linux 也可用同一设置限制内存：
 生成前按实际 token 数从最早的完整问答开始裁剪，为本轮输出预留空间；运行日志显示采用和裁剪的轮数。
 若当前问题本身也放不下，则报错并提示缩短问题或减少输出 token 数。历史仅在当前 TUI 会话中保留。
 
+TUI 会自动在轮次之间保留一个推理子进程，复用模型权重、专家缓存和 KV 状态。每轮按实际
+token 前缀校验缓存，只 prefill 未缓存的后缀。若原生模板删除历史思考内容，会回退到该回复
+前的检查点并重算变化的部分；历史裁剪或前缀不匹配时重建序列状态。上下文容量在 RAM 预算内
+提前预留，同时计入循环状态和滑动窗口检查点的内存；超过容量时重新规划并加载。
+运行日志中的 `kv cache: reused=... tokens, prefill=... tokens, capacity=...` 显示复用情况。
+
+普通 CLI 使用常驻对话入口：
+
+```bash
+urb chat /path/to/model --ram-gib 32 --allow-large-model --max-new-tokens 512
+```
+
+每行输入一条消息，也可通过 stdin 管道输入；`/clear` 释放模型和对话，`/quit` 或 EOF 退出。
+TUI 的 `/clear`、成功切换模型、修改 RAM/线程/thinking 设置、取消生成和退出都会释放会话。
+生成过程中 `/clear` 会在当前回复结束时释放资源。历史和 KV 仅保存在进程内存，不写入磁盘；
+单次 `urb generate` 保持原有行为。TUI 自动 RAM 模式会保留首次检测的预算上限，避免把自身
+常驻内存误当作下一轮可用预算下降；重新设置 `--ram-gib auto` 会重新检测。
+
 也可以继续使用显式参数生成：
 
 ```text
@@ -165,12 +184,12 @@ RAM 数值是显式预算，不代表模型一定能放入内存。生成复用 
 `/clear` 也会清除运行日志，后台任务继续，后续输出会重新出现。长输出保留最近的 32 KiB/256 个换行的正文
 和 8 KiB/64 个换行的日志，并显示截断提示；完整输出可用普通 CLI 重定向保存。
 历史结果最多保留 100 条，文本总量上限为 512 KiB，超出会移除较早的结果。
-每次请求都通过同一个 `urb` 可执行文件启动独立生成进程，携带保留的文本对话重新构建上下文，
-暂不复用已加载权重和 KV 状态，无需额外运行时。
+常驻推理子进程使用同一个 `urb` 可执行文件，无需额外运行时。
 
 普通 `urb generate` 无需开启 `--profile`，结束时会向 stderr 输出 `metrics:` 汇总。
 加 `--progress` 可周期输出可读统计；`--progress-json` 输出带 `URB_PROGRESS ` 前缀的结构化统计，
-这两个选项互斥。TUI 读取同一套结构化数据，stdout 始终只输出生成正文。
+这两个选项互斥。TUI 读取同一套结构化指标；公开的 `generate` 和 `chat` 命令的 stdout
+只输出生成正文，TUI 内部的会话协议另用 JSON 封装正文和轮次结束事件。
 输入 token 数包括原生模板和保留的历史；合计为输入加已生成的 token ID 数，EOS 也计入。
 TTFT 从请求开始到选出首 token，包含权重加载和 prefill，与 profiler 中仅统计引擎阶段的
 `generation.time_to_first_token` 不同。解码速率为 `(已生成 token 数 - 1) / (末 token 时间 - 首 token 时间)`，

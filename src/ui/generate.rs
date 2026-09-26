@@ -3,8 +3,8 @@
 
 use super::commands::GenerateOptions;
 use crate::progress::{Snapshot, JSON_PREFIX};
-use std::io::{self, Read, Write};
-use std::path::Path;
+use std::io::{self, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
@@ -28,15 +28,35 @@ pub enum Event {
     Finished(Outcome),
 }
 
+enum Incoming {
+    Event(Event),
+    TextEnd(Outcome),
+    LogEnd,
+}
+
+struct SessionInput {
+    path: PathBuf,
+    threads: Option<String>,
+    send: SyncSender<Vec<u8>>,
+}
+
 pub struct Generation {
     pub id: u64,
     child: Child,
-    output: Receiver<io::Result<Event>>,
+    output: Receiver<io::Result<Incoming>>,
+    session: Option<SessionInput>,
+    running: bool,
+    pub retain: bool,
+    text_end: Option<Outcome>,
+    log_end: bool,
     cancelled: bool,
 }
 
 impl Generation {
     pub fn start(id: u64, path: &Path, options: &GenerateOptions) -> io::Result<Self> {
+        if options.conversation.is_some() {
+            return Self::start_session(id, path, options);
+        }
         let mut command = Command::new(std::env::current_exe()?);
         command
             .arg("generate")
@@ -81,6 +101,11 @@ impl Generation {
             child,
             output,
             cancelled: false,
+            session: None,
+            running: true,
+            retain: false,
+            text_end: None,
+            log_end: false,
         };
         let stdout = generation.child.stdout.take().expect("piped stdout");
         let stderr = generation.child.stderr.take().expect("piped stderr");
@@ -105,6 +130,118 @@ impl Generation {
         Ok(generation)
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    pub fn can_reuse(&mut self, path: &Path, options: &GenerateOptions) -> bool {
+        self.retain
+            && !self.running
+            && self.child.try_wait().ok().flatten().is_none()
+            && options.conversation.is_some()
+            && self.session.as_ref().is_some_and(|session| {
+                session.path == path && session.threads.as_deref() == options.value("--threads")
+            })
+    }
+
+    pub fn submit(&mut self, id: u64, options: &GenerateOptions) -> io::Result<()> {
+        let args = options
+            .args
+            .iter()
+            .map(|arg| {
+                arg.to_str().map(str::to_owned).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "generation arguments must be UTF-8",
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut args = args;
+        args.push("--progress-json".into());
+        let request = crate::chat_session::Request {
+            args,
+            conversation: options
+                .conversation
+                .clone()
+                .ok_or_else(|| io::Error::other("missing conversation"))?,
+        };
+        let mut bytes = serde_json::to_vec(&request)?;
+        bytes.push(b'\n');
+        self.session
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing session"))?
+            .send
+            .try_send(bytes)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.id = id;
+        self.running = true;
+        self.text_end = None;
+        self.log_end = false;
+        Ok(())
+    }
+
+    fn finish_turn(&mut self) -> io::Result<Option<Event>> {
+        if self.log_end {
+            if let Some(outcome) = self.text_end.take() {
+                self.running = false;
+                return Ok(Some(Event::Finished(outcome)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn start_session(id: u64, path: &Path, options: &GenerateOptions) -> io::Result<Self> {
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("chat")
+            .arg(path)
+            .arg("--session-json")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let (send, output) = mpsc::sync_channel(32);
+        let (requests, input) = mpsc::sync_channel::<Vec<u8>>(1);
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut generation = Self {
+            id,
+            child,
+            output,
+            cancelled: false,
+            running: false,
+            retain: true,
+            text_end: None,
+            log_end: false,
+            session: Some(SessionInput {
+                path: path.to_owned(),
+                threads: options.value("--threads").map(str::to_owned),
+                send: requests,
+            }),
+        };
+        let write_send = send.clone();
+        thread::Builder::new()
+            .name("urb-session-input".into())
+            .spawn(move || {
+                while let Ok(bytes) = input.recv() {
+                    if let Err(error) = stdin.write_all(&bytes).and_then(|_| stdin.flush()) {
+                        let _ = write_send.send(Err(error));
+                        break;
+                    }
+                }
+            })?;
+        let text_send = send.clone();
+        thread::Builder::new()
+            .name("urb-session-text".into())
+            .spawn(move || read_session_pipe(stdout, true, text_send))?;
+        thread::Builder::new()
+            .name("urb-session-log".into())
+            .spawn(move || read_session_pipe(stderr, false, send))?;
+        generation.submit(id, options)?;
+        Ok(generation)
+    }
+
     pub fn cancel(&mut self) -> io::Result<()> {
         if !self.cancelled && self.child.try_wait()?.is_none() {
             self.child.kill()?;
@@ -114,8 +251,23 @@ impl Generation {
     }
 
     pub fn poll(&mut self) -> io::Result<Option<Event>> {
+        if !self.running {
+            return Ok(None);
+        }
         match self.output.try_recv() {
-            Ok(Ok(event)) => Ok(Some(event)),
+            Ok(Ok(Incoming::Event(event))) => Ok(Some(event)),
+            Ok(Ok(Incoming::TextEnd(outcome))) => {
+                self.text_end = Some(outcome);
+                self.finish_turn()
+            }
+            Ok(Ok(Incoming::LogEnd)) => {
+                self.log_end = true;
+                self.finish_turn()
+            }
+            Ok(Err(_)) if self.cancelled => {
+                self.running = false;
+                Ok(Some(Event::Finished(Outcome::Cancelled)))
+            }
             Ok(Err(error)) => Err(error),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
@@ -123,7 +275,7 @@ impl Generation {
                 Ok(self.child.try_wait()?.map(|status| {
                     Event::Finished(if self.cancelled {
                         Outcome::Cancelled
-                    } else if status.success() {
+                    } else if status.success() && self.session.is_none() {
                         Outcome::Complete
                     } else {
                         Outcome::Failed(format!(
@@ -147,7 +299,7 @@ impl Drop for Generation {
     }
 }
 
-fn read_pipe(mut pipe: impl Read, stream: Stream, send: SyncSender<io::Result<Event>>) {
+fn read_pipe(mut pipe: impl Read, stream: Stream, send: SyncSender<io::Result<Incoming>>) {
     let mut bytes = [0; 4096];
     let mut decoder = Utf8Stream::default();
     let mut logs = LogLines::default();
@@ -169,13 +321,56 @@ fn read_pipe(mut pipe: impl Read, stream: Stream, send: SyncSender<io::Result<Ev
             vec![]
         };
         for event in events {
-            if send.send(Ok(event)).is_err() {
+            if send.send(Ok(Incoming::Event(event))).is_err() {
                 return;
             }
         }
         if eof {
             return;
         }
+    }
+}
+
+fn read_session_pipe(pipe: impl Read, text: bool, send: SyncSender<io::Result<Incoming>>) {
+    let result = (|| -> io::Result<()> {
+        let mut reader = BufReader::new(pipe);
+        let mut logs = LogLines::default();
+        while let Some(line) =
+            crate::chat_session::read_line(&mut reader, crate::chat::MAX_WIRE_BYTES)?
+        {
+            let events = if text {
+                match serde_json::from_slice::<crate::chat_session::Record>(&line)? {
+                    crate::chat_session::Record::Text { text } => {
+                        vec![Incoming::Event(Event::Output(Stream::Text, text))]
+                    }
+                    crate::chat_session::Record::Finished { error } => {
+                        vec![Incoming::TextEnd(match error {
+                            Some(error) => Outcome::Failed(error),
+                            None => Outcome::Complete,
+                        })]
+                    }
+                }
+            } else if line == format!("{}\n", crate::chat_session::END_MARKER).as_bytes() {
+                vec![Incoming::LogEnd]
+            } else {
+                logs.push(&String::from_utf8_lossy(&line), true)
+                    .into_iter()
+                    .map(Incoming::Event)
+                    .collect()
+            };
+            for event in events {
+                if send.send(Ok(event)).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "resident generation process exited",
+        ))
+    })();
+    if let Err(error) = result {
+        let _ = send.send(Err(error));
     }
 }
 

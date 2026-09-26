@@ -62,6 +62,9 @@ pub fn run_args(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             }
             dirty = true;
         }
+        if std::mem::take(&mut app.release_session) {
+            worker.release_session();
+        }
         if (dirty || app.pending.is_some()) && last_draw.elapsed() >= Duration::from_millis(50) {
             session.terminal.draw(|frame| view::draw(frame, &mut app))?;
             dirty = false;

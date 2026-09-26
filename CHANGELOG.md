@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## [0.2.2]
+
+### Persistent chat sessions
+
+- Add interactive `urb chat` with bounded conversation history, `/clear`, and `/quit`.
+- Keep the TUI inference process, model, and runtime state resident between completed turns.
+- Automatically reuse matching token-prefix KV caches across GLM, Hy4, Qwen3.8, Kimi-K3,
+  DeepSeek-V4, and DeepSeek-V4.1. Report reused tokens, remaining prefill, and context capacity.
+- Restore model-specific checkpoints when chat templates rewrite earlier reasoning or turn
+  boundaries; rebuild sequence state when no saved prefix matches the next prompt.
+- Budget context capacity and checkpoint memory alongside model weights and expert caches.
+  Replan when context grows beyond capacity, and retain the initial automatic RAM ceiling
+  so resident model memory does not shrink the next turn's budget.
+- Release resident sessions on conversation clearing, model or RAM/thread/thinking changes,
+  cancellation, and exit. Keep streamed text and diagnostics synchronized across turns.
+
+### Validation and scope
+
+- Add cached-versus-fresh generation and checkpoint replay checks, plus CLI/TUI terminal tests
+  for multi-turn process reuse and cache cleanup.
+- Caches remain in memory for the current session; they are not persisted across restarts.
+  `urb generate` remains a single-request command.
+- This release does not establish new real-model quality, memory-use, or throughput guarantees.
+
 ## [0.2.1]
 
 ### Interactive generation
@@ -87,6 +111,7 @@
 - Include model adapters, bounded-memory execution, tokenizer and chat-template support,
   runtime validation, profiling, and an interactive profile-trace viewer.
 
+[0.2.2]: https://github.com/inspirewind/Urbilateria/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/inspirewind/Urbilateria/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/inspirewind/Urbilateria/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/inspirewind/Urbilateria/releases/tag/v0.1.0

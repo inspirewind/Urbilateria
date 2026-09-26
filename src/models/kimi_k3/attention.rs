@@ -366,6 +366,23 @@ impl MlaCache {
         &self.latent
     }
 
+    pub(crate) fn truncate(&mut self, tokens: usize) -> Result<(), AttentionError> {
+        if tokens > self.len {
+            return Err(AttentionError::CachePosition {
+                expected: self.len,
+                got: tokens,
+            });
+        }
+        if self.len != 0 {
+            self.latent
+                .truncate(tokens * (self.latent.len() / self.len));
+            self.shared_nope_slots
+                .truncate(tokens * (self.shared_nope_slots.len() / self.len));
+        }
+        self.len = tokens;
+        Ok(())
+    }
+
     pub fn shared_nope_slots(&self) -> &[f32] {
         &self.shared_nope_slots
     }

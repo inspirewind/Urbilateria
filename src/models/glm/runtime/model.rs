@@ -214,6 +214,27 @@ impl RuntimeState {
     }
 }
 
+impl crate::runtime::session::SessionState for RuntimeState {
+    type Checkpoint = usize;
+
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn checkpoint(&self) -> usize {
+        self.position
+    }
+    fn restore(&mut self, position: usize) -> Result<(), Box<dyn std::error::Error>> {
+        for cache in &mut self.layer_caches {
+            cache.truncate(position)?;
+        }
+        self.position = position;
+        Ok(())
+    }
+    fn expert_telemetry(&self) -> &ExpertTelemetry {
+        self.experts.telemetry()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeStep {
     pub logits: Vec<f32>,
@@ -1449,6 +1470,29 @@ mod tests {
         for (&a, &b) in left.iter().zip(right) {
             assert!((a - b).abs() < tolerance, "{a} versus {b}");
         }
+    }
+
+    #[test]
+    fn session_checkpoint_replays_a_different_suffix_with_identical_logits() {
+        use crate::runtime::session::SessionState;
+        let dir = fixture_dir("session_rewind");
+        write_oracle_checkpoint(&dir);
+        let model = RuntimeModel::load(&dir, options(8)).unwrap();
+        let mut state = model.new_state().unwrap();
+        model.forward_token(1, &mut state).unwrap();
+        model.forward_token(2, &mut state).unwrap();
+        let saved = state.checkpoint();
+        for token in [3, 4, 1, 2] {
+            model.forward_token(token, &mut state).unwrap();
+        }
+        state.restore(saved).unwrap();
+        let resumed = model.forward_token(0, &mut state).unwrap().logits;
+        let mut fresh = model.new_state().unwrap();
+        let expected =
+            crate::generation::CausalDecoder::prefill(&model, &[1, 2, 0], &mut fresh).unwrap();
+        assert_eq!(resumed, expected);
+        assert_eq!(state.cached_f32_elements(), fresh.cached_f32_elements());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

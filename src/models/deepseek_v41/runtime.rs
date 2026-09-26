@@ -771,10 +771,32 @@ impl DeepseekV41RuntimeState {
 }
 
 #[derive(Debug)]
-struct StateCheckpoint {
+pub struct StateCheckpoint {
     attention: Vec<AttentionState>,
     sources: HashMap<usize, SourceCheckpoint>,
     engram_hash_len: usize,
+}
+
+impl crate::runtime::session::SessionState for DeepseekV41RuntimeState {
+    type Checkpoint = (usize, StateCheckpoint);
+
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn checkpoint(&self) -> Self::Checkpoint {
+        (self.position, StateCheckpoint::capture(self))
+    }
+    fn restore(
+        &mut self,
+        (position, saved): Self::Checkpoint,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        saved.restore(self)?;
+        self.position = position;
+        Ok(())
+    }
+    fn expert_telemetry(&self) -> &ExpertTelemetry {
+        &self.experts.telemetry
+    }
 }
 
 #[derive(Debug, Clone)]

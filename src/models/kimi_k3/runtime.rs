@@ -697,6 +697,50 @@ impl KimiK3RuntimeState {
     }
 }
 
+pub struct KimiK3SessionCheckpoint {
+    position: usize,
+    recurrent: Vec<(usize, KdaState)>,
+}
+
+impl crate::runtime::session::SessionState for KimiK3RuntimeState {
+    type Checkpoint = KimiK3SessionCheckpoint;
+
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn checkpoint(&self) -> Self::Checkpoint {
+        KimiK3SessionCheckpoint {
+            position: self.position,
+            recurrent: self
+                .attention
+                .iter()
+                .enumerate()
+                .filter_map(|(index, layer)| match layer {
+                    KimiK3LayerState::Kda(value) => Some((index, value.clone())),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+    fn restore(&mut self, checkpoint: Self::Checkpoint) -> Result<(), Box<dyn std::error::Error>> {
+        for layer in &mut self.attention {
+            if let KimiK3LayerState::Mla(cache) = layer {
+                cache.truncate(checkpoint.position)?;
+            }
+        }
+        for (index, value) in checkpoint.recurrent {
+            self.attention[index] = KimiK3LayerState::Kda(value);
+        }
+        self.position = checkpoint.position;
+        self.routes_by_layer.clear();
+        self.poisoned = false;
+        Ok(())
+    }
+    fn expert_telemetry(&self) -> &ExpertTelemetry {
+        self.experts.telemetry()
+    }
+}
+
 struct LayerFolds {
     attention: Vec<f32>,
     mlp: Vec<f32>,

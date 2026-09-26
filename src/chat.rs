@@ -63,6 +63,27 @@ pub enum Input {
     Chat(Conversation),
 }
 
+pub struct EncodedPrompt {
+    pub tokens: Vec<u32>,
+    /// Prefix expected to survive rendering this reply as a historical assistant message.
+    /// Reuse still requires an exact token comparison on the following request.
+    pub checkpoint: usize,
+}
+
+fn common_prefix(left: &[u32], right: &[u32]) -> usize {
+    left.iter().zip(right).take_while(|(a, b)| a == b).count()
+}
+
+fn future_turns(turns: &[Turn], prompt: &str) -> Vec<Turn> {
+    let mut future = turns.to_vec();
+    future.push(Turn {
+        user: prompt.to_owned(),
+        assistant: String::new(),
+        thinking: false,
+    });
+    future
+}
+
 impl Input {
     pub fn text(&self) -> Option<&str> {
         match self {
@@ -71,6 +92,7 @@ impl Input {
         }
     }
 
+    #[cfg(test)]
     pub fn encode_bytes(
         &self,
         tokenizer: &ByteBpeTokenizer,
@@ -80,10 +102,29 @@ impl Input {
         context: usize,
         reserve: usize,
     ) -> Result<Vec<u32>, Box<dyn Error>> {
+        Ok(self
+            .encode_bytes_cached(tokenizer, family, raw, thinking, context, reserve)?
+            .tokens)
+    }
+
+    pub fn encode_bytes_cached(
+        &self,
+        tokenizer: &ByteBpeTokenizer,
+        family: ModelFamily,
+        raw: bool,
+        thinking: bool,
+        context: usize,
+        reserve: usize,
+    ) -> Result<EncodedPrompt, Box<dyn Error>> {
         if raw {
-            return Ok(tokenizer.encode(self.text().ok_or("chat input cannot use --raw-prompt")?)?);
+            return Ok(EncodedPrompt {
+                tokens: tokenizer
+                    .encode(self.text().ok_or("chat input cannot use --raw-prompt")?)?,
+                checkpoint: 0,
+            });
         }
-        self.encode_fitting(context, reserve, |turns, prompt| {
+        let mut checkpoint = 0;
+        let tokens = self.encode_fitting(context, reserve, |turns, prompt| {
             for user in turns.iter().map(|turn| turn.user.as_str()).chain([prompt]) {
                 tokenizer.validate_chat_content(user)?;
             }
@@ -91,26 +132,47 @@ impl Input {
                 let (_, visible) = assistant_parts(family, &turn.assistant, turn.thinking);
                 tokenizer.validate_chat_content(visible)?;
             }
-            Ok(tokenizer.encode(&render_bytes(family, turns, prompt, thinking)?)?)
-        })
+            let tokens = tokenizer.encode(&render_bytes(family, turns, prompt, thinking)?)?;
+            let future = tokenizer.encode(&render_bytes(
+                family,
+                &future_turns(turns, prompt),
+                "",
+                thinking,
+            )?)?;
+            checkpoint = common_prefix(&tokens, &future).min(tokens.len().saturating_sub(1));
+            Ok(tokens)
+        })?;
+        Ok(EncodedPrompt { tokens, checkpoint })
     }
 
-    pub fn encode_kimi(
+    pub fn encode_kimi_cached(
         &self,
         tokenizer: &kimi_k3::tokenizer::KimiK3Tokenizer,
         raw: bool,
         thinking: bool,
         context: usize,
         reserve: usize,
-    ) -> Result<Vec<u32>, Box<dyn Error>> {
+    ) -> Result<EncodedPrompt, Box<dyn Error>> {
         if raw {
-            return Ok(tokenizer.encode_with_special_tokens(
-                self.text().ok_or("chat input cannot use --raw-prompt")?,
-            )?);
+            return Ok(EncodedPrompt {
+                tokens: tokenizer.encode_with_special_tokens(
+                    self.text().ok_or("chat input cannot use --raw-prompt")?,
+                )?,
+                checkpoint: 0,
+            });
         }
-        self.encode_fitting(context, reserve, |turns, prompt| {
-            Ok(tokenizer.encode_chat(&kimi_messages(turns, prompt), kimi_options(thinking))?)
-        })
+        let mut checkpoint = 0;
+        let tokens = self.encode_fitting(context, reserve, |turns, prompt| {
+            let tokens =
+                tokenizer.encode_chat(&kimi_messages(turns, prompt), kimi_options(thinking))?;
+            let future = tokenizer.encode_chat(
+                &kimi_messages(&future_turns(turns, prompt), ""),
+                kimi_options(thinking),
+            )?;
+            checkpoint = common_prefix(&tokens, &future).min(tokens.len().saturating_sub(1));
+            Ok(tokens)
+        })?;
+        Ok(EncodedPrompt { tokens, checkpoint })
     }
 
     fn encode_fitting(

@@ -655,6 +655,51 @@ impl Qwen38RuntimeState {
     }
 }
 
+/// Only recurrent layers need a copy; full-attention KV is rewound in place.
+pub struct Qwen38SessionCheckpoint {
+    position: usize,
+    recurrent: Vec<(usize, DeltaNetState)>,
+}
+
+impl crate::runtime::session::SessionState for Qwen38RuntimeState {
+    type Checkpoint = Qwen38SessionCheckpoint;
+
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn checkpoint(&self) -> Self::Checkpoint {
+        Qwen38SessionCheckpoint {
+            position: self.position,
+            recurrent: self
+                .attention
+                .iter()
+                .enumerate()
+                .filter_map(|(index, layer)| match layer {
+                    Qwen38LayerState::Linear(value) => Some((index, value.clone())),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+    fn restore(&mut self, checkpoint: Self::Checkpoint) -> Result<(), Box<dyn std::error::Error>> {
+        for layer in &mut self.attention {
+            if let Qwen38LayerState::Full(cache) = layer {
+                cache.truncate(checkpoint.position)?;
+            }
+        }
+        for (index, value) in checkpoint.recurrent {
+            self.attention[index] = Qwen38LayerState::Linear(value);
+        }
+        self.position = checkpoint.position;
+        self.routes_by_layer.clear();
+        self.poisoned = false;
+        Ok(())
+    }
+    fn expert_telemetry(&self) -> &ExpertTelemetry {
+        self.experts.telemetry()
+    }
+}
+
 struct LoadedLayer {
     input_norm: Vec<f32>,
     attention: LoadedAttention,

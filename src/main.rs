@@ -15,9 +15,7 @@ use urbilateria::analysis::{
 use urbilateria::execution::{
     configure_threads, enable_streamed_weight_allocation_reuse, worker_threads,
 };
-use urbilateria::generation::{
-    try_generate_with_state, GenerationConfig, GenerationError, StopReason,
-};
+use urbilateria::generation::GenerationConfig;
 use urbilateria::models::deepseek_v4::runtime::DeepseekRuntimeModel;
 use urbilateria::models::deepseek_v4::schema as deepseek_schema;
 use urbilateria::models::deepseek_v41::runtime::DeepseekV41RuntimeModel;
@@ -39,7 +37,9 @@ use urbilateria::{
 };
 
 mod chat;
+mod chat_session;
 mod progress;
+mod session;
 
 #[cfg(feature = "ui")]
 mod ui;
@@ -251,6 +251,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             let remaining: Vec<String> = args.collect();
             run_generate(&model, &remaining)?;
         }
+        "chat" => {
+            let model = required_path(args.next(), "chat requires MODEL_DIR")?;
+            chat_session::run(&model, &args.collect::<Vec<_>>())?;
+        }
         "list" => {
             let model = required_path(args.next(), "list requires MODEL_DIR")?;
             let mut remaining: Vec<String> = args.collect();
@@ -322,6 +326,7 @@ Usage:\n  \
       [--max-new-tokens N] [--threads N] [--profile] [--profile-json PATH]\n    \
       [--profile-trace PATH] [--progress | --progress-json]\n    \
       [--raw-prompt | --no-thinking]\n  \
+  urb chat MODEL_DIR --ram-gib N --allow-large-model [--max-new-tokens N] [--threads N] [--no-thinking]\n  \
   urb explain MODEL_DIR\n\n\
 Commands:\n  \
   ui       Open the interactive checkpoint explorer (requires the ui feature)\n  \
@@ -333,11 +338,14 @@ Commands:\n  \
   tokenize Encode raw text or one model-native text-only user turn with byte-level BPE\n  \
   decode   Decode comma-separated token IDs, preserving special tokens by default\n  \
   generate Run explicitly authorized, RAM-planned greedy generation (experimental)\n  \
+  chat     Keep a resident model and KV cache across messages from stdin\n  \
   explain  Print the model's token path and tensor geometry\n\n\
 `--raw-prompt` accepts an already-rendered model-native prompt, not bare user text.\n\
 For ordinary text omit it; add `--no-thinking` for non-reasoning chat.\n\n\
 --chat-stdin reads JSON with turns (user, assistant, thinking) and the current prompt.\n\
 It renders native multi-turn chat and drops oldest pairs to fit context; incompatible with raw prompts.\n\n\
+`chat` reads one message per line; /clear releases the session, /quit or EOF exits.\n\
+The TUI reuses resident KV automatically; runtime logs show reused and prefilled token counts.\n\n\
 Large matrix output rows run on one persistent CPU pool. `--threads 1` is the serial baseline;\n\
 without `--threads`, the pool uses one worker per available physical core. Profile text goes to\n\
 stderr and profile JSON to the requested file, never to streamed stdout.\n\n\
@@ -448,6 +456,24 @@ fn run_generate_to<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
 ) -> Result<(), Box<dyn Error>> {
+    run_generate_cached(
+        model_dir,
+        args,
+        available_ram_override,
+        output,
+        &mut session::Cache::default(),
+        None,
+    )
+}
+
+fn run_generate_cached<W: Write>(
+    model_dir: &Path,
+    args: &[String],
+    available_ram_override: Option<u64>,
+    output: &mut W,
+    cache: &mut session::Cache,
+    input: Option<chat::Input>,
+) -> Result<(), Box<dyn Error>> {
     let started = std::time::Instant::now();
     let args = GenerateArguments::parse(args)?;
     if args.flag("--progress") && args.flag("--progress-json") {
@@ -486,6 +512,8 @@ fn run_generate_to<W: Write>(
             available_ram_override,
             output,
             &mut progress,
+            cache,
+            input,
         )
     };
     let profile_result = if let Some(profile) = profile {
@@ -540,6 +568,8 @@ fn run_generate_inner<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
     progress: &mut progress::Progress,
+    cache: &mut session::Cache,
+    input: Option<chat::Input>,
 ) -> Result<(), Box<dyn Error>> {
     if !args.flag("--allow-large-model") {
         return Err("generate requires --allow-large-model; no model weights were loaded".into());
@@ -561,7 +591,11 @@ fn run_generate_inner<W: Write>(
         return Err("--no-thinking applies to chat mode and conflicts with --raw-prompt".into());
     }
 
-    let prompt = match (args.value("--prompt"), args.flag("--chat-stdin")) {
+    cache.configure(args.value("--ram-gib").unwrap(), raw_prompt, !no_thinking);
+    let prompt = if let Some(input) = input {
+        input
+    } else {
+        match (args.value("--prompt"), args.flag("--chat-stdin")) {
         (Some(text), false) if !text.is_empty() => chat::Input::Text(text.to_owned()),
         (None, true) if !raw_prompt => {
             if io::stdin().is_terminal() {
@@ -571,6 +605,7 @@ fn run_generate_inner<W: Write>(
         }
         (Some(""), false) => return Err("--prompt must not be empty".into()),
         _ => return Err("generate requires either --prompt TEXT or --chat-stdin; --chat-stdin cannot use --raw-prompt".into()),
+    }
     };
 
     let model_config = {
@@ -595,6 +630,7 @@ fn run_generate_inner<W: Write>(
             available_ram_override,
             output,
             progress,
+            cache,
         );
     }
     if let ModelConfig::Hy4(config) = model_config {
@@ -609,6 +645,7 @@ fn run_generate_inner<W: Write>(
             available_ram_override,
             output,
             progress,
+            cache,
         );
     }
     if let ModelConfig::DeepseekV4(config) = model_config {
@@ -623,6 +660,7 @@ fn run_generate_inner<W: Write>(
             available_ram_override,
             output,
             progress,
+            cache,
         );
     }
     if let ModelConfig::DeepseekV41(config) = model_config {
@@ -637,6 +675,7 @@ fn run_generate_inner<W: Write>(
             available_ram_override,
             output,
             progress,
+            cache,
         );
     }
     if let ModelConfig::KimiK3(config) = model_config {
@@ -651,6 +690,7 @@ fn run_generate_inner<W: Write>(
             available_ram_override,
             output,
             progress,
+            cache,
         );
     }
     let ModelConfig::Glm52(config) = model_config else {
@@ -658,7 +698,7 @@ fn run_generate_inner<W: Write>(
     };
     let prompt_profile = span(ProfileStage::TokenizerPrompt);
     let tokenizer = ByteBpeTokenizer::load(model_dir)?;
-    let prompt_tokens = prompt.encode_bytes(
+    let encoded = prompt.encode_bytes_cached(
         &tokenizer,
         ModelFamily::Glm52,
         raw_prompt,
@@ -670,6 +710,7 @@ fn run_generate_inner<W: Write>(
         },
         max_new_tokens,
     )?;
+    let prompt_tokens = &encoded.tokens;
     progress.prompt(prompt_tokens.len());
     drop(prompt_profile);
     if prompt_tokens.is_empty() {
@@ -720,6 +761,17 @@ fn run_generate_inner<W: Write>(
         .into());
     }
 
+    if let Some(live) = cache.take::<GlmRuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
     let report = analyze_checkpoint(model_dir)?;
     let expected_experts = config
@@ -745,7 +797,18 @@ fn run_generate_inner<W: Write>(
         .or_else(detect_available_ram)
         .map(|available| available.min(requested_ram))
         .unwrap_or(requested_ram);
-    let plan = build_resource_plan(&config, &report, effective_ram, required_context as u64, 4);
+    let (required_context, plan) = session::resource_plan(
+        cache.enabled,
+        required_context,
+        exact_limit,
+        effective_ram,
+        |capacity, ram| {
+            Ok((
+                build_resource_plan(&config, &report, ram, capacity as u64, 4),
+                0,
+            ))
+        },
+    )?;
     drop(preflight_profile);
     if !plan.feasible {
         return Err(format!(
@@ -782,54 +845,15 @@ fn run_generate_inner<W: Write>(
             },
         )?
     };
-    let mut state = {
-        let _profile = span(ProfileStage::StateInit);
-        model.new_state()?
-    };
-    let mut decoder = tokenizer.streaming_decoder(false);
-    let result = try_generate_with_state(
-        &model,
-        &prompt_tokens,
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
         &generation,
-        &mut state,
-        |token| -> Result<(), StreamError> {
-            progress.token();
-            if eos.contains(&token) {
-                return Ok(());
-            }
-            let text = decoder.push(token)?;
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-            Ok(())
-        },
-    );
-    let generated = match result {
-        Ok(generated) => generated,
-        Err(GenerationError::Callback(StreamError::Io(error)))
-            if error.kind() == io::ErrorKind::BrokenPipe =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-    let tail = decoder.finish();
-    output.write_all(tail.as_bytes())?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    let telemetry = state.expert_telemetry();
-    eprintln!(
-        "done: new_tokens={}, stop={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
-        generated.generated_tokens.len(),
-        match generated.stop_reason {
-            StopReason::Eos(token) => format!("eos:{token}"),
-            StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
-        },
-        telemetry.hits,
-        telemetry.misses,
-        telemetry.evictions,
-        telemetry.bytes_read
-    );
-    Ok(())
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 fn validate_native_raw_prompt(family: ModelFamily, prompt: &str) -> Result<(), Box<dyn Error>> {
@@ -863,13 +887,14 @@ fn run_generate_qwen38<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
     progress: &mut progress::Progress,
+    cache: &mut session::Cache,
 ) -> Result<(), Box<dyn Error>> {
     if no_thinking {
         return Err("Qwen3.8 requires thinking; --no-thinking is unsupported".into());
     }
     let prompt_profile = span(ProfileStage::TokenizerPrompt);
     let tokenizer = ByteBpeTokenizer::load(model_dir)?;
-    let prompt_tokens = prompt.encode_bytes(
+    let encoded = prompt.encode_bytes_cached(
         &tokenizer,
         ModelFamily::Qwen38,
         raw_prompt,
@@ -877,6 +902,7 @@ fn run_generate_qwen38<W: Write>(
         config.max_position_embeddings,
         max_new_tokens,
     )?;
+    let prompt_tokens = &encoded.tokens;
     progress.prompt(prompt_tokens.len());
     drop(prompt_profile);
     if prompt_tokens.is_empty() {
@@ -920,6 +946,17 @@ fn run_generate_qwen38<W: Write>(
         .into());
     }
 
+    if let Some(live) = cache.take::<Qwen38RuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
     let effective_ram = available_ram_override
         .or_else(detect_available_ram)
         .map(|available| available.min(requested_ram))
@@ -927,7 +964,22 @@ fn run_generate_qwen38<W: Write>(
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
     // Start with zero retained expert slots, which is the lowest-memory correct execution mode.
     // A later planner can trade memory for throughput without changing forward semantics.
-    let requirements = Qwen38RuntimeModel::inspect_requirements(model_dir, required_context, 0)?;
+    let (required_context, requirements) = session::plan(
+        cache.enabled,
+        required_context,
+        config.max_position_embeddings,
+        |capacity| {
+            let requirements = Qwen38RuntimeModel::inspect_requirements(model_dir, capacity, 0)?;
+            let recurrent = requirements
+                .recurrent_state_bytes
+                .saturating_add(requirements.convolution_state_bytes);
+            let total = requirements
+                .peak_resident_bytes
+                .saturating_add(requirements.kv_cache_bytes)
+                .saturating_add(recurrent.saturating_mul(if cache.enabled { 2 } else { 1 }));
+            Ok((requirements, total <= effective_ram))
+        },
+    )?;
     let state_bytes = requirements
         .kv_cache_bytes
         .checked_add(requirements.recurrent_state_bytes)
@@ -937,6 +989,13 @@ fn run_generate_qwen38<W: Write>(
         .peak_resident_bytes
         .checked_add(state_bytes)
         .ok_or("Qwen3.8 total resident byte count overflows")?;
+    let total_required = total_required.saturating_add(if cache.enabled {
+        requirements
+            .recurrent_state_bytes
+            .saturating_add(requirements.convolution_state_bytes)
+    } else {
+        0
+    });
     if total_required > effective_ram {
         return Err(format!(
             "Qwen3.8 runtime needs at least {} for streamed layer, state, scratch, and one transient expert; effective RAM is {}",
@@ -976,53 +1035,15 @@ fn run_generate_qwen38<W: Write>(
             },
         )?
     };
-    let mut state = {
-        let _profile = span(ProfileStage::StateInit);
-        model.new_state()?
-    };
-    let mut decoder = tokenizer.streaming_decoder(false);
-    let result = try_generate_with_state(
-        &model,
-        &prompt_tokens,
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
         &generation,
-        &mut state,
-        |token| -> Result<(), StreamError> {
-            progress.token();
-            if eos.contains(&token) {
-                return Ok(());
-            }
-            let text = decoder.push(token)?;
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-            Ok(())
-        },
-    );
-    let generated = match result {
-        Ok(generated) => generated,
-        Err(GenerationError::Callback(StreamError::Io(error)))
-            if error.kind() == io::ErrorKind::BrokenPipe =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-    output.write_all(decoder.finish().as_bytes())?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    let telemetry = state.expert_telemetry();
-    eprintln!(
-        "done: new_tokens={}, stop={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
-        generated.generated_tokens.len(),
-        match generated.stop_reason {
-            StopReason::Eos(token) => format!("eos:{token}"),
-            StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
-        },
-        telemetry.hits,
-        telemetry.misses,
-        telemetry.evictions,
-        telemetry.bytes_read
-    );
-    Ok(())
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1037,6 +1058,7 @@ fn run_generate_kimi<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
     progress: &mut progress::Progress,
+    cache: &mut session::Cache,
 ) -> Result<(), Box<dyn Error>> {
     let prompt_profile = span(ProfileStage::TokenizerPrompt);
     let tokenizer = KimiK3Tokenizer::load(model_dir)?;
@@ -1049,13 +1071,14 @@ fn run_generate_kimi<W: Write>(
         )
         .into());
     }
-    let prompt_tokens = prompt.encode_kimi(
+    let encoded = prompt.encode_kimi_cached(
         &tokenizer,
         raw_prompt,
         !no_thinking,
         text.max_position_embeddings,
         max_new_tokens,
     )?;
+    let prompt_tokens = &encoded.tokens;
     progress.prompt(prompt_tokens.len());
     drop(prompt_profile);
     if prompt_tokens.is_empty() {
@@ -1104,14 +1127,40 @@ fn run_generate_kimi<W: Write>(
         .into());
     }
 
+    if let Some(live) = cache.take::<KimiK3RuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
     let effective_ram = available_ram_override
         .or_else(detect_available_ram)
         .map(|available| available.min(requested_ram))
         .unwrap_or(requested_ram);
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
     let report = analyze_checkpoint(model_dir)?;
-    let plan =
-        build_kimi_k3_resource_plan(&config, &report, effective_ram, required_context as u64, 4);
+    let checkpoint_bytes = if cache.enabled {
+        KimiK3RuntimeModel::inspect_requirements(model_dir, required_context, 0)?.kda_state_bytes
+    } else {
+        0
+    };
+    let (required_context, plan) = session::resource_plan(
+        cache.enabled,
+        required_context,
+        text.max_position_embeddings,
+        effective_ram,
+        |capacity, ram| {
+            Ok((
+                build_kimi_k3_resource_plan(&config, &report, ram, capacity as u64, 4),
+                checkpoint_bytes,
+            ))
+        },
+    )?;
     if !plan.feasible {
         return Err(format!(
             "RAM plan is infeasible for {} bytes and {required_context} tokens: {}",
@@ -1186,53 +1235,15 @@ fn run_generate_kimi<W: Write>(
             },
         )?
     };
-    let mut state = {
-        let _profile = span(ProfileStage::StateInit);
-        model.new_state()?
-    };
-    let mut decoder = tokenizer.streaming_decoder(false);
-    let result = try_generate_with_state(
-        &model,
-        &prompt_tokens,
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
         &generation,
-        &mut state,
-        |token| -> Result<(), StreamError> {
-            progress.token();
-            if eos.contains(&token) {
-                return Ok(());
-            }
-            let text = decoder.push(token)?;
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-            Ok(())
-        },
-    );
-    let generated = match result {
-        Ok(generated) => generated,
-        Err(GenerationError::Callback(StreamError::Io(error)))
-            if error.kind() == io::ErrorKind::BrokenPipe =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-    output.write_all(decoder.finish().as_bytes())?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    let telemetry = state.expert_telemetry();
-    eprintln!(
-        "done: new_tokens={}, stop={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
-        generated.generated_tokens.len(),
-        match generated.stop_reason {
-            StopReason::Eos(token) => format!("eos:{token}"),
-            StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
-        },
-        telemetry.hits,
-        telemetry.misses,
-        telemetry.evictions,
-        telemetry.bytes_read
-    );
-    Ok(())
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1247,10 +1258,11 @@ fn run_generate_hy4<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
     progress: &mut progress::Progress,
+    cache: &mut session::Cache,
 ) -> Result<(), Box<dyn Error>> {
     let prompt_profile = span(ProfileStage::TokenizerPrompt);
     let tokenizer = ByteBpeTokenizer::load(model_dir)?;
-    let prompt_tokens = prompt.encode_bytes(
+    let encoded = prompt.encode_bytes_cached(
         &tokenizer,
         ModelFamily::Hy4,
         raw_prompt,
@@ -1258,6 +1270,7 @@ fn run_generate_hy4<W: Write>(
         config.exact_dense_context_ceiling(),
         max_new_tokens,
     )?;
+    let prompt_tokens = &encoded.tokens;
     progress.prompt(prompt_tokens.len());
     drop(prompt_profile);
     if prompt_tokens.is_empty() {
@@ -1297,20 +1310,37 @@ fn run_generate_hy4<W: Write>(
         )
         .into());
     }
+    if let Some(live) = cache.take::<Hy4RuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
     let effective_ram = available_ram_override
         .or_else(detect_available_ram)
         .map(|available| available.min(requested_ram))
         .unwrap_or(requested_ram);
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
     let index = TensorIndex::open(model_dir)?;
-    let requirements = hy4_schema::inspect_requirements(&config, &index, required_context, 0)?;
-    let plan = build_hy4_resource_plan(
-        &config,
-        &requirements,
+    let (required_context, plan) = session::resource_plan(
+        cache.enabled,
+        required_context,
+        config.exact_dense_context_ceiling(),
         effective_ram,
-        required_context as u64,
-        4,
-    );
+        |capacity, ram| {
+            let requirements = hy4_schema::inspect_requirements(&config, &index, capacity, 0)?;
+            Ok((
+                build_hy4_resource_plan(&config, &requirements, ram, capacity as u64, 4),
+                0,
+            ))
+        },
+    )?;
+    let requirements = hy4_schema::inspect_requirements(&config, &index, required_context, 0)?;
     drop(preflight_profile);
     if !plan.feasible {
         return Err(format!(
@@ -1363,53 +1393,15 @@ fn run_generate_hy4<W: Write>(
             },
         )?
     };
-    let mut state = {
-        let _profile = span(ProfileStage::StateInit);
-        model.new_state()?
-    };
-    let mut decoder = tokenizer.streaming_decoder(false);
-    let result = try_generate_with_state(
-        &model,
-        &prompt_tokens,
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
         &generation,
-        &mut state,
-        |token| -> Result<(), StreamError> {
-            progress.token();
-            if eos.contains(&token) {
-                return Ok(());
-            }
-            let text = decoder.push(token)?;
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-            Ok(())
-        },
-    );
-    let generated = match result {
-        Ok(generated) => generated,
-        Err(GenerationError::Callback(StreamError::Io(error)))
-            if error.kind() == io::ErrorKind::BrokenPipe =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-    output.write_all(decoder.finish().as_bytes())?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    let telemetry = state.expert_telemetry();
-    eprintln!(
-        "done: new_tokens={}, stop={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
-        generated.generated_tokens.len(),
-        match generated.stop_reason {
-            StopReason::Eos(token) => format!("eos:{token}"),
-            StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
-        },
-        telemetry.hits,
-        telemetry.misses,
-        telemetry.evictions,
-        telemetry.bytes_read
-    );
-    Ok(())
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1424,10 +1416,11 @@ fn run_generate_deepseek<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
     progress: &mut progress::Progress,
+    cache: &mut session::Cache,
 ) -> Result<(), Box<dyn Error>> {
     let prompt_profile = span(ProfileStage::TokenizerPrompt);
     let tokenizer = ByteBpeTokenizer::load(model_dir)?;
-    let prompt_tokens = prompt.encode_bytes(
+    let encoded = prompt.encode_bytes_cached(
         &tokenizer,
         ModelFamily::DeepseekV4,
         raw_prompt,
@@ -1435,6 +1428,7 @@ fn run_generate_deepseek<W: Write>(
         config.max_position_embeddings,
         max_new_tokens,
     )?;
+    let prompt_tokens = &encoded.tokens;
     progress.prompt(prompt_tokens.len());
     drop(prompt_profile);
     if prompt_tokens.is_empty() {
@@ -1475,6 +1469,17 @@ fn run_generate_deepseek<W: Write>(
         )
         .into());
     }
+    if let Some(live) = cache.take::<DeepseekRuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
     let effective_ram = available_ram_override
         .or_else(detect_available_ram)
         .map(|available| available.min(requested_ram))
@@ -1482,15 +1487,29 @@ fn run_generate_deepseek<W: Write>(
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
     let report = analyze_checkpoint(model_dir)?;
     let index = TensorIndex::open(model_dir)?;
-    let requirements = deepseek_schema::inspect_requirements(&config, &index, required_context, 0)?;
-    let plan = build_deepseek_resource_plan(
-        &config,
-        &report,
-        &requirements,
+    let (required_context, plan) = session::resource_plan(
+        cache.enabled,
+        required_context,
+        config.max_position_embeddings,
         effective_ram,
-        required_context as u64,
-        4,
-    );
+        |capacity, ram| {
+            let requirements = deepseek_schema::inspect_requirements(&config, &index, capacity, 0)?;
+            // This conservative bound includes the ring and compressor checkpoint without copying
+            // the growing compressed history.
+            Ok((
+                build_deepseek_resource_plan(
+                    &config,
+                    &report,
+                    &requirements,
+                    ram,
+                    capacity as u64,
+                    4,
+                ),
+                requirements.kv_cache_bytes,
+            ))
+        },
+    )?;
+    let requirements = deepseek_schema::inspect_requirements(&config, &index, required_context, 0)?;
     drop(preflight_profile);
     if !plan.feasible {
         return Err(format!(
@@ -1535,53 +1554,15 @@ fn run_generate_deepseek<W: Write>(
             },
         )?
     };
-    let mut state = {
-        let _profile = span(ProfileStage::StateInit);
-        model.new_state()?
-    };
-    let mut decoder = tokenizer.streaming_decoder(false);
-    let result = try_generate_with_state(
-        &model,
-        &prompt_tokens,
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
         &generation,
-        &mut state,
-        |token| -> Result<(), StreamError> {
-            progress.token();
-            if eos.contains(&token) {
-                return Ok(());
-            }
-            let text = decoder.push(token)?;
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-            Ok(())
-        },
-    );
-    let generated = match result {
-        Ok(generated) => generated,
-        Err(GenerationError::Callback(StreamError::Io(error)))
-            if error.kind() == io::ErrorKind::BrokenPipe =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-    output.write_all(decoder.finish().as_bytes())?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    let telemetry = state.expert_telemetry();
-    eprintln!(
-        "done: new_tokens={}, stop={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
-        generated.generated_tokens.len(),
-        match generated.stop_reason {
-            StopReason::Eos(token) => format!("eos:{token}"),
-            StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
-        },
-        telemetry.hits,
-        telemetry.misses,
-        telemetry.evictions,
-        telemetry.bytes_read
-    );
-    Ok(())
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1596,11 +1577,12 @@ fn run_generate_deepseek_v41<W: Write>(
     available_ram_override: Option<u64>,
     output: &mut W,
     progress: &mut progress::Progress,
+    cache: &mut session::Cache,
 ) -> Result<(), Box<dyn Error>> {
     let text = &config.text_config;
     let prompt_profile = span(ProfileStage::TokenizerPrompt);
     let tokenizer = ByteBpeTokenizer::load(model_dir)?;
-    let prompt_tokens = prompt.encode_bytes(
+    let encoded = prompt.encode_bytes_cached(
         &tokenizer,
         ModelFamily::DeepseekV41,
         raw_prompt,
@@ -1608,6 +1590,7 @@ fn run_generate_deepseek_v41<W: Write>(
         text.max_position_embeddings,
         max_new_tokens,
     )?;
+    let prompt_tokens = &encoded.tokens;
     progress.prompt(prompt_tokens.len());
     drop(prompt_profile);
     if prompt_tokens.is_empty() {
@@ -1647,20 +1630,49 @@ fn run_generate_deepseek_v41<W: Write>(
         )
         .into());
     }
+    if let Some(live) = cache.take::<DeepseekV41RuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
     let effective_ram = available_ram_override
         .or_else(detect_available_ram)
         .map(|available| available.min(requested_ram))
         .unwrap_or(requested_ram);
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
     let index = TensorIndex::open(model_dir)?;
+    let (required_context, plan) = session::resource_plan(
+        cache.enabled,
+        required_context,
+        text.max_position_embeddings,
+        effective_ram,
+        |capacity, ram| {
+            let requirements =
+                deepseek_v41_schema::inspect_requirements(&config, &index, capacity, 0)?;
+            let compressors = text.kv_source_layer_ids.iter().fold(0u64, |bytes, &layer| {
+                bytes.saturating_add(
+                    (text.compress_ratios[layer] as u64)
+                        .saturating_mul(text.head_dim as u64)
+                        .saturating_mul(8),
+                )
+            });
+            let checkpoint_bytes = requirements
+                .sliding_window_cache_bytes
+                .saturating_add(compressors);
+            Ok((
+                build_deepseek_v41_resource_plan(&config, &requirements, ram, capacity as u64),
+                checkpoint_bytes,
+            ))
+        },
+    )?;
     let zero_cache =
         deepseek_v41_schema::inspect_requirements(&config, &index, required_context, 0)?;
-    let plan = build_deepseek_v41_resource_plan(
-        &config,
-        &zero_cache,
-        effective_ram,
-        required_context as u64,
-    );
     drop(preflight_profile);
     if !plan.feasible {
         return Err(format!(
@@ -1710,54 +1722,15 @@ fn run_generate_deepseek_v41<W: Write>(
             },
         )?
     };
-    let mut state = {
-        let _profile = span(ProfileStage::StateInit);
-        model.new_state()?
-    };
-    let mut decoder = tokenizer.streaming_decoder(false);
-    let result = try_generate_with_state(
-        &model,
-        &prompt_tokens,
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
         &generation,
-        &mut state,
-        |token| -> Result<(), StreamError> {
-            progress.token();
-            if eos.contains(&token) {
-                return Ok(());
-            }
-            let text = decoder.push(token)?;
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-            Ok(())
-        },
-    );
-    let generated = match result {
-        Ok(generated) => generated,
-        Err(GenerationError::Callback(StreamError::Io(error)))
-            if error.kind() == io::ErrorKind::BrokenPipe =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-    output.write_all(decoder.finish().as_bytes())?;
-    output.write_all(b"\n")?;
-    output.flush()?;
-    let telemetry = state.expert_telemetry();
-    eprintln!(
-        "done: new_tokens={}, stop={}, cache={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
-        generated.generated_tokens.len(),
-        match generated.stop_reason {
-            StopReason::Eos(token) => format!("eos:{token}"),
-            StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
-        },
-        human_bytes(state.cache_bytes() as u64),
-        telemetry.hits,
-        telemetry.misses,
-        telemetry.evictions,
-        telemetry.bytes_read
-    );
-    Ok(())
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 fn print_preflight(report: &PreflightReport) {
@@ -2868,6 +2841,118 @@ mod tests {
         let mut output = Vec::new();
         run_generate_to(&dir, &args, Some(2 * 1024 * 1024 * 1024), &mut output).unwrap();
         assert_eq!(output, b"B\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_reasoning_rewrite_preserves_the_saved_token_prefix() {
+        let dir = empty_model_dir();
+        write_tiny_generate_fixture(&dir);
+        let tokenizer = ByteBpeTokenizer::load(&dir).unwrap();
+        for family in [
+            ModelFamily::Glm52,
+            ModelFamily::DeepseekV4,
+            ModelFamily::DeepseekV41,
+            ModelFamily::Hy4,
+            ModelFamily::Qwen38,
+        ] {
+            let first = chat::Input::Chat(chat::Conversation {
+                turns: vec![],
+                prompt: "first question".into(),
+            })
+            .encode_bytes_cached(&tokenizer, family, false, true, 4096, 32)
+            .unwrap();
+            let assistant = if family == ModelFamily::Hy4 {
+                "reasoning</think:opensource｜>answer"
+            } else {
+                "reasoning</think>answer"
+            };
+            let next = chat::Input::Chat(chat::Conversation {
+                turns: vec![chat::Turn {
+                    user: "first question".into(),
+                    assistant: assistant.into(),
+                    thinking: true,
+                }],
+                prompt: "next question".into(),
+            })
+            .encode_bytes_cached(&tokenizer, family, false, true, 4096, 32)
+            .unwrap();
+            assert!(first.checkpoint > 1, "{family:?}");
+            assert!(
+                next.tokens.starts_with(&first.tokens[..first.checkpoint]),
+                "{family:?}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resident_chat_matches_cold_generation_without_reloading_weights() {
+        let dir = empty_model_dir();
+        write_tiny_generate_fixture(&dir);
+        let args = [
+            "--ram-gib",
+            "2",
+            "--allow-large-model",
+            "--max-new-tokens",
+            "3",
+            "--no-thinking",
+        ]
+        .map(str::to_owned);
+        let first = chat::Conversation {
+            turns: vec![],
+            prompt: "A".into(),
+        };
+        let mut cache = session::Cache::resident();
+        let mut output = Vec::new();
+        run_generate_cached(
+            &dir,
+            &args,
+            Some(2 << 30),
+            &mut output,
+            &mut cache,
+            Some(chat::Input::Chat(first)),
+        )
+        .unwrap();
+        let next = chat::Conversation {
+            turns: vec![chat::Turn {
+                user: "A".into(),
+                assistant: String::from_utf8(output)
+                    .unwrap()
+                    .strip_suffix('\n')
+                    .unwrap()
+                    .to_owned(),
+                thinking: false,
+            }],
+            prompt: "B".into(),
+        };
+        let mut cold = Vec::new();
+        run_generate_cached(
+            &dir,
+            &args,
+            Some(2 << 30),
+            &mut cold,
+            &mut session::Cache::default(),
+            Some(chat::Input::Chat(next.clone())),
+        )
+        .unwrap();
+        // The dense fixture has no streamed experts. A warm request must not reopen its weights.
+        fs::rename(
+            dir.join("model.safetensors"),
+            dir.join("unavailable.weights"),
+        )
+        .unwrap();
+        let mut warm = Vec::new();
+        run_generate_cached(
+            &dir,
+            &args,
+            Some(1),
+            &mut warm,
+            &mut cache,
+            Some(chat::Input::Chat(next)),
+        )
+        .unwrap();
+        assert_eq!(warm, cold);
         fs::remove_dir_all(dir).unwrap();
     }
 

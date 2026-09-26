@@ -30,6 +30,7 @@ pub struct Pending {
 }
 
 pub struct App {
+    pub release_session: bool,
     pub editor: TextArea<'static>,
     pub entries: VecDeque<Entry>,
     pub model_path: Option<PathBuf>,
@@ -60,6 +61,7 @@ pub struct App {
 impl App {
     pub fn new(model_path: Option<PathBuf>) -> Self {
         let mut app = Self {
+            release_session: false,
             editor: editor(""),
             entries: VecDeque::new(),
             model_path,
@@ -345,6 +347,10 @@ impl App {
                 }
             }
             Ok(Command::Settings(update)) => {
+                if update.ram_gib.is_some() || update.threads.is_some() || update.thinking.is_some()
+                {
+                    self.release_session = true;
+                }
                 self.settings.update(update);
                 self.push(Entry::message(Kind::Info, "Conversation settings", format!(
                     "{}\nSend plain text to chat. Options: --ram-gib N|auto --max-new-tokens N --threads N|auto --thinking | --no-thinking.",
@@ -358,6 +364,7 @@ impl App {
                 format!("urb {}", env!("CARGO_PKG_VERSION")),
             )),
             Ok(Command::Clear) => {
+                self.release_session = true;
                 self.entries.clear();
                 self.scroll = None;
                 self.conversation.clear();
@@ -508,6 +515,9 @@ impl App {
         match event.result {
             Ok(report) => {
                 let (path, family) = report.identity();
+                if self.model_path.as_deref() != Some(path) {
+                    self.release_session = true;
+                }
                 self.select_model(path.to_owned());
                 if family.is_some() {
                     self.model_family = family.map(|family| family.to_string());

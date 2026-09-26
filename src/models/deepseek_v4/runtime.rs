@@ -862,6 +862,59 @@ impl DeepseekRuntimeState {
     }
 }
 
+/// Ring values and compressor working state are bounded; compressed history stays in place.
+pub struct DeepseekSessionCheckpoint {
+    position: usize,
+    attention: Vec<SessionAttentionCheckpoint>,
+}
+
+struct SessionAttentionCheckpoint {
+    next_position: usize,
+    local: Vec<Option<Vec<f32>>>,
+    compressor: Option<CompressorCheckpoint>,
+    indexer: Option<CompressorCheckpoint>,
+}
+
+impl crate::runtime::session::SessionState for DeepseekRuntimeState {
+    type Checkpoint = DeepseekSessionCheckpoint;
+
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn checkpoint(&self) -> Self::Checkpoint {
+        DeepseekSessionCheckpoint {
+            position: self.position,
+            attention: self
+                .attention
+                .iter()
+                .map(|state| SessionAttentionCheckpoint {
+                    next_position: state.next_position,
+                    local: state.local.clone(),
+                    compressor: state.compressor.as_ref().map(CompressorState::checkpoint),
+                    indexer: state.indexer.as_ref().map(CompressorState::checkpoint),
+                })
+                .collect(),
+        }
+    }
+    fn restore(&mut self, checkpoint: Self::Checkpoint) -> Result<(), Box<dyn std::error::Error>> {
+        for (state, saved) in self.attention.iter_mut().zip(checkpoint.attention) {
+            state.next_position = saved.next_position;
+            state.local = saved.local;
+            if let (Some(state), Some(saved)) = (&mut state.compressor, saved.compressor) {
+                state.restore(saved);
+            }
+            if let (Some(state), Some(saved)) = (&mut state.indexer, saved.indexer) {
+                state.restore(saved);
+            }
+        }
+        self.position = checkpoint.position;
+        Ok(())
+    }
+    fn expert_telemetry(&self) -> &ExpertTelemetry {
+        &self.experts.telemetry
+    }
+}
+
 #[derive(Debug)]
 struct HcVectorWeights {
     base: Arc<[f32]>,
@@ -4592,6 +4645,32 @@ mod tests {
                 .0,
             oracle.expected["argmax"].as_u64().unwrap() as usize
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_checkpoint_restores_overwritten_window_and_preserves_weight_cache() {
+        use crate::runtime::session::SessionState;
+        let oracle = tiny_oracle();
+        let directory = fixture_dir();
+        write_oracle_checkpoint(&directory, &oracle);
+        let mut load_options = options();
+        load_options.context_limit = 16;
+        let model = DeepseekRuntimeModel::load(&directory, load_options).unwrap();
+        let token = oracle.token as u32;
+        let mut state = model.new_state().unwrap();
+        model.prefill_tokens(&[token; 3], &mut state).unwrap();
+        let saved = state.checkpoint();
+        model.prefill_tokens(&[token; 12], &mut state).unwrap();
+        let telemetry = state.expert_telemetry().clone();
+        state.restore(saved).unwrap();
+        assert_eq!(state.position(), 3);
+        assert_eq!(*state.expert_telemetry(), telemetry);
+        let resumed = model.prefill_tokens(&[token; 2], &mut state).unwrap();
+        let mut fresh = model.new_state().unwrap();
+        let expected = model.prefill_tokens(&[token; 5], &mut fresh).unwrap();
+        assert_eq!(resumed.logits, expected.logits);
+        assert_eq!(state.cached_f32_elements(), fresh.cached_f32_elements());
         fs::remove_dir_all(directory).unwrap();
     }
 

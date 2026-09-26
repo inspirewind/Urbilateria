@@ -6,6 +6,7 @@ use urbilateria::analysis::detect_available_ram;
 pub const HISTORY_BYTES: usize = 512 * 1024;
 
 pub struct ChatSettings {
+    detected_ram: Option<String>,
     pub ram_gib: Option<String>,
     pub max_new_tokens: usize,
     pub threads: Option<usize>,
@@ -15,6 +16,7 @@ pub struct ChatSettings {
 impl Default for ChatSettings {
     fn default() -> Self {
         Self {
+            detected_ram: None,
             ram_gib: None,
             max_new_tokens: 512,
             threads: None,
@@ -27,6 +29,7 @@ impl ChatSettings {
     pub fn update(&mut self, update: SettingsUpdate) {
         if let Some(ram) = update.ram_gib {
             self.ram_gib = ram;
+            self.detected_ram = None;
         }
         if let Some(threads) = update.threads {
             self.threads = threads;
@@ -53,11 +56,14 @@ impl ChatSettings {
         }
     }
 
-    pub fn generation(&self, prompt: &str) -> Result<GenerateOptions, String> {
-        let ram = self.ram_gib.clone().or_else(|| {
+    pub fn generation(&mut self, prompt: &str) -> Result<GenerateOptions, String> {
+        let ram = self.ram_gib.clone().or_else(|| self.detected_ram.clone()).or_else(|| {
             detect_available_ram().filter(|bytes| *bytes > 0)
                 .map(|bytes| (bytes as f64 / 1_073_741_824.0).to_string())
         }).ok_or("Cannot detect available RAM. Set /settings --ram-gib N once, then send your message again.")?;
+        if self.ram_gib.is_none() {
+            self.detected_ram = Some(ram.clone());
+        }
         let mut args = vec![
             "--prompt".into(),
             prompt.into(),
