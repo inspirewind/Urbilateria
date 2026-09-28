@@ -110,16 +110,76 @@ fn real_decode_matches_transformers() {
 #[ignore = "reads native checkpoint; verifies hybrid recurrent/GQA prefill and decode agree"]
 fn real_prefill_matches_incremental_decode() {
     let model = model(3);
+    assert_eq!(model.default_prefill_batch_size(), 32);
     let tokens = [9419, 11, 0];
     let mut incremental = model.new_state().unwrap();
     let mut last = Vec::new();
     for token in tokens {
         last = model.forward_token(token, &mut incremental).unwrap().logits;
     }
-    let mut batched = model.new_state().unwrap();
-    let actual = model.prefill_tokens(&tokens, &mut batched).unwrap();
-    assert_eq!(actual.logits, last);
-    assert_eq!(batched.position(), 3);
+    for batch in [1, 2, 32, Qwen36RuntimeModel::MAX_PREFILL_BATCH] {
+        let mut batched = model.new_state().unwrap();
+        for invalid in [0, Qwen36RuntimeModel::MAX_PREFILL_BATCH + 1] {
+            assert!(model
+                .prefill_tokens_with_batch_size(&tokens, &mut batched, invalid)
+                .is_err());
+            assert_eq!(batched.position(), 0);
+        }
+        let actual = model
+            .prefill_tokens_with_batch_size(&tokens, &mut batched, batch)
+            .unwrap();
+        assert_eq!(actual.logits, last);
+        assert_eq!(batched.position(), 3);
+    }
+}
+
+#[test]
+#[ignore = "requires native weights; verifies all prefill chunk boundaries, continuation and rewind"]
+fn batched_prefill_crosses_boundary_and_preserves_continuation() {
+    use urbilateria::runtime::session::SessionState;
+    let maximum = Qwen36RuntimeModel::MAX_PREFILL_BATCH;
+    let r = Qwen36RuntimeModel::inspect_requirements(directory(), maximum + 8, 0).unwrap();
+    let options = r.plan_load_options(90 << 30, true).unwrap();
+    let model = Qwen36RuntimeModel::load(directory(), options).unwrap();
+    assert_eq!(model.default_prefill_batch_size(), maximum);
+    let mut state = model.new_state().unwrap();
+    model.forward_token(9419, &mut state).unwrap();
+    let checkpoint = state.checkpoint();
+    let tokens: Vec<u32> = [11, 9419, 0, 271, 32]
+        .into_iter()
+        .cycle()
+        .take(maximum + 1)
+        .collect();
+    let mut expected = None;
+    for &token in &tokens {
+        expected = Some(model.forward_token(token, &mut state).unwrap());
+    }
+    let continuation = [32, 2972].map(|token| model.forward_token(token, &mut state).unwrap());
+    let misses = state.expert_telemetry().misses;
+    state.restore(checkpoint).unwrap();
+    let expected = expected.unwrap();
+    for batch in [32, 64, maximum] {
+        let checkpoint = state.checkpoint();
+        let hits = state.expert_telemetry().hits;
+        let actual = if batch == maximum {
+            model.prefill_tokens(&tokens, &mut state).unwrap()
+        } else {
+            model
+                .prefill_tokens_with_batch_size(&tokens, &mut state, batch)
+                .unwrap()
+        };
+        assert_eq!(actual, expected, "batch={batch}");
+        assert_eq!(state.position(), maximum + 2);
+        for (token, expected) in [32, 2972].into_iter().zip(&continuation) {
+            assert_eq!(&model.forward_token(token, &mut state).unwrap(), expected);
+        }
+        assert_eq!(state.expert_telemetry().misses, misses);
+        assert_eq!(
+            state.expert_telemetry().hits - hits,
+            (tokens.len() as u64 + 2) * 40 * 8
+        );
+        state.restore(checkpoint).unwrap();
+    }
 }
 
 #[test]
@@ -136,5 +196,109 @@ fn real_tokenizer_matches_official_prompt_fixtures() {
                 .unwrap(),
             expected
         );
+    }
+}
+
+#[test]
+#[ignore = "requires native weights; verifies resident layers/LM head/expert cache preserve every logit and route"]
+fn resident_weights_match_streamed_and_survive_rewind() {
+    use urbilateria::runtime::session::SessionState;
+    let streamed = model(4);
+    let r = streamed.requirements();
+    let mut options = r.plan_load_options(8 * 1024 * 1024 * 1024, true).unwrap();
+    // Retain at least all experts touched by these three tokens without allocating all 35B weights.
+    options.expert_slots_per_layer = 24;
+    options.expert_cache_budget_bytes = r.expert_bytes * 40 * 24;
+    options.resident_budget_bytes = r.peak_resident_bytes
+        + options.expert_cache_budget_bytes
+        + r.lm_head_resident_bytes
+        + r.layer_resident_bytes.iter().sum::<u64>();
+    let resident = Qwen36RuntimeModel::load(directory(), options).unwrap();
+    assert_eq!(resident.default_prefill_batch_size(), 32);
+    let mut reference = streamed.new_state().unwrap();
+    let mut cached = resident.new_state().unwrap();
+    let start = cached.checkpoint();
+    let mut expected = Vec::new();
+    for token in [9419, 11, 271] {
+        let a = streamed
+            .forward_token_traced(token, &mut reference)
+            .unwrap();
+        let b = resident.forward_token_traced(token, &mut cached).unwrap();
+        assert_eq!(a, b);
+        expected.push(a.step);
+    }
+    let before = cached.expert_telemetry().clone();
+    cached.restore(start).unwrap();
+    for (token, expected) in [9419, 11, 271].into_iter().zip(expected) {
+        assert_eq!(
+            resident.forward_token(token, &mut cached).unwrap(),
+            expected
+        );
+    }
+    assert_eq!(cached.expert_telemetry().misses, before.misses);
+    assert_eq!(cached.expert_telemetry().bytes_read, before.bytes_read);
+    assert_eq!(cached.expert_telemetry().hits - before.hits, 3 * 40 * 8);
+}
+
+#[test]
+#[ignore = "requires checkpoint metadata; checks automatic RAM planning boundaries"]
+fn memory_plan_reserves_state_and_bounds_all_caches() {
+    let r = Qwen36RuntimeModel::inspect_requirements(directory(), 128, 0).unwrap();
+    let state = r.kv_cache_bytes + r.recurrent_state_bytes + r.convolution_state_bytes;
+    let snapshot = r.recurrent_state_bytes + r.convolution_state_bytes;
+    let minimum = r.peak_resident_bytes + state + snapshot;
+    assert!(r.plan_load_options(minimum - 1, true).is_err());
+    let tiny = r.plan_load_options(minimum, true).unwrap();
+    assert_eq!(tiny.expert_slots_per_layer, 0);
+    assert_eq!(r.backbone_residency(tiny.resident_budget_bytes), (0, false));
+    for ram in [minimum, 2 << 30, 4 << 30, 8 << 30, 32 << 30, 90 << 30] {
+        let p = r.plan_load_options(ram, true).unwrap();
+        assert!(p.resident_budget_bytes + state + snapshot <= ram);
+        assert_eq!(
+            p.expert_cache_budget_bytes,
+            p.expert_slots_per_layer as u64 * 40 * r.expert_bytes
+        );
+        assert!(p.expert_slots_per_layer <= 256);
+    }
+    let full = r.plan_load_options(90 << 30, true).unwrap();
+    assert_eq!(full.expert_slots_per_layer, 256);
+    assert_eq!(
+        r.backbone_residency(full.resident_budget_bytes - full.expert_cache_budget_bytes),
+        (40, true)
+    );
+}
+
+#[test]
+#[ignore = "requires native weights; checks a two-layer resident prefix and synchronous streaming tail"]
+fn partial_backbone_cache_preserves_logits_and_load_counts() {
+    use urbilateria::profiling::ProfileSession;
+    let streamed = model(2);
+    let r = streamed.requirements();
+    let causal_bytes = r.kv_cache_bytes + r.recurrent_state_bytes + r.convolution_state_bytes;
+    let ram = r.peak_resident_bytes
+        + causal_bytes
+        + r.lm_head_resident_bytes
+        + r.layer_resident_bytes[..2].iter().sum::<u64>();
+    let options = r.plan_load_options(ram, false).unwrap();
+    assert_eq!(options.expert_slots_per_layer, 0);
+    assert_eq!(
+        r.backbone_residency(options.resident_budget_bytes),
+        (2, true)
+    );
+    let partial = Qwen36RuntimeModel::load(directory(), options).unwrap();
+    let mut reference = streamed.new_state().unwrap();
+    let mut state = partial.new_state().unwrap();
+    for (step, token) in [9419, 11].into_iter().enumerate() {
+        let expected = streamed.forward_token(token, &mut reference).unwrap();
+        let profile = ProfileSession::start();
+        let actual = partial.forward_token(token, &mut state).unwrap();
+        let report = profile.finish();
+        assert_eq!(actual, expected);
+        let loads = report
+            .stages
+            .iter()
+            .find(|s| s.stage == "qwen36.layer.load")
+            .unwrap();
+        assert_eq!(loads.calls, if step == 0 { 40 } else { 38 });
     }
 }

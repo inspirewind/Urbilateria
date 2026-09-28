@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- Use 128-token Qwen3.6 prefill chunks when all routed experts fit in the planned
+  cache, retaining 32-token defaults for partial caches and the same scratch budget.
+- Extend prefill parity checks through 128-token boundaries, singleton tails,
+  checkpoint replay, and continued decoding; make profiler defaults follow the RAM plan.
+- Vectorize Qwen BF16 activation rounding with AVX2 while preserving ties-to-even,
+  finite-overflow rejection, the first failing element, and partial-write behavior.
+- Enter the CPU pool once per Qwen3.6 forward or prefill, including the LM head,
+  reducing repeated caller-to-pool dispatch while preserving profiling context,
+  single-worker execution, and deterministic results.
+- Overlap Qwen3.6 current-layer computation with one retained next-layer load on
+  the existing CPU pool; preserve streaming budgets and wait for both jobs on errors.
+- Reuse one DeltaNet transaction workspace across Qwen3.6 prefill layers and copy
+  recurrent state once per chunk, preserving numerical order and output-failure rollback.
+- Use Qwen3.6 RAM budgets for persistent decoder layers, LM head, and lazy routed-expert
+  caches, preserving the minimum-memory streaming fallback and session rewind behavior.
+- Vectorize BF16 payload validation, interleave four BF16 matrix rows without
+  reassociation, and traverse DeltaNet state contiguously with ordered reductions.
+- Reuse normalized DeltaNet keys/queries across value heads, remove per-head heap
+  scratch for native shapes, and parallelize independent head updates with ordered
+  AVX2 F64 projections while preserving state on errors.
+- Load and compute selected Qwen3.6 experts concurrently when the cache can retain
+  the complete set within budget; preserve deterministic BF16 accumulation.
+- Add numerical parity gates, cache-rewind checks, and a real-model CPU profiler.
+- Batch Qwen3.6 attention projections in bounded 32-token prefill chunks with
+  shared BF16 weight loads and unchanged per-token accumulation and causal order.
+- Cover batch tails, continuation across chunk boundaries, and rollback after
+  attention output-projection failures.
+- Group prefill tokens by routed expert when the full selection fits the RAM budget;
+  batch shared-expert projections while preserving BF16 rounding, cache counters,
+  and subsequent LRU eviction order. Keep the tokenwise fallback for smaller caches.
+- Add configurable same-process prefill crossover runs and separate prefill/decode
+  profiling totals without restarting resource sampling.
+- Vectorize DeltaNet finite-value validation without changing NaN/infinity rejection.
+- Compute shared and retained routed experts concurrently during Qwen3.6 decode,
+  keeping the shared contribution last and preserving the streaming fallback.
+- Traverse GQA values contiguously with ordered AVX2 F64 reductions and scalar tails;
+  preserve token-order sums and use stack scratch for native head widths.
+- Allow a UTF-8 prompt file in the Qwen3.6 profiler for longer-context comparisons.
+- Parallelize independent GQA heads above a 256K work threshold, preserving
+  per-head reductions, error order, and KV rollback while retaining the serial fallback.
+
 - Add experimental Qwen3.6-35B-A3B native BF16 text inference, with strict nested
   configuration and complete 26-shard/1,045-tensor validation.
 - Stream selected experts from packed gate/up/down tensors; reuse hybrid Qwen

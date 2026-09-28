@@ -103,6 +103,15 @@ pub enum ProfileStage {
     DeepseekExpertCompute,
     DeepseekFinalization,
     DeepseekLmHead,
+    QwenDeltaInputProjection,
+    QwenDeltaStateUpdate,
+    QwenDeltaOutputProjection,
+    Qwen36LayerLoad,
+    Qwen36Attention,
+    Qwen36Moe,
+    Qwen36ExpertLoad,
+    Qwen36ExpertCompute,
+    Qwen36LmHead,
     Hy4LayerLoad,
     Hy4Layer,
     Hy4Attention,
@@ -157,6 +166,15 @@ const ALL_STAGES: &[ProfileStage] = &[
     ProfileStage::DeepseekExpertCompute,
     ProfileStage::DeepseekFinalization,
     ProfileStage::DeepseekLmHead,
+    ProfileStage::QwenDeltaInputProjection,
+    ProfileStage::QwenDeltaStateUpdate,
+    ProfileStage::QwenDeltaOutputProjection,
+    ProfileStage::Qwen36LayerLoad,
+    ProfileStage::Qwen36Attention,
+    ProfileStage::Qwen36Moe,
+    ProfileStage::Qwen36ExpertLoad,
+    ProfileStage::Qwen36ExpertCompute,
+    ProfileStage::Qwen36LmHead,
     ProfileStage::Hy4LayerLoad,
     ProfileStage::Hy4Layer,
     ProfileStage::Hy4Attention,
@@ -213,6 +231,15 @@ impl ProfileStage {
             Self::DeepseekExpertCompute => "deepseek.expert.compute",
             Self::DeepseekFinalization => "deepseek.finalization",
             Self::DeepseekLmHead => "deepseek.lm_head",
+            Self::QwenDeltaInputProjection => "qwen.delta.input_projection",
+            Self::QwenDeltaStateUpdate => "qwen.delta.state_update",
+            Self::QwenDeltaOutputProjection => "qwen.delta.output_projection",
+            Self::Qwen36LayerLoad => "qwen36.layer.load",
+            Self::Qwen36Attention => "qwen36.attention",
+            Self::Qwen36Moe => "qwen36.moe",
+            Self::Qwen36ExpertLoad => "qwen36.expert.load",
+            Self::Qwen36ExpertCompute => "qwen36.expert.compute",
+            Self::Qwen36LmHead => "qwen36.lm_head",
             Self::Hy4LayerLoad => "hy4.layer.load",
             Self::Hy4Layer => "hy4.layer",
             Self::Hy4Attention => "hy4.attention",
@@ -424,6 +451,12 @@ impl ProfileSession {
             resources: resources::ResourceMonitor::start(),
             _not_send: PhantomData,
         }
+    }
+
+    /// Copies cumulative counters for completed spans without stopping the session or
+    /// resource monitor. Useful for measuring adjacent phases without a sampler restart.
+    pub fn stage_snapshot(&self) -> Vec<ProfileEntry> {
+        self.collector.stage_entries()
     }
 
     pub fn finish(mut self) -> ProfileReport {
@@ -645,11 +678,23 @@ impl Collector {
         resources: Option<SystemResourceReport>,
     ) -> ProfileReport {
         self.close();
+        ProfileReport {
+            schema_version: 2,
+            wall_time_ns: duration_ns(wall_time),
+            requested_threads,
+            worker_threads: crate::execution::initialized_worker_threads(),
+            resources,
+            stages: self.stage_entries(),
+            trace: self.trace.as_ref().map(trace::TraceRecorder::snapshot),
+        }
+    }
+
+    fn stage_entries(&self) -> Vec<ProfileEntry> {
         let stages = self
             .stages
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let entries = ALL_STAGES
+        ALL_STAGES
             .iter()
             .filter_map(|&stage| {
                 stages.get(&stage).map(|aggregate| ProfileEntry {
@@ -662,16 +707,7 @@ impl Collector {
                     logical_bytes: aggregate.logical_bytes,
                 })
             })
-            .collect();
-        ProfileReport {
-            schema_version: 2,
-            wall_time_ns: duration_ns(wall_time),
-            requested_threads,
-            worker_threads: crate::execution::initialized_worker_threads(),
-            resources,
-            stages: entries,
-            trace: self.trace.as_ref().map(trace::TraceRecorder::snapshot),
-        }
+            .collect()
     }
 
     fn close(&self) {
@@ -704,6 +740,27 @@ fn bytes_to_mib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_snapshots_keep_collecting_and_include_only_completed_spans() {
+        let session = ProfileSession::start();
+        let outer = span(ProfileStage::Prefill);
+        drop(span_with_metrics(ProfileStage::MatvecF32, 128, 32));
+        let first = session.stage_snapshot();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].calls, 1);
+        assert_eq!(first[0].work_items, 128);
+        drop(span_with_metrics(ProfileStage::MatvecF32, 256, 64));
+        let second = session.stage_snapshot();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].calls, 2);
+        assert_eq!(second[0].work_items, 384);
+        assert_eq!(second[0].logical_bytes, 96);
+        drop(outer);
+        let report = session.finish();
+        assert_eq!(report.stage(ProfileStage::Prefill).unwrap().calls, 1);
+        assert_eq!(report.stage(ProfileStage::MatvecF32).unwrap(), &second[0]);
+    }
 
     #[test]
     fn aggregates_calls_work_and_nested_stages() {

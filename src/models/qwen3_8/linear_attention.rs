@@ -1,6 +1,9 @@
-use super::math::{linear, round_to_bf16, round_to_bf16_in_place, uses_bf16_output};
+use super::math::{linear, linear_batch, round_to_bf16, round_to_bf16_in_place, uses_bf16_output};
 use super::norm::{gated_rms_norm, gated_rms_norm_bf16, NormError};
+use crate::execution::{install, should_parallelize};
 use crate::model::{DenseMatrix, WeightError, WeightMatrix};
+use crate::profiling::{span, ProfileStage};
+use rayon::prelude::*;
 use std::fmt;
 
 const QK_L2_EPSILON: f32 = 1e-6;
@@ -146,6 +149,27 @@ pub struct DeltaNetState {
     tokens: usize,
 }
 
+/// One transactional working state, reusable across sequential layers of the same geometry.
+/// It is execution scratch, so session checkpoints need only copy the committed causal state.
+#[derive(Debug, Default)]
+pub(crate) struct DeltaNetWorkspace {
+    state: Option<DeltaNetState>,
+}
+
+impl DeltaNetWorkspace {
+    fn prepare(&mut self, source: &DeltaNetState) -> &mut DeltaNetState {
+        match self.state.as_mut() {
+            Some(state) if state.geometry == source.geometry => {
+                state.conv.clone_from(&source.conv);
+                state.recurrent.clone_from(&source.recurrent);
+                state.tokens = source.tokens;
+            }
+            _ => self.state = Some(source.clone()),
+        }
+        self.state.as_mut().expect("workspace was initialized")
+    }
+}
+
 impl DeltaNetState {
     pub fn new(geometry: DeltaNetGeometry) -> Result<Self, DeltaNetError> {
         geometry.validate()?;
@@ -208,7 +232,7 @@ impl DeltaNetState {
     }
 }
 
-/// Scalar, one-token Qwen3.8 Gated DeltaNet reference.
+/// One-token Qwen Gated DeltaNet with ordered recurrent reductions.
 #[derive(Debug, Clone)]
 pub struct GatedDeltaNet {
     geometry: DeltaNetGeometry,
@@ -348,6 +372,15 @@ impl GatedDeltaNet {
         input: &[f32],
         state: &mut DeltaNetState,
     ) -> Result<Vec<f32>, DeltaNetError> {
+        self.forward_token_with_workspace(input, state, &mut DeltaNetWorkspace::default())
+    }
+
+    pub(crate) fn forward_token_with_workspace(
+        &self,
+        input: &[f32],
+        state: &mut DeltaNetState,
+        workspace: &mut DeltaNetWorkspace,
+    ) -> Result<Vec<f32>, DeltaNetError> {
         if state.geometry != self.geometry {
             return Err(DeltaNetError::StateGeometry {
                 expected: self.geometry,
@@ -355,30 +388,126 @@ impl GatedDeltaNet {
             });
         }
         expect_input(input, self.geometry.hidden_size)?;
-        let next_tokens = state
+        state
             .tokens
             .checked_add(1)
             .ok_or(DeltaNetError::StateLengthOverflow)?;
 
+        let projection_profile = span(ProfileStage::QwenDeltaInputProjection);
         let mixed_qkv = linear(&self.in_proj_qkv, input)?;
         let z = linear(&self.in_proj_z, input)?;
         let b = linear(&self.in_proj_b, input)?;
         let a = linear(&self.in_proj_a, input)?;
-        ensure_finite("QKV projection", &mixed_qkv)?;
-        ensure_finite("z projection", &z)?;
-        ensure_finite("beta projection", &b)?;
-        ensure_finite("decay projection", &a)?;
+        drop(projection_profile);
+        let state_profile = span(ProfileStage::QwenDeltaStateUpdate);
+        let next_state = workspace.prepare(state);
+        let gated_output = self.recurrent_step(&mixed_qkv, &z, &b, &a, next_state)?;
+        drop(state_profile);
+        let _output_profile = span(ProfileStage::QwenDeltaOutputProjection);
+        let output = linear(&self.out_proj, &gated_output)?;
+        ensure_finite("output projection", &output)?;
+        std::mem::swap(state, next_state);
+        Ok(output)
+    }
+
+    /// Prefills consecutive tokens with shared projection weights and ordered recurrence.
+    /// The caller bounds the batch; neither state component changes if any token fails.
+    pub fn forward_tokens(
+        &self,
+        input: &[f32],
+        batch: usize,
+        state: &mut DeltaNetState,
+    ) -> Result<Vec<f32>, DeltaNetError> {
+        self.forward_tokens_with_workspace(input, batch, state, &mut DeltaNetWorkspace::default())
+    }
+
+    pub(crate) fn forward_tokens_with_workspace(
+        &self,
+        input: &[f32],
+        batch: usize,
+        state: &mut DeltaNetState,
+        workspace: &mut DeltaNetWorkspace,
+    ) -> Result<Vec<f32>, DeltaNetError> {
+        if batch == 1 {
+            return self.forward_token_with_workspace(input, state, workspace);
+        }
+        if batch == 0 {
+            return Err(DeltaNetError::InvalidShape(
+                "prefill batch must be non-zero".into(),
+            ));
+        }
+        if state.geometry != self.geometry {
+            return Err(DeltaNetError::StateGeometry {
+                expected: self.geometry,
+                got: state.geometry,
+            });
+        }
+        let length = batch
+            .checked_mul(self.geometry.hidden_size)
+            .ok_or_else(|| DeltaNetError::InvalidShape("prefill input length overflows".into()))?;
+        expect_input(input, length)?;
+        state
+            .tokens
+            .checked_add(batch)
+            .ok_or(DeltaNetError::StateLengthOverflow)?;
+        let projection_profile = span(ProfileStage::QwenDeltaInputProjection);
+        let qkv = linear_batch(&self.in_proj_qkv, input, batch)?;
+        let z = linear_batch(&self.in_proj_z, input, batch)?;
+        let b = linear_batch(&self.in_proj_b, input, batch)?;
+        let a = linear_batch(&self.in_proj_a, input, batch)?;
+        drop(projection_profile);
+        let conv_width = self.geometry.conv_width()?;
+        let value_width = self.geometry.value_width()?;
+        let heads = self.geometry.num_value_heads;
+        let state_profile = span(ProfileStage::QwenDeltaStateUpdate);
+        let next_state = workspace.prepare(state);
+        let mut gated = Vec::with_capacity(batch * value_width);
+        for token in 0..batch {
+            let output = self.recurrent_step(
+                &qkv[token * conv_width..(token + 1) * conv_width],
+                &z[token * value_width..(token + 1) * value_width],
+                &b[token * heads..(token + 1) * heads],
+                &a[token * heads..(token + 1) * heads],
+                next_state,
+            )?;
+            gated.extend(output);
+        }
+        drop(state_profile);
+        let _output_profile = span(ProfileStage::QwenDeltaOutputProjection);
+        let output = linear_batch(&self.out_proj, &gated, batch)?;
+        ensure_finite("output projection", &output)?;
+        std::mem::swap(state, next_state);
+        Ok(output)
+    }
+
+    // Mutates only a private transaction workspace. Callers publish it after the complete
+    // token/batch output projection succeeds, so a partial update may be discarded on error.
+    #[inline(always)]
+    fn recurrent_step(
+        &self,
+        mixed_qkv: &[f32],
+        z: &[f32],
+        b: &[f32],
+        a: &[f32],
+        state: &mut DeltaNetState,
+    ) -> Result<Vec<f32>, DeltaNetError> {
+        let next_tokens = state
+            .tokens
+            .checked_add(1)
+            .ok_or(DeltaNetError::StateLengthOverflow)?;
+        ensure_finite("QKV projection", mixed_qkv)?;
+        ensure_finite("z projection", z)?;
+        ensure_finite("beta projection", b)?;
+        ensure_finite("decay projection", a)?;
 
         let conv_width = self.geometry.conv_width()?;
         let kernel = self.geometry.conv_kernel_size;
-        let mut next_conv = vec![0.0; state.conv.len()];
         let mut convolved = vec![0.0; conv_width];
         for channel in 0..conv_width {
             let start = channel * kernel;
-            let old = &state.conv[start..start + kernel];
-            let new = &mut next_conv[start..start + kernel];
+            let new = &mut state.conv[start..start + kernel];
             if kernel > 1 {
-                new[..kernel - 1].copy_from_slice(&old[1..]);
+                new.copy_within(1.., 0);
             }
             new[kernel - 1] = mixed_qkv[channel];
             let convolution = new
@@ -406,19 +535,24 @@ impl GatedDeltaNet {
 
         let repeats = self.geometry.num_value_heads / self.geometry.num_key_heads;
         let query_scale = (self.geometry.key_head_dim as f32).sqrt().recip();
-        let mut next_recurrent = state.recurrent.clone();
+        let normalized_queries = query
+            .chunks_exact(self.geometry.key_head_dim)
+            .map(|head| l2_normalize(head, self.bf16_activations))
+            .collect::<Result<Vec<_>, _>>()?;
+        let normalized_keys = key
+            .chunks_exact(self.geometry.key_head_dim)
+            .map(|head| l2_normalize(head, self.bf16_activations))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_recurrent = &mut state.recurrent;
         let mut core_output = vec![0.0; value_width];
-        for value_head in 0..self.geometry.num_value_heads {
+        let head_state_len = self.geometry.key_head_dim * self.geometry.value_head_dim;
+        let update_head = |value_head: usize,
+                           head_state: &mut [f32],
+                           head_output: &mut [f32]|
+         -> Result<(), DeltaNetError> {
             let key_head = value_head / repeats;
-            let key_start = key_head * self.geometry.key_head_dim;
-            let normalized_query = l2_normalize(
-                &query[key_start..key_start + self.geometry.key_head_dim],
-                self.bf16_activations,
-            )?;
-            let normalized_key = l2_normalize(
-                &key[key_start..key_start + self.geometry.key_head_dim],
-                self.bf16_activations,
-            )?;
+            let normalized_query = &normalized_queries[key_head];
+            let normalized_key = &normalized_keys[key_head];
             let value_start = value_head * self.geometry.value_head_dim;
             let head_value = &value[value_start..value_start + self.geometry.value_head_dim];
 
@@ -434,45 +568,59 @@ impl GatedDeltaNet {
                 return Err(DeltaNetError::NonFinite("decay log"));
             }
             let decay = decay_log.exp();
-            let state_start =
-                value_head * self.geometry.key_head_dim * self.geometry.value_head_dim;
-            let head_state = &mut next_recurrent[state_start
-                ..state_start + self.geometry.key_head_dim * self.geometry.value_head_dim];
             for state_value in head_state.iter_mut() {
                 *state_value *= decay;
             }
 
-            let mut delta = vec![0.0; self.geometry.value_head_dim];
-            for value_dimension in 0..self.geometry.value_head_dim {
-                let memory = (0..self.geometry.key_head_dim)
-                    .map(|key_dimension| {
-                        f64::from(
-                            head_state
-                                [key_dimension * self.geometry.value_head_dim + value_dimension],
-                        ) * f64::from(normalized_key[key_dimension])
-                    })
-                    .sum::<f64>() as f32;
-                delta[value_dimension] = (head_value[value_dimension] - memory) * beta;
+            // The native 128-wide heads use stack scratch. Wider geometries keep a bounded
+            // per-head fallback, while the output slice temporarily holds the rank-one delta.
+            let mut local_sums = [0.0f64; 128];
+            let mut wide_sums;
+            let sums = if self.geometry.value_head_dim <= local_sums.len() {
+                &mut local_sums[..self.geometry.value_head_dim]
+            } else {
+                wide_sums = vec![0.0; self.geometry.value_head_dim];
+                &mut wide_sums
+            };
+            project_recurrent_state_into(head_state, normalized_key, 1.0, sums);
+            for ((delta, &value), &memory) in
+                head_output.iter_mut().zip(head_value).zip(sums.iter())
+            {
+                *delta = (value - memory as f32) * beta;
             }
-            for key_dimension in 0..self.geometry.key_head_dim {
-                for value_dimension in 0..self.geometry.value_head_dim {
-                    head_state[key_dimension * self.geometry.value_head_dim + value_dimension] +=
-                        normalized_key[key_dimension] * delta[value_dimension];
+            for (row, &key) in head_state
+                .chunks_exact_mut(self.geometry.value_head_dim)
+                .zip(normalized_key)
+            {
+                for (value, &delta) in row.iter_mut().zip(head_output.iter()) {
+                    *value += key * delta;
                 }
             }
-            for value_dimension in 0..self.geometry.value_head_dim {
-                core_output[value_start + value_dimension] = (0..self.geometry.key_head_dim)
-                    .map(|key_dimension| {
-                        f64::from(
-                            head_state
-                                [key_dimension * self.geometry.value_head_dim + value_dimension],
-                        ) * f64::from(normalized_query[key_dimension] * query_scale)
-                    })
-                    .sum::<f64>()
-                    as f32;
+            project_recurrent_state_into(head_state, normalized_query, query_scale, sums);
+            for (output, &sum) in head_output.iter_mut().zip(sums.iter()) {
+                *output = sum as f32;
+            }
+            Ok(())
+        };
+        // Heads own disjoint state and output slices. Scheduling changes no reduction order.
+        if should_parallelize(self.geometry.num_value_heads, next_recurrent.len()) {
+            install(|| {
+                next_recurrent
+                    .par_chunks_mut(head_state_len)
+                    .zip(core_output.par_chunks_mut(self.geometry.value_head_dim))
+                    .enumerate()
+                    .try_for_each(|(head, (state, output))| update_head(head, state, output))
+            })?;
+        } else {
+            for (head, (state, output)) in next_recurrent
+                .chunks_mut(head_state_len)
+                .zip(core_output.chunks_mut(self.geometry.value_head_dim))
+                .enumerate()
+            {
+                update_head(head, state, output)?;
             }
         }
-        ensure_finite("recurrent state", &next_recurrent)?;
+        ensure_finite("recurrent state", next_recurrent)?;
         ensure_finite("recurrent output", &core_output)?;
         if self.bf16_activations {
             round_to_bf16_in_place(&mut core_output)?;
@@ -498,14 +646,52 @@ impl GatedDeltaNet {
             };
             gated_output.extend(normalized);
         }
-        let output = linear(&self.out_proj, &gated_output)?;
-        ensure_finite("output projection", &output)?;
-
-        // Commit both state components only once the complete token succeeds.
-        state.conv = next_conv;
-        state.recurrent = next_recurrent;
         state.tokens = next_tokens;
-        Ok(output)
+        Ok(gated_output)
+    }
+}
+
+/// Ordered F64 reduction, identical to the column-wise reference, with contiguous loads.
+fn project_recurrent_state_into(state: &[f32], vector: &[f32], scale: f32, sums: &mut [f64]) {
+    sums.fill(-0.0);
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected and the helper bounds all loads/stores to full lanes.
+        unsafe { project_recurrent_state_avx2(state, vector, scale, sums) };
+        return;
+    }
+    for (row, &factor) in state.chunks_exact(sums.len()).zip(vector) {
+        let factor = f64::from(factor * scale);
+        for (sum, &value) in sums.iter_mut().zip(row) {
+            *sum += f64::from(value) * factor;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn project_recurrent_state_avx2(
+    state: &[f32],
+    vector: &[f32],
+    scale: f32,
+    sums: &mut [f64],
+) {
+    use std::arch::x86_64::*;
+    let width = sums.len();
+    let complete = width / 4 * 4;
+    for (row, &factor) in state.chunks_exact(width).zip(vector) {
+        let factor = f64::from(factor * scale);
+        let factors = _mm256_set1_pd(factor);
+        for column in (0..complete).step_by(4) {
+            let values = _mm256_cvtps_pd(_mm_loadu_ps(row.as_ptr().add(column)));
+            let previous = _mm256_loadu_pd(sums.as_ptr().add(column));
+            // Separate multiply and add preserve the scalar F64 rounding; do not use FMA.
+            let next = _mm256_add_pd(previous, _mm256_mul_pd(values, factors));
+            _mm256_storeu_pd(sums.as_mut_ptr().add(column), next);
+        }
+        for column in complete..width {
+            sums[column] += f64::from(row[column]) * factor;
+        }
     }
 }
 
@@ -616,15 +802,93 @@ fn expect_input(input: &[f32], length: usize) -> Result<(), DeltaNetError> {
 }
 
 fn ensure_finite(name: &'static str, values: &[f32]) -> Result<(), DeltaNetError> {
-    if values.iter().any(|value| !value.is_finite()) {
+    if !values_are_finite(values) {
         return Err(DeltaNetError::NonFinite(name));
     }
     Ok(())
 }
 
+fn values_are_finite(values: &[f32]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected and the helper only loads complete eight-value chunks.
+        return unsafe { values_are_finite_avx2(values) };
+    }
+    values.iter().all(|value| value.is_finite())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn values_are_finite_avx2(values: &[f32]) -> bool {
+    use std::arch::x86_64::*;
+    let exponent = _mm256_set1_epi32(0x7f80_0000);
+    let mut chunks = values.chunks_exact(8);
+    for chunk in &mut chunks {
+        let bits = _mm256_loadu_si256(chunk.as_ptr().cast());
+        let nonfinite = _mm256_cmpeq_epi32(_mm256_and_si256(bits, exponent), exponent);
+        if _mm256_movemask_epi8(nonfinite) != 0 {
+            return false;
+        }
+    }
+    chunks.remainder().iter().all(|value| value.is_finite())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_scan_handles_unaligned_tails_and_all_exponent_patterns() {
+        let finite = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x807f_ffff),
+        ];
+        let nonfinite = [
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_0001,
+            0xff80_0001,
+            0x7fc0_0000,
+            0xffc0_0000,
+            0x7fff_ffff,
+            0xffff_ffff,
+        ];
+        for offset in 0..8 {
+            for length in 0..=65 {
+                let mut buffer = (0..offset + length)
+                    .map(|i| finite[i % finite.len()])
+                    .collect::<Vec<_>>();
+                let values = &mut buffer[offset..];
+                assert!(values_are_finite(values));
+                for position in 0..length {
+                    let old = values[position];
+                    for bits in nonfinite {
+                        values[position] = f32::from_bits(bits);
+                        assert!(
+                            !values_are_finite(values),
+                            "offset={offset} length={length} position={position}"
+                        );
+                    }
+                    values[position] = old;
+                }
+            }
+        }
+        // Every sign/exponent/high-mantissa pattern with representative low mantissas,
+        // including signaling NaNs and values immediately below infinity.
+        for low in [0, 1, 0x7fff, 0xffff] {
+            for high in 0..=u16::MAX {
+                let value = f32::from_bits((u32::from(high) << 16) | low);
+                assert_eq!(values_are_finite(&[value; 8]), value.is_finite());
+            }
+        }
+    }
 
     fn matrix(rows: usize, columns: usize, values: Vec<f32>) -> DenseMatrix {
         DenseMatrix::new(rows, columns, values).unwrap()
@@ -660,6 +924,217 @@ mod tests {
         .unwrap()
     }
 
+    fn tiny_delta_net_with_dtype(bf16: bool) -> GatedDeltaNet {
+        let mut module = tiny_delta_net();
+        if bf16 {
+            for weight in [
+                &mut module.in_proj_qkv,
+                &mut module.in_proj_z,
+                &mut module.in_proj_b,
+                &mut module.in_proj_a,
+                &mut module.out_proj,
+            ] {
+                let WeightMatrix::F32(dense) = weight else {
+                    unreachable!()
+                };
+                let bytes = dense
+                    .data()
+                    .iter()
+                    .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                    .collect::<Vec<_>>();
+                *weight = WeightMatrix::Bf16(
+                    crate::model::Bf16Matrix::from_le_bytes(dense.rows(), dense.cols(), bytes)
+                        .unwrap(),
+                );
+            }
+            module.bf16_activations = true;
+        }
+        module
+    }
+
+    #[test]
+    fn batched_prefill_preserves_outputs_and_existing_state_bits() {
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for bf16 in [false, true] {
+            let module = tiny_delta_net_with_dtype(bf16);
+            for batch in [2, 3, 8, 19, 32, 33, 128, 129] {
+                let input = (0..batch * 2)
+                    .map(|i| ((i * 19 % 41) as f32 - 20.0) / 16.0)
+                    .collect::<Vec<_>>();
+                let mut sequential = module.new_state().unwrap();
+                module.forward_token(&[0.25, 0.5], &mut sequential).unwrap();
+                let mut batched = sequential.clone();
+                let mut expected = Vec::new();
+                for token in input.chunks_exact(2) {
+                    expected.extend(module.forward_token(token, &mut sequential).unwrap());
+                }
+                let actual = module.forward_tokens(&input, batch, &mut batched).unwrap();
+                assert_eq!(bits(&actual), bits(&expected));
+                assert_eq!(bits(&batched.conv), bits(&sequential.conv));
+                assert_eq!(bits(&batched.recurrent), bits(&sequential.recurrent));
+                assert_eq!(batched.tokens, sequential.tokens);
+            }
+        }
+    }
+
+    #[test]
+    fn batch_output_failure_preserves_both_state_components() {
+        let mut module = tiny_delta_net();
+        module.out_proj = matrix(2, 2, vec![f32::MAX; 4]).into();
+        let mut state = module.new_state().unwrap();
+        module.forward_token(&[0.0, 0.0], &mut state).unwrap();
+        let before = state.clone();
+        assert!(module
+            .forward_tokens(&[1.0, 2.0, 2.0, 3.0], 2, &mut state)
+            .is_err());
+        assert_eq!(state.tokens, before.tokens);
+        assert_eq!(state.conv, before.conv);
+        assert_eq!(state.recurrent, before.recurrent);
+        assert!(module.forward_tokens(&[], 0, &mut state).is_err());
+        assert_eq!(state.tokens, before.tokens);
+    }
+
+    #[test]
+    fn shared_workspace_preserves_bits_and_reuses_buffers_across_layers() {
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let pointers = |states: &[DeltaNetState], workspace: &DeltaNetWorkspace| {
+            let mut pointers = states
+                .iter()
+                .chain(workspace.state.iter())
+                .map(|state| {
+                    (
+                        state.conv.as_ptr() as usize,
+                        state.recurrent.as_ptr() as usize,
+                    )
+                })
+                .collect::<Vec<_>>();
+            pointers.sort_unstable();
+            pointers
+        };
+        for bf16 in [false, true] {
+            let module = tiny_delta_net_with_dtype(bf16);
+            let mut states = [module.new_state().unwrap(), module.new_state().unwrap()];
+            let mut references = states.clone();
+            let mut workspace = DeltaNetWorkspace::default();
+            module
+                .forward_token_with_workspace(&[0.25, 0.5], &mut states[0], &mut workspace)
+                .unwrap();
+            module
+                .forward_token(&[0.25, 0.5], &mut references[0])
+                .unwrap();
+            let allocations = pointers(&states, &workspace);
+            for (layer, batch) in [(1, 3), (0, 1), (1, 8), (0, 2), (1, 32), (0, 19)] {
+                let input = (0..batch * 2)
+                    .map(|i| ((i * 19 % 41) as f32 - 20.0) / 16.0)
+                    .collect::<Vec<_>>();
+                let actual = module
+                    .forward_tokens_with_workspace(
+                        &input,
+                        batch,
+                        &mut states[layer],
+                        &mut workspace,
+                    )
+                    .unwrap();
+                let expected = module
+                    .forward_tokens(&input, batch, &mut references[layer])
+                    .unwrap();
+                assert_eq!(bits(&actual), bits(&expected));
+                assert_eq!(bits(&states[layer].conv), bits(&references[layer].conv));
+                assert_eq!(
+                    bits(&states[layer].recurrent),
+                    bits(&references[layer].recurrent)
+                );
+                assert_eq!(states[layer].tokens, references[layer].tokens);
+                assert_eq!(pointers(&states, &workspace), allocations);
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_recovers_after_output_failure_and_geometry_change() {
+        let mut module = tiny_delta_net();
+        let mut state = module.new_state().unwrap();
+        let mut workspace = DeltaNetWorkspace::default();
+        module
+            .forward_token_with_workspace(&[0.0, 0.0], &mut state, &mut workspace)
+            .unwrap();
+        let before = state.clone();
+        let output_projection = module.out_proj.clone();
+        module.out_proj = matrix(2, 2, vec![f32::MAX; 4]).into();
+        assert!(module
+            .forward_tokens_with_workspace(&[1.0, 2.0, 2.0, 3.0], 2, &mut state, &mut workspace)
+            .is_err());
+        assert_eq!(state.tokens, before.tokens);
+        assert_eq!(state.conv, before.conv);
+        assert_eq!(state.recurrent, before.recurrent);
+        module.out_proj = output_projection;
+        let mut reference = before;
+        let expected = module
+            .forward_tokens(&[1.0, 2.0, 2.0, 3.0], 2, &mut reference)
+            .unwrap();
+        let actual = module
+            .forward_tokens_with_workspace(&[1.0, 2.0, 2.0, 3.0], 2, &mut state, &mut workspace)
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(state.recurrent, reference.recurrent);
+        assert_eq!(state.conv, reference.conv);
+        assert_eq!(state.tokens, reference.tokens);
+
+        module.geometry.conv_kernel_size = 3;
+        module.conv_weight = [0.0, 0.0, 1.0].repeat(module.geometry.conv_width().unwrap());
+        let mut different = module.new_state().unwrap();
+        let mut reference = different.clone();
+        let expected = module.forward_token(&[0.25, 0.5], &mut reference).unwrap();
+        let actual = module
+            .forward_token_with_workspace(&[0.25, 0.5], &mut different, &mut workspace)
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(different.conv, reference.conv);
+        assert_eq!(different.recurrent, reference.recurrent);
+    }
+
+    #[test]
+    fn contiguous_state_projection_preserves_ordered_reductions() {
+        fn project_recurrent_state(
+            state: &[f32],
+            vector: &[f32],
+            values: usize,
+            scale: f32,
+        ) -> Vec<f32> {
+            let mut sums = vec![0.0; values];
+            project_recurrent_state_into(state, vector, scale, &mut sums);
+            sums.into_iter().map(|value| value as f32).collect()
+        }
+        for (keys, values) in [(1, 1), (3, 5), (17, 31), (128, 128), (129, 257)] {
+            let state = (0..keys * values)
+                .map(|i| ((i * 137 % 251) as f32 - 125.0) / 37.0)
+                .collect::<Vec<_>>();
+            let vector = (0..keys)
+                .map(|i| ((i * 19 % 97) as f32 - 48.0) / 31.0)
+                .collect::<Vec<_>>();
+            for scale in [1.0, (keys as f32).sqrt().recip()] {
+                let actual = project_recurrent_state(&state, &vector, values, scale);
+                let expected = (0..values)
+                    .map(|v| {
+                        (0..keys)
+                            .map(|k| {
+                                f64::from(state[k * values + v]) * f64::from(vector[k] * scale)
+                            })
+                            .sum::<f64>() as f32
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+            }
+        }
+        assert_eq!(
+            project_recurrent_state(&[-0.0], &[1.0], 1, 1.0)[0].to_bits(),
+            ([-0.0f64].into_iter().sum::<f64>() as f32).to_bits()
+        );
+    }
+
     #[test]
     fn one_token_updates_full_conv_window_and_fp32_recurrence() {
         let delta_net = tiny_delta_net();
@@ -692,6 +1167,50 @@ mod tests {
         assert_eq!(state.len(), 2);
         assert!(state.recurrent_state()[0] > first[0]);
         assert!(state.recurrent_state()[1] > first[1]);
+    }
+
+    #[test]
+    fn late_head_failure_leaves_large_state_unchanged() {
+        let geometry = DeltaNetGeometry {
+            hidden_size: 1,
+            num_key_heads: 1,
+            num_value_heads: 16,
+            key_head_dim: 32,
+            value_head_dim: 128,
+            conv_kernel_size: 2,
+            norm_eps: 1e-6,
+        };
+        let conv_width = geometry.conv_width().unwrap();
+        let value_width = geometry.value_width().unwrap();
+        let zeros = |rows, cols| DenseMatrix::new(rows, cols, vec![0.0; rows * cols]).unwrap();
+        let mut a_log = vec![0.0; geometry.num_value_heads];
+        let mut dt_bias = a_log.clone();
+        // exp(88) is finite, but its product with softplus(3) overflows in the last head.
+        a_log[geometry.num_value_heads - 1] = 88.0;
+        dt_bias[geometry.num_value_heads - 1] = 3.0;
+        let module = GatedDeltaNet::new(
+            geometry,
+            zeros(conv_width, 1),
+            zeros(value_width, 1),
+            zeros(geometry.num_value_heads, 1),
+            zeros(geometry.num_value_heads, 1),
+            vec![0.5; conv_width * geometry.conv_kernel_size],
+            dt_bias,
+            a_log,
+            vec![1.0; geometry.value_head_dim],
+            zeros(1, value_width),
+        )
+        .unwrap();
+        let mut state = module.new_state().unwrap();
+        state.conv.fill(0.5);
+        state.recurrent.fill(1.0);
+        state.tokens = 7;
+        let before = state.clone();
+        let error = module.forward_token(&[1.0], &mut state).unwrap_err();
+        assert!(matches!(error, DeltaNetError::NonFinite("decay log")));
+        assert_eq!(state.tokens, before.tokens);
+        assert_eq!(state.conv, before.conv);
+        assert_eq!(state.recurrent, before.recurrent);
     }
 
     #[test]

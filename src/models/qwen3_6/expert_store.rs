@@ -1,12 +1,15 @@
 //! Packed BF16 routed-expert slice loading and deterministic per-layer caching.
 
+use crate::execution::install;
 use crate::model::{Bf16Matrix, WeightMatrix};
 use crate::models::qwen3_8::expert::{
     Qwen38Expert as Qwen36Expert, Qwen38ExpertError as Qwen36ExpertError,
 };
+use crate::profiling::{span, ProfileStage};
 use crate::runtime::cache::LayerLruCache;
 use crate::runtime::ExpertTelemetry;
 use crate::storage::{DType, TensorIndex, WeightLoadError};
+use rayon::prelude::*;
 use std::fmt;
 use std::sync::Arc;
 
@@ -258,6 +261,7 @@ impl Qwen36ExpertStore {
 
         // Load before allowing the LRU to evict: a short/corrupt shard must not discard a usable
         // cached expert.
+        let _profile = span(ProfileStage::Qwen36ExpertLoad);
         let loaded = Qwen36LoadedExpert::load(
             &self.index,
             layer,
@@ -276,6 +280,82 @@ impl Qwen36ExpertStore {
             || Ok((loaded, resident_bytes, payload_bytes)),
             |value| Ok(Arc::clone(value)),
         )
+    }
+
+    /// Stage a selected set only when every value remains charged to the cache.
+    /// Otherwise the caller must use the one-transient-expert streaming path.
+    pub fn acquire_retained(
+        &mut self,
+        layer: usize,
+        ids: &[usize],
+    ) -> Result<Option<Vec<Arc<Qwen36LoadedExpert>>>, Qwen36ExpertStoreError> {
+        if layer >= self.layers {
+            return Err(Qwen36ExpertStoreError::InvalidLayer {
+                layer,
+                layers: self.layers,
+            });
+        }
+        if !self.cache.can_insert_without_eviction(layer, ids) {
+            return Ok(None);
+        }
+        let mut missing = Vec::new();
+        for &id in ids {
+            if !self.cache.contains(layer, id) && !missing.contains(&id) {
+                missing.push(id);
+            }
+        }
+        if missing.len() < 2 {
+            return ids
+                .iter()
+                .map(|&id| self.acquire(layer, id))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some);
+        }
+        let context = crate::profiling::capture_context();
+        // No eviction is needed, so all in-flight payloads already fit the cache reservation.
+        // Reads are positional and each worker owns its buffers; finite validation stays enabled.
+        let loaded = install(|| {
+            missing
+                .par_iter()
+                .map(|&id| {
+                    context.enter(|| {
+                        let _profile = span(ProfileStage::Qwen36ExpertLoad);
+                        Qwen36LoadedExpert::load(
+                            &self.index,
+                            layer,
+                            id,
+                            self.hidden,
+                            self.intermediate,
+                            self.maximum_expert_bytes,
+                        )
+                        .map(Arc::new)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let mut loaded = loaded.into_iter().map(Some).collect::<Vec<_>>();
+        let mut selected = Vec::with_capacity(ids.len());
+        for &id in ids {
+            selected.push(self.cache.access(
+                &mut self.telemetry,
+                layer,
+                id,
+                || {
+                    let position = missing
+                        .iter()
+                        .position(|&key| key == id)
+                        .expect("missing expert was prefetched");
+                    let value = loaded[position]
+                        .take()
+                        .expect("each missing expert is inserted once");
+                    let resident = value.resident_bytes();
+                    let payload = value.payload_bytes();
+                    Ok::<_, Qwen36ExpertStoreError>((value, resident, payload))
+                },
+                |value| Ok(Arc::clone(value)),
+            )?);
+        }
+        Ok(Some(selected))
     }
 
     pub fn telemetry(&self) -> &ExpertTelemetry {
@@ -338,6 +418,59 @@ mod tests {
             Err(Qwen36ExpertStoreError::Budget { .. })
         ));
         assert!(Qwen36LoadedExpert::load(&index, 0, 256, 2048, 512, 3 * matrix_bytes).is_err());
+        let index = Arc::new(index);
+        let mut store = Qwen36ExpertStore::new_shared(
+            Arc::clone(&index),
+            1,
+            256,
+            2048,
+            512,
+            2,
+            3 * matrix_bytes,
+        )
+        .unwrap();
+        let selected = store.acquire_retained(0, &[255, 0]).unwrap().unwrap();
+        assert_eq!(selected[0].value.forward(&input).unwrap(), output);
+        assert_eq!(store.telemetry().misses, 2);
+        assert_eq!(store.telemetry().resident_bytes, 6 * matrix_bytes);
+        let before = store.telemetry().clone();
+        assert!(store.acquire_retained(0, &[1, 2]).unwrap().is_none());
+        assert_eq!(store.telemetry(), &before);
+        store.acquire_retained(0, &[255, 0]).unwrap().unwrap();
+        assert_eq!(store.telemetry().hits, 2);
+        assert_eq!(store.telemetry().bytes_read, 6 * matrix_bytes);
+        drop(store);
+        let new_store = || {
+            Qwen36ExpertStore::new_shared(
+                Arc::clone(&index),
+                1,
+                256,
+                2048,
+                512,
+                2,
+                3 * matrix_bytes,
+            )
+            .unwrap()
+        };
+        let mut sequential = new_store();
+        let mut grouped = new_store();
+        let accesses = [255, 0, 255, 0, 255];
+        for id in accesses {
+            sequential.acquire(0, id).unwrap();
+        }
+        let staged = grouped.acquire_retained(0, &accesses).unwrap().unwrap();
+        assert_eq!(staged.len(), accesses.len());
+        assert!(Arc::ptr_eq(&staged[0], &staged[2]));
+        assert_eq!(grouped.telemetry(), sequential.telemetry());
+        drop(staged);
+        // The next eviction must choose the same victim after replaying duplicate accesses.
+        for id in [1, 255, 0] {
+            grouped.acquire(0, id).unwrap();
+            sequential.acquire(0, id).unwrap();
+            assert_eq!(grouped.telemetry(), sequential.telemetry());
+        }
+        drop(grouped);
+        drop(sequential);
         drop(index);
         std::fs::remove_dir_all(directory).unwrap();
     }

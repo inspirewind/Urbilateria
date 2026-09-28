@@ -59,11 +59,7 @@ impl Bf16Matrix {
                 little_endian_bytes.len()
             )));
         }
-        if validate_finite
-            && little_endian_bytes
-                .chunks_exact(2)
-                .any(|bytes| !decode_bf16(bytes).is_finite())
-        {
+        if validate_finite && !bf16_payload_is_finite(&little_endian_bytes) {
             return Err(MatrixError::NonFinite);
         }
         Ok(Self {
@@ -212,29 +208,126 @@ impl Bf16Matrix {
         #[cfg(target_arch = "x86_64")]
         let avx2_fma = std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma");
-        let dot = |row: &[u8]| {
+        let compute_rows = |output: &mut [f32], rows: &[u8]| {
             #[cfg(target_arch = "x86_64")]
-            if avx2_fma {
-                // SAFETY: feature detection proves AVX2/FMA support and the helper bounds every
-                // vector load to a complete eight-value group.
-                return unsafe { dot_bf16_fp32_avx2_fma(row, input) };
+            if avx2_fma && output.len() == 4 {
+                // SAFETY: feature detection and the four complete row slices satisfy the kernel.
+                unsafe {
+                    dot_bf16_four_rows_fp32_avx2_fma(rows, input, output);
+                }
+                return;
             }
-            dot_bf16(row, input)
+            for (output, row) in output.iter_mut().zip(rows.chunks_exact(row_bytes)) {
+                #[cfg(target_arch = "x86_64")]
+                if avx2_fma {
+                    *output = unsafe { dot_bf16_fp32_avx2_fma(row, input) };
+                    continue;
+                }
+                *output = dot_bf16(row, input);
+            }
         };
         if should_parallelize(self.rows, work) {
             install(|| {
                 output
-                    .par_iter_mut()
-                    .zip(rows.par_chunks_exact(row_bytes))
-                    .for_each(|(output, row)| *output = dot(row));
+                    .par_chunks_mut(4)
+                    .zip(rows.par_chunks(row_bytes * 4))
+                    .for_each(|(output, rows)| compute_rows(output, rows));
             });
         } else {
-            for (output, row) in output.iter_mut().zip(rows.chunks_exact(row_bytes)) {
-                *output = dot(row);
+            for (output, rows) in output.chunks_mut(4).zip(rows.chunks(row_bytes * 4)) {
+                compute_rows(output, rows);
             }
         }
         if output.iter().any(|value| !value.is_finite()) {
             return Err(MatrixError::NonFinite);
+        }
+        Ok(output)
+    }
+
+    /// Applies consecutive input rows without changing the FP32 GEMV reduction tree.
+    /// Each SIMD weight load is shared by up to eight independent input accumulators.
+    pub(crate) fn matmul_rows_fp32(
+        &self,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, MatrixError> {
+        let expected = batch
+            .checked_mul(self.cols)
+            .ok_or_else(|| MatrixError::InvalidShape("batch * cols overflows usize".into()))?;
+        if batch == 0 || input.len() != expected {
+            return Err(MatrixError::InputLength {
+                expected,
+                got: input.len(),
+            });
+        }
+        if batch == 1 {
+            return self.matvec_fp32(input);
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(MatrixError::NonFinite);
+        }
+        let output_len = batch
+            .checked_mul(self.rows)
+            .ok_or_else(|| MatrixError::InvalidShape("batch * rows overflows usize".into()))?;
+        let work = output_len.saturating_mul(self.cols);
+        let _profile = span_with_work(ProfileStage::MatvecBf16, work);
+        let mut by_row = vec![0.0f32; output_len];
+        #[cfg(target_arch = "x86_64")]
+        let avx2_fma = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+        let compute = |row: &[u8], values: &mut [f32]| {
+            #[cfg(target_arch = "x86_64")]
+            if avx2_fma {
+                let mut offset = 0;
+                // Full groups share weights; small tails keep the same vector reduction.
+                for width in [8, 4, 2, 1] {
+                    while values.len() - offset >= width {
+                        let inputs = &input[offset * self.cols..(offset + width) * self.cols];
+                        let outputs = &mut values[offset..offset + width];
+                        // SAFETY: features are detected and inputs/outputs contain exactly
+                        // the selected number of complete rows. The helper bounds every load.
+                        unsafe {
+                            match width {
+                                8 => dot_bf16_inputs_fp32_avx2_fma::<8>(row, inputs, outputs),
+                                4 => dot_bf16_inputs_fp32_avx2_fma::<4>(row, inputs, outputs),
+                                2 => dot_bf16_inputs_fp32_avx2_fma::<2>(row, inputs, outputs),
+                                1 => dot_bf16_inputs_fp32_avx2_fma::<1>(row, inputs, outputs),
+                                _ => unreachable!(),
+                            }
+                        }
+                        offset += width;
+                    }
+                }
+                return;
+            }
+            for (value, token) in values.iter_mut().zip(input.chunks_exact(self.cols)) {
+                *value = dot_bf16(row, token);
+            }
+        };
+        if should_parallelize(self.rows, work) {
+            install(|| {
+                self.little_endian_bytes
+                    .par_chunks_exact(self.cols * 2)
+                    .zip(by_row.par_chunks_mut(batch))
+                    .for_each(|(row, values)| compute(row, values));
+            });
+        } else {
+            for (row, values) in self
+                .little_endian_bytes
+                .chunks_exact(self.cols * 2)
+                .zip(by_row.chunks_mut(batch))
+            {
+                compute(row, values);
+            }
+        }
+        if by_row.iter().any(|value| !value.is_finite()) {
+            return Err(MatrixError::NonFinite);
+        }
+        let mut output = vec![0.0; output_len];
+        for (row, values) in by_row.chunks_exact(batch).enumerate() {
+            for (token, &value) in values.iter().enumerate() {
+                output[token * self.rows + row] = value;
+            }
         }
         Ok(output)
     }
@@ -371,6 +464,125 @@ unsafe fn dot_bf16_fp32_avx2_fma(row: &[u8], input: &[f32]) -> f32 {
     sum
 }
 
+/// One weight row and N input rows, preserving each input's original eight-lane FMA tree.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_inputs_fp32_avx2_fma<const N: usize>(
+    row: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let cols = row.len() / 2;
+    debug_assert_eq!(input.len(), N * cols);
+    debug_assert_eq!(output.len(), N);
+    let mut accumulators = [_mm256_setzero_ps(); N];
+    let complete = cols / 8 * 8;
+    for column in (0..complete).step_by(8) {
+        let packed = _mm_loadu_si128(row.as_ptr().add(column * 2).cast());
+        let weights = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
+        for (token, accumulator) in accumulators.iter_mut().enumerate() {
+            let values = _mm256_loadu_ps(input.as_ptr().add(token * cols + column));
+            *accumulator = _mm256_fmadd_ps(weights, values, *accumulator);
+        }
+    }
+    for (token, accumulator) in accumulators.into_iter().enumerate() {
+        let mut lanes = [0.0; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        let mut sum = lanes.into_iter().sum::<f32>();
+        for column in complete..cols {
+            sum += decode_bf16(&row[column * 2..column * 2 + 2]) * input[token * cols + column];
+        }
+        output[token] = sum;
+    }
+}
+
+/// Four independent row accumulators hide FMA latency and reuse the input load,
+/// without reassociating any row's products or changing its final lane reduction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_four_rows_fp32_avx2_fma(rows: &[u8], input: &[f32], output: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let stride = input.len() * 2;
+    debug_assert_eq!(rows.len(), stride * 4);
+    debug_assert_eq!(output.len(), 4);
+    let mut a = _mm256_setzero_ps();
+    let mut b = a;
+    let mut c = a;
+    let mut d = a;
+    let complete = input.len() / 8 * 8;
+    for offset in (0..complete).step_by(8) {
+        let x = _mm256_loadu_ps(input.as_ptr().add(offset));
+        let ptr = rows.as_ptr().add(offset * 2);
+        let w0 = _mm_loadu_si128(ptr.cast());
+        let w1 = _mm_loadu_si128(ptr.add(stride).cast());
+        let w2 = _mm_loadu_si128(ptr.add(stride * 2).cast());
+        let w3 = _mm_loadu_si128(ptr.add(stride * 3).cast());
+        a = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(w0), 16)),
+            x,
+            a,
+        );
+        b = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(w1), 16)),
+            x,
+            b,
+        );
+        c = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(w2), 16)),
+            x,
+            c,
+        );
+        d = _mm256_fmadd_ps(
+            _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(w3), 16)),
+            x,
+            d,
+        );
+    }
+    for (row, accumulator) in [a, b, c, d].into_iter().enumerate() {
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        let mut sum = lanes.into_iter().sum::<f32>();
+        for (column, &value) in input.iter().enumerate().skip(complete) {
+            sum += decode_bf16(&rows[row * stride + column * 2..row * stride + column * 2 + 2])
+                * value;
+        }
+        output[row] = sum;
+    }
+}
+
+/// BF16 non-finite values have an all-ones exponent. Check packed bits directly
+/// so loading a resident expert does not scalar-decode every element before GEMV.
+fn bf16_payload_is_finite(bytes: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature is detected and all loads stay within complete 32-byte chunks.
+        return unsafe { bf16_payload_is_finite_avx2(bytes) };
+    }
+    bytes
+        .chunks_exact(2)
+        .all(|value| decode_bf16(value).is_finite())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bf16_payload_is_finite_avx2(bytes: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let mask = _mm256_set1_epi16(0x7f80);
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in &mut chunks {
+        let bits = _mm256_loadu_si256(chunk.as_ptr().cast());
+        let invalid = _mm256_cmpeq_epi16(_mm256_and_si256(bits, mask), mask);
+        if _mm256_movemask_epi8(invalid) != 0 {
+            return false;
+        }
+    }
+    chunks
+        .remainder()
+        .chunks_exact(2)
+        .all(|value| decode_bf16(value).is_finite())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +592,103 @@ mod tests {
             .iter()
             .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
             .collect()
+    }
+
+    #[test]
+    fn batched_fp32_matches_individual_gemv_bits_across_tiles_and_tails() {
+        for rows in [1, 3, 17, 129] {
+            for cols in [1, 7, 8, 9, 65, 512] {
+                let weights = (0..rows * cols)
+                    .map(|i| ((i * 137 % 251) as f32 - 125.0) / 37.0)
+                    .collect::<Vec<_>>();
+                let matrix = Bf16Matrix::from_le_bytes(rows, cols, bf16_bytes(&weights)).unwrap();
+                for batch in [1, 2, 3, 4, 7, 8, 9, 15, 16, 19, 32, 33, 128, 129] {
+                    let input = (0..batch * cols)
+                        .map(|i| ((i * 19 % 97) as f32 - 48.0) / 31.0)
+                        .collect::<Vec<_>>();
+                    let expected = input
+                        .chunks_exact(cols)
+                        .flat_map(|token| matrix.matvec_fp32(token).unwrap())
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>();
+                    let actual = matrix.matmul_rows_fp32(&input, batch).unwrap();
+                    assert_eq!(
+                        actual.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected,
+                        "rows={rows}, cols={cols}, batch={batch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_fp32_rejects_invalid_shapes_and_nonfinite_values() {
+        let matrix = Bf16Matrix::from_le_bytes(2, 2, bf16_bytes(&[1.0; 4])).unwrap();
+        assert!(matrix.matmul_rows_fp32(&[], 0).is_err());
+        assert!(matrix.matmul_rows_fp32(&[1.0; 3], 2).is_err());
+        assert!(matrix.matmul_rows_fp32(&[], usize::MAX).is_err());
+        assert!(matrix
+            .matmul_rows_fp32(&[1.0, 2.0, 3.0, f32::NAN], 2)
+            .is_err());
+        assert!(matrix.matmul_rows_fp32(&[f32::MAX; 4], 2).is_err());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn four_row_fp32_kernel_preserves_single_row_bits_and_tails() {
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            return;
+        }
+        for columns in [1, 7, 8, 9, 31, 65, 512, 2048] {
+            for rows in [1, 3, 4, 5, 9, 17] {
+                let values = (0..rows * columns)
+                    .map(|i| ((i * 137 % 251) as f32 - 125.0) / 37.0)
+                    .collect::<Vec<_>>();
+                let input = (0..columns)
+                    .map(|i| ((i * 19 % 97) as f32 - 48.0) / 31.0)
+                    .collect::<Vec<_>>();
+                let bytes = bf16_bytes(&values);
+                let expected = bytes
+                    .chunks_exact(columns * 2)
+                    .map(|row| unsafe { dot_bf16_fp32_avx2_fma(row, &input) })
+                    .collect::<Vec<_>>();
+                let matrix = Bf16Matrix::from_le_bytes(rows, columns, bytes).unwrap();
+                let actual = matrix.matvec_fp32(&input).unwrap();
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+                if rows > 4 {
+                    let slice = matrix.matvec_rows_fp32(1, rows - 2, &input).unwrap();
+                    assert_eq!(slice, expected[1..rows - 1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_finiteness_matches_scalar_for_every_bf16_encoding_and_tail() {
+        for count in [1, 15, 16, 17, 31, 32, 33, 97] {
+            let mut bytes = vec![0u8; count * 2];
+            for position in 0..count {
+                for bits in [0x7f80u16, 0xff80, 0x7fc1, 0xffc1] {
+                    bytes[position * 2..position * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+                    assert!(!bf16_payload_is_finite(&bytes));
+                }
+                bytes[position * 2..position * 2 + 2].copy_from_slice(&0x7f7fu16.to_le_bytes());
+                assert!(bf16_payload_is_finite(&bytes));
+            }
+        }
+        for bits in 0..=u16::MAX {
+            let bytes = bits.to_le_bytes().repeat(32);
+            assert_eq!(
+                bf16_payload_is_finite(&bytes),
+                decode_bf16(&bits.to_le_bytes()).is_finite()
+            );
+        }
     }
 
     #[test]

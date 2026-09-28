@@ -976,8 +976,7 @@ fn run_generate_qwen36<W: Write>(
         .map(|available| available.min(requested_ram))
         .unwrap_or(requested_ram);
     let preflight_profile = span(ProfileStage::CheckpointPreflight);
-    // Start with zero retained expert slots, which is the lowest-memory correct execution mode.
-    // A later planner can trade memory for throughput without changing forward semantics.
+    // Establish causal-state capacity first, then spend remaining RAM on weight residency.
     let (required_context, requirements) = session::plan(
         cache.enabled,
         required_context,
@@ -994,33 +993,13 @@ fn run_generate_qwen36<W: Write>(
             Ok((requirements, total <= effective_ram))
         },
     )?;
-    let state_bytes = requirements
-        .kv_cache_bytes
-        .checked_add(requirements.recurrent_state_bytes)
-        .and_then(|value| value.checked_add(requirements.convolution_state_bytes))
-        .ok_or("Qwen3.6 state byte count overflows")?;
-    let total_required = requirements
-        .peak_resident_bytes
-        .checked_add(state_bytes)
-        .ok_or("Qwen3.6 total resident byte count overflows")?;
-    let total_required = total_required.saturating_add(if cache.enabled {
-        requirements
-            .recurrent_state_bytes
-            .saturating_add(requirements.convolution_state_bytes)
-    } else {
-        0
-    });
-    if total_required > effective_ram {
-        return Err(format!(
-            "Qwen3.6 runtime needs at least {} for streamed layer, state, scratch, and one transient expert; effective RAM is {}",
-            human_bytes(total_required),
-            human_bytes(effective_ram)
-        )
-        .into());
-    }
+    let load_options = requirements.plan_load_options(effective_ram, cache.enabled)?;
+    let (cached_layers, cached_head) = requirements.backbone_residency(
+        load_options.resident_budget_bytes - load_options.expert_cache_budget_bytes,
+    );
     drop(preflight_profile);
     eprintln!(
-        "preflight: Qwen3.6 prompt={} tokens, context={}, RAM={}, streamed-layer peak={}, recurrent+conv state={}, full-GQA KV={}, expert cache slots/layer=0, transient expert={}, suppressed LM-head rows={}, CPU workers={} (scalar correctness runtime)",
+        "preflight: Qwen3.6 prompt={} tokens, context={}, RAM={}, streamed-layer peak={}, recurrent+conv state={}, full-GQA KV={}, cached layers={}/{}, resident LM head={}, expert cache slots/layer={}, expert cache budget={}, transient expert={}, suppressed LM-head rows={}, CPU workers={}",
         prompt_tokens.len(),
         required_context,
         human_bytes(effective_ram),
@@ -1031,23 +1010,18 @@ fn run_generate_qwen36<W: Write>(
                 .saturating_add(requirements.convolution_state_bytes)
         ),
         human_bytes(requirements.kv_cache_bytes),
+        cached_layers,
+        config.num_hidden_layers,
+        cached_head,
+        load_options.expert_slots_per_layer,
+        human_bytes(load_options.expert_cache_budget_bytes),
         human_bytes(requirements.expert_bytes),
         suppressed_rows,
         worker_threads()
     );
     let model = {
         let _profile = span(ProfileStage::ModelLoad);
-        Qwen36RuntimeModel::load(
-            model_dir,
-            RuntimeLoadOptions {
-                resident_budget_bytes: requirements.peak_resident_bytes,
-                expert_cache_budget_bytes: 0,
-                kv_cache_budget_bytes: state_bytes,
-                expert_slots_per_layer: 0,
-                maximum_expert_bytes: requirements.expert_bytes,
-                context_limit: required_context,
-            },
-        )?
+        Qwen36RuntimeModel::load(model_dir, load_options)?
     };
     session::generate(
         cache,

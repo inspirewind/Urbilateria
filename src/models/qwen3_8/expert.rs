@@ -1,4 +1,4 @@
-//! Scalar Qwen3.8 SwiGLU expert used by the correctness runtime.
+//! Qwen SwiGLU expert with tokenwise and batched projection paths.
 //!
 //! Qwen's routed and shared experts have the same equation but may have different
 //! intermediate widths:
@@ -9,7 +9,7 @@
 //! projections behind [`WeightMatrix`] lets the same forward path exercise dense
 //! tiny fixtures, BF16 trunk weights, and block-FP8 routed experts.
 
-use super::math::{linear, round_to_bf16, round_to_bf16_in_place, uses_bf16_output};
+use super::math::{linear, linear_batch, round_to_bf16, round_to_bf16_in_place, uses_bf16_output};
 use crate::math::silu;
 use crate::model::{WeightError, WeightMatrix};
 use std::fmt;
@@ -187,6 +187,111 @@ impl Qwen38Expert {
         validate_projection("down_proj", &output, hidden_size)?;
         Ok(output)
     }
+    /// Shares projection weights across consecutive inputs with scalar-path BF16 boundaries.
+    pub fn forward_batch(
+        &self,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, Qwen38ExpertError> {
+        Self::forward_projections_batch(
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+            input,
+            batch,
+        )
+    }
+
+    pub(crate) fn forward_projections_batch(
+        gate_proj: &WeightMatrix,
+        up_proj: &WeightMatrix,
+        down_proj: &WeightMatrix,
+        input: &[f32],
+        batch: usize,
+    ) -> Result<Vec<f32>, Qwen38ExpertError> {
+        if batch == 1 {
+            return Self::forward_projections(gate_proj, up_proj, down_proj, input);
+        }
+        if batch == 0 {
+            return Err(Qwen38ExpertError::InvalidShape(
+                "batch must be non-zero".into(),
+            ));
+        }
+        let hidden_size = gate_proj.cols();
+        let intermediate_size = gate_proj.rows();
+        if up_proj.rows() != intermediate_size
+            || up_proj.cols() != hidden_size
+            || down_proj.rows() != hidden_size
+            || down_proj.cols() != intermediate_size
+        {
+            return Err(Qwen38ExpertError::InvalidShape(
+                "expert projection shapes disagree".to_owned(),
+            ));
+        }
+        let output_size = batch.checked_mul(hidden_size).ok_or_else(|| {
+            Qwen38ExpertError::InvalidShape("batch * hidden size overflows".into())
+        })?;
+        let activation_size = batch.checked_mul(intermediate_size).ok_or_else(|| {
+            Qwen38ExpertError::InvalidShape("batch * intermediate size overflows".into())
+        })?;
+        if input.len() != output_size {
+            return Err(Qwen38ExpertError::InvalidShape(format!(
+                "input has length {}, expected batch * hidden size {}",
+                input.len(),
+                output_size
+            )));
+        }
+        validate_finite("input", input)?;
+
+        let bf16_output = uses_bf16_output(gate_proj);
+        let gate =
+            linear_batch(gate_proj, input, batch).map_err(|source| Qwen38ExpertError::Weight {
+                projection: "gate_proj",
+                source,
+            })?;
+        let up =
+            linear_batch(up_proj, input, batch).map_err(|source| Qwen38ExpertError::Weight {
+                projection: "up_proj",
+                source,
+            })?;
+        validate_projection("gate_proj", &gate, activation_size)?;
+        validate_projection("up_proj", &up, activation_size)?;
+
+        let mut activated = Vec::with_capacity(activation_size);
+        for (index, (gate, up)) in gate.into_iter().zip(up).enumerate() {
+            let activated_gate = if bf16_output {
+                round_to_bf16(silu(gate)).map_err(|source| Qwen38ExpertError::Weight {
+                    projection: "SwiGLU gate cast",
+                    source,
+                })?
+            } else {
+                silu(gate)
+            };
+            let value = activated_gate * up;
+            if !value.is_finite() {
+                return Err(Qwen38ExpertError::NonFinite {
+                    operation: "SwiGLU activation",
+                    index,
+                });
+            }
+            activated.push(value);
+        }
+        if bf16_output {
+            round_to_bf16_in_place(&mut activated).map_err(|source| Qwen38ExpertError::Weight {
+                projection: "SwiGLU activation cast",
+                source,
+            })?;
+        }
+
+        let output = linear_batch(down_proj, &activated, batch).map_err(|source| {
+            Qwen38ExpertError::Weight {
+                projection: "down_proj",
+                source,
+            }
+        })?;
+        validate_projection("down_proj", &output, output_size)?;
+        Ok(output)
+    }
 }
 
 fn validate_projection(
@@ -217,6 +322,57 @@ mod tests {
 
     fn dense(rows: usize, columns: usize, values: Vec<f32>) -> WeightMatrix {
         WeightMatrix::F32(DenseMatrix::new(rows, columns, values).unwrap())
+    }
+
+    #[test]
+    fn batched_expert_preserves_tokenwise_bits_and_bf16_rounding() {
+        for (hidden, intermediate) in [(7, 5), (65, 17), (128, 129)] {
+            for bf16 in [false, true] {
+                let weight = |rows, cols, salt| {
+                    let data = (0..rows * cols)
+                        .map(|i| ((i * 19 + salt) % 41) as f32 / 31.0 - 0.5)
+                        .collect::<Vec<_>>();
+                    if bf16 {
+                        let bytes = data
+                            .iter()
+                            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                            .collect();
+                        WeightMatrix::Bf16(
+                            crate::model::Bf16Matrix::from_le_bytes(rows, cols, bytes).unwrap(),
+                        )
+                    } else {
+                        dense(rows, cols, data)
+                    }
+                };
+                let expert = Qwen38Expert::new(
+                    weight(intermediate, hidden, 3),
+                    weight(intermediate, hidden, 17),
+                    weight(hidden, intermediate, 23),
+                )
+                .unwrap();
+                for batch in [1, 2, 3, 9, 32] {
+                    let input = (0..batch * hidden)
+                        .map(|i| ((i * 13 % 31) as f32 - 15.0) / 13.0)
+                        .collect::<Vec<_>>();
+                    let expected = input
+                        .chunks_exact(hidden)
+                        .flat_map(|token| expert.forward(token).unwrap())
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>();
+                    let actual = expert.forward_batch(&input, batch).unwrap();
+                    assert_eq!(
+                        actual.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+                assert!(expert.forward_batch(&[], 0).is_err());
+                assert!(expert.forward_batch(&[], usize::MAX).is_err());
+                assert!(expert.forward_batch(&vec![0.0; hidden + 1], 2).is_err());
+                assert!(expert
+                    .forward_batch(&vec![f32::NAN; hidden * 2], 2)
+                    .is_err());
+            }
+        }
     }
 
     #[test]
