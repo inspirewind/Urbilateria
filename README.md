@@ -12,23 +12,23 @@ English · <a href="README_CN.md">中文</a>
 
 <p>
 A pure-Rust research runtime for understanding and running frontier models such as<br>
-GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only machines.
+GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.6/3.8, and Hy4 on bounded-memory, CPU-only machines.
 </p>
 
 <p>
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="CPU-only runtime">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="Five model families">
-<img src="https://img.shields.io/badge/tests-415_passing-2e7d32?style=flat-square" alt="415 tests passing">
+<img src="https://img.shields.io/badge/tests-453_passing-2e7d32?style=flat-square" alt="453 tests passing">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT License"></a>
 </p>
 
 <table>
 <tr>
 <td align="center"><b>2.78T</b><br><sub>maximum parameter count</sub></td>
-<td align="center"><b>6</b><br><sub>model adapters</sub></td>
-<td align="center"><b>6</b><br><sub>public generation paths</sub></td>
-<td align="center"><b>415</b><br><sub>default tests passing</sub></td>
+<td align="center"><b>7</b><br><sub>model adapters</sub></td>
+<td align="center"><b>7</b><br><sub>public generation paths</sub></td>
+<td align="center"><b>453</b><br><sub>default tests passing</sub></td>
 <td align="center"><b>0</b><br><sub>GPUs required</sub></td>
 </tr>
 </table>
@@ -45,9 +45,9 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4 on bounded-memory, CPU-only
 </div>
 
 > [!WARNING]
-> Urbilateria is an experimental learning and model-forensics project. Its scalar runtimes favor
+> Urbilateria is an experimental learning and model-forensics project. Its CPU runtimes favor
 > readable, runnable behavior over production throughput. Large-checkpoint generation works for
-> GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.8, and Hy4, but numerical accuracy, output quality, memory
+> GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.6/3.8, and Hy4, but numerical accuracy, output quality, memory
 > use, and speed carry no production guarantees. DeepSeek-V4.1 includes a scalar base-text
 > generation path validated against an independent real-weight BOS oracle, with batched prompt
 > prefill and weight residency planned within the RAM budget.
@@ -65,8 +65,11 @@ model weights are included in this repository.
 Building from source requires Rust 1.88 or newer. With rustup, this repository automatically selects Rust 1.88.0
 using `rust-toolchain.toml`, including rustfmt and Clippy.
 
-Version 0.2.2 adds automatic KV-cache reuse in TUI conversations and the interactive `urb chat` CLI; see
-[CHANGELOG.md](CHANGELOG.md) for all changes.
+Version 0.2.3 adds experimental Qwen3.6-35B-A3B native BF16 text inference in the CLI and TUI,
+with thinking/no-thinking chat, persistent sessions, RAM-budgeted weight caches, batched prefill,
+and AVX2 CPU optimizations. Prefill defaults to 128-token chunks when all routed experts fit in
+the planned cache, or 32 tokens for partial caches. See [CHANGELOG.md](CHANGELOG.md) for all changes
+and the [Qwen3.6 guide](src/models/qwen3_6/README.md) for usage, validation, and measured performance.
 After publication, [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) will
 provide binaries for Linux x86_64 (glibc 2.35+) and Apple Silicon macOS (deployment target 13+,
 tested on 15). They include the UI and need no Rust installation. See
@@ -128,7 +131,7 @@ tokens, and `--kv-bytes 4` (`2` is also accepted). On macOS, pass `--ram-gib` ex
 `/preflight` defaults to one context token and zero expert-cache slots per layer.
 Planning reports estimates and checkpoint warnings; preflight validates headers and shows
 family-specific requirements without loading weights or attempting inference.
-Qwen3.8 uses `/preflight` for hybrid memory requirements and does not support `/plan`.
+Qwen3.6 and Qwen3.8 use `/preflight` for hybrid memory requirements and do not support `/plan`.
 Kimi-K3 preflight checks schema only, so context/cache options do not affect it; `--partial`
 validates visible decoder layers during a transfer without asserting checkpoint completeness.
 
@@ -258,7 +261,7 @@ Run the `generate` command:
 
 `generate` requires an explicit RAM limit and `--allow-large-model`; a short generation can still
 read many gigabytes from storage. The public command supports GLM-5.2, DeepSeek-V4,
-DeepSeek-V4.1, text-only Kimi-K3, text-only Qwen3.8, and Hy4 today. Qwen3.8 uses the release's
+DeepSeek-V4.1, text-only Kimi-K3, text-only Qwen3.6/3.8, and Hy4 today. Qwen3.8 uses the release's
 always-thinking chat template, so omit `--no-thinking` for that model. Hy4 generation is exact through 2,048 total
 prompt+generation tokens, where its top-2,048 DSA selection contains the complete causal history.
 
@@ -376,7 +379,16 @@ keeps the compact BF16 trunk bounded by layer, and preserves recurrent KDA plus 
 state. XTML is assembled from trusted structural segments and escaped untrusted content. Generation
 stops on `<|end_of_msg|>` (163586), not the tokenizer metadata's `[EOS]` token (163585).
 
-**Qwen3.6-35B-A3B.** Native BF16 text adapter with 40 hybrid-attention layers, top-8/256 experts, bounded expert-slice loading, thinking/no-thinking ChatML, and CLI/TUI generation and preflight. The complete 26-shard schema, two-step Transformers comparison, and prefill consistency are validated. Experimental: BF16 numerical differences remain; vision and MTP are schema-only. See [usage, memory, and validation](src/models/qwen3_6/README.md).
+**Qwen3.6-35B-A3B.** Native BF16 text adapter with 40 hybrid-attention layers, top-8/256 experts,
+thinking/no-thinking ChatML, and CLI/TUI generation, preflight, and persistent chat sessions.
+The RAM planner retains decoder layers, the LM head, and lazy expert caches while reserving
+sequence state and scratch; smaller budgets retain a streaming fallback. Prefill batches
+projections and groups tokens by expert, using 128-token chunks for full expert caches and
+32-token defaults for partial caches. AVX2 kernels and a shared CPU pool accelerate BF16,
+DeltaNet, GQA, and expert execution while preserving deterministic accumulation and rollback.
+The complete 26-shard schema, two-step Transformers comparison, resident/streamed parity,
+prefill boundaries, and checkpoint replay are validated. BF16 numerical differences remain;
+vision and MTP are schema-only. See [usage, memory, validation, and CPU benchmarks](src/models/qwen3_6/README.md).
 
 **Qwen3.8.** The adapter is pinned to `model_type="qwen3_5_moe_text"` and the released
 `Qwen/Qwen3.8-2.4T-A95B-FP8` ABI. It implements the base 92-layer text forward, top-10/512 routed
@@ -494,6 +506,7 @@ layer of confidence has its own gate:
 | DeepSeek-V4 | independent tiny oracle; real layer/token and tokenizer regressions | sustained performance work |
 | DeepSeek-V4.1 | exact headers, native MX payloads, complete Engram/CSA2/mHC base forward and public generation, layer-wise prefill, real 40-layer BOS routing and top-16-logit oracle | vision and DSpark execution |
 | Kimi-K3 | independent full-stack logits parity and known `Paris` continuation | sustained performance and revision-by-revision validation |
+| Qwen3.6 | complete schema; two-step Transformers numerical gates; exact resident/streamed, batched/incremental, and checkpoint-replay parity | long-context quality and broader workload/hardware performance validation |
 | Qwen3.8 | independent tiny FP32/BF16 graph, real FP8 expert payload, and real 92-layer full-logits oracles | sustained performance and multi-token release validation |
 | Hy4 | upstream iHC/Gated-MLA semantics; exact schema/MXFP8/expert payload gates; real 78-layer token and public CLI generation smoke | independent full-logits parity and >2,048-token IndexCache execution |
 
@@ -510,7 +523,7 @@ The model-free suite is fast and does not need a checkpoint:
 cargo test --all-targets --locked
 ```
 
-Current Linux result: **415 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
+Current Linux result: **453 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
 their model directory is supplied.
 
 <details>
@@ -534,6 +547,9 @@ KIMI_K3_MODEL_DIR=/path/to/Kimi-K3 \
 
 HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
   cargo test --release --locked --test hy4_real -- --ignored --nocapture
+
+QWEN36_MODEL_DIR=/path/to/Qwen3.6-35B-A3B \
+  cargo test --release --locked --test qwen3_6_real -- --ignored --nocapture --test-threads=1
 ```
 
 </details>
@@ -543,15 +559,15 @@ HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
 | Command | Purpose | Model support |
 | --- | --- | --- |
 | `ui [MODEL_DIR]` | Interactive terminal with history, completion, background analysis, tensor browsing, tokenization and streamed generation; 13 commands | Linux/macOS; same model coverage and generation limits as corresponding CLI commands |
-| `inspect` | Build a static parameter, quantization, tensor, and routing X-ray | All six adapters |
+| `inspect` | Build a static parameter, quantization, tensor, and routing X-ray | All seven adapters |
 | `plan` | Estimate resident, KV, scratch, and expert-cache budgets | GLM, DeepSeek, Kimi, Hy4 |
-| `preflight` | Validate exact runtime tensors and memory without payload reads | All six adapters |
+| `preflight` | Validate exact runtime tensors and memory without payload reads | All seven adapters |
 | `list` | Search exact tensor names | All safetensors checkpoints |
 | `probe` | Sample one tensor without loading the checkpoint | All safetensors checkpoints |
-| `tokenize` | Encode raw text or a model-native chat turn | All six adapters |
-| `decode` | Decode comma-separated token IDs | All six adapters |
-| `generate` | Run RAM-planned greedy generation | All six adapters |
-| `explain` | Print the token path and tensor geometry | All six adapters |
+| `tokenize` | Encode raw text or a model-native chat turn | All seven adapters |
+| `decode` | Decode comma-separated token IDs | All seven adapters |
+| `generate` | Run RAM-planned greedy generation | All seven adapters |
+| `explain` | Print the token path and tensor geometry | All seven adapters |
 
 Every analysis command that supports it can emit JSON for automation. Run `urb help` for the exact
 flags and defaults.

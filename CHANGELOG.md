@@ -2,55 +2,58 @@
 
 ## Unreleased
 
-- Use 128-token Qwen3.6 prefill chunks when all routed experts fit in the planned
-  cache, retaining 32-token defaults for partial caches and the same scratch budget.
-- Extend prefill parity checks through 128-token boundaries, singleton tails,
-  checkpoint replay, and continued decoding; make profiler defaults follow the RAM plan.
-- Vectorize Qwen BF16 activation rounding with AVX2 while preserving ties-to-even,
-  finite-overflow rejection, the first failing element, and partial-write behavior.
-- Enter the CPU pool once per Qwen3.6 forward or prefill, including the LM head,
-  reducing repeated caller-to-pool dispatch while preserving profiling context,
-  single-worker execution, and deterministic results.
-- Overlap Qwen3.6 current-layer computation with one retained next-layer load on
-  the existing CPU pool; preserve streaming budgets and wait for both jobs on errors.
-- Reuse one DeltaNet transaction workspace across Qwen3.6 prefill layers and copy
-  recurrent state once per chunk, preserving numerical order and output-failure rollback.
-- Use Qwen3.6 RAM budgets for persistent decoder layers, LM head, and lazy routed-expert
-  caches, preserving the minimum-memory streaming fallback and session rewind behavior.
-- Vectorize BF16 payload validation, interleave four BF16 matrix rows without
-  reassociation, and traverse DeltaNet state contiguously with ordered reductions.
-- Reuse normalized DeltaNet keys/queries across value heads, remove per-head heap
-  scratch for native shapes, and parallelize independent head updates with ordered
-  AVX2 F64 projections while preserving state on errors.
-- Load and compute selected Qwen3.6 experts concurrently when the cache can retain
-  the complete set within budget; preserve deterministic BF16 accumulation.
-- Add numerical parity gates, cache-rewind checks, and a real-model CPU profiler.
-- Batch Qwen3.6 attention projections in bounded 32-token prefill chunks with
-  shared BF16 weight loads and unchanged per-token accumulation and causal order.
-- Cover batch tails, continuation across chunk boundaries, and rollback after
-  attention output-projection failures.
-- Group prefill tokens by routed expert when the full selection fits the RAM budget;
-  batch shared-expert projections while preserving BF16 rounding, cache counters,
-  and subsequent LRU eviction order. Keep the tokenwise fallback for smaller caches.
-- Add configurable same-process prefill crossover runs and separate prefill/decode
-  profiling totals without restarting resource sampling.
-- Vectorize DeltaNet finite-value validation without changing NaN/infinity rejection.
-- Compute shared and retained routed experts concurrently during Qwen3.6 decode,
-  keeping the shared contribution last and preserving the streaming fallback.
-- Traverse GQA values contiguously with ordered AVX2 F64 reductions and scalar tails;
-  preserve token-order sums and use stack scratch for native head widths.
-- Allow a UTF-8 prompt file in the Qwen3.6 profiler for longer-context comparisons.
-- Parallelize independent GQA heads above a 256K work threshold, preserving
-  per-head reductions, error order, and KV rollback while retaining the serial fallback.
+## [0.2.3]
+
+### Qwen3.6-35B-A3B text inference
 
 - Add experimental Qwen3.6-35B-A3B native BF16 text inference, with strict nested
   configuration and complete 26-shard/1,045-tensor validation.
 - Stream selected experts from packed gate/up/down tensors; reuse hybrid Qwen
   attention kernels and support bounded recurrent/GQA state and session reuse.
 - Wire CLI/TUI inspect, preflight, tokenize, chat, and generate; support the shipped
-  thinking/no-thinking template. Vision and MTP remain schema-only.
-- Add packed-expert offset/budget tests, official prompt fixtures, two-step real
-  Transformers numerical gates, and real prefill/decode consistency checks.
+  thinking/no-thinking ChatML template and persistent chat sessions.
+
+### CPU inference performance
+
+- Retain decoder layers, the LM head, and lazy routed-expert caches within the RAM
+  budget, reserving sequence state, session checkpoints, and scratch first. Preserve
+  the minimum-memory streaming fallback and weight caches across session rewind.
+- Batch attention projections and group prefill tokens by expert when the selected
+  experts fit in cache. Use 128-token chunks when all routed experts fit in the planned
+  cache, retaining 32-token defaults for partial caches and the same scratch budget.
+  Preserve BF16 accumulation, causal order, cache counters, and LRU eviction order.
+- Load and compute retained routed experts concurrently; overlap shared-expert work
+  during decode while accumulating its contribution last. Overlap current-layer
+  computation with one retained next-layer load on the existing CPU pool.
+- Enter the CPU pool once per forward or prefill, including the LM head, preserving
+  profiling context, direct single-worker execution, and deterministic results.
+- Vectorize BF16 payload validation and activation rounding with AVX2; interleave
+  matrix rows and share weight loads across batched inputs without reassociation.
+  Preserve ties-to-even rounding, finite-overflow rejection, the first failing element,
+  and partial-write behavior.
+- Traverse DeltaNet state contiguously, reuse normalized keys/queries and stack
+  scratch, and parallelize independent heads with ordered AVX2 F64 reductions.
+  Reuse one transaction workspace across prefill layers and copy state once per chunk,
+  preserving rollback and finite-value checks.
+- Traverse GQA values contiguously with ordered AVX2 F64 reductions and scalar tails.
+  Parallelize independent heads above a 256K work threshold while preserving error
+  order and KV rollback.
+
+### Profiling, validation, and scope
+
+- Add phase-level Qwen profiling and a real-model CPU harness with separate
+  prefill/decode totals, same-process batch-size comparisons, UTF-8 prompt files,
+  reproducible prompts, and defaults that follow the RAM plan.
+- Add packed-expert offset/budget tests, official prompt fixtures, and two-step real
+  Transformers numerical gates. Verify resident/streamed parity, cache rewind,
+  32/64/128-token prefill boundaries, singleton tails, continued decoding, and rollback.
+- Document CPU benchmark conditions, memory budgets, and numerical tolerances in the
+  [Qwen3.6 adapter guide](https://github.com/inspirewind/Urbilateria/blob/v0.2.3/src/models/qwen3_6/README.md).
+  Measurements distinguish initial runtime-cache population from warm reuse; they do not
+  establish cold-storage or hardware-independent throughput guarantees.
+- Qwen3.6 execution remains text-only. Vision and MTP tensors are schema-validated
+  but not executed; bounded Transformers comparisons do not establish bitwise parity
+  or long-context generation quality.
 
 ## [0.2.2]
 
@@ -166,6 +169,7 @@
 - Include model adapters, bounded-memory execution, tokenizer and chat-template support,
   runtime validation, profiling, and an interactive profile-trace viewer.
 
+[0.2.3]: https://github.com/inspirewind/Urbilateria/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/inspirewind/Urbilateria/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/inspirewind/Urbilateria/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/inspirewind/Urbilateria/compare/v0.1.0...v0.2.0

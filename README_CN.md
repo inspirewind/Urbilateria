@@ -12,23 +12,23 @@
 
 <p>
 一个纯 Rust 研究运行时，用于在内存有限的纯 CPU 机器上理解和运行<br>
-GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
+GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.6/3.8 与 Hy4 等前沿模型。
 </p>
 
 <p>
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="仅 CPU 运行时">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="五个模型家族">
-<img src="https://img.shields.io/badge/tests-415_passing-2e7d32?style=flat-square" alt="415 项测试通过">
+<img src="https://img.shields.io/badge/tests-453_passing-2e7d32?style=flat-square" alt="453 项测试通过">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT 许可证"></a>
 </p>
 
 <table>
 <tr>
 <td align="center"><b>2.78T</b><br><sub>最大支持参数</sub></td>
-<td align="center"><b>6</b><br><sub>模型适配器</sub></td>
-<td align="center"><b>6</b><br><sub>公开生成路径</sub></td>
-<td align="center"><b>415</b><br><sub>默认测试通过</sub></td>
+<td align="center"><b>7</b><br><sub>模型适配器</sub></td>
+<td align="center"><b>7</b><br><sub>公开生成路径</sub></td>
+<td align="center"><b>453</b><br><sub>默认测试通过</sub></td>
 <td align="center"><b>0</b><br><sub>所需 GPU</sub></td>
 </tr>
 </table>
@@ -45,8 +45,8 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 </div>
 
 > [!WARNING]
-> Urbilateria 是一个实验性的学习与模型取证项目。其标量运行时优先考虑行为的可读性和
-> 可运行性，而非生产吞吐量。GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4
+> Urbilateria 是一个实验性的学习与模型取证项目。其 CPU 运行时优先考虑行为的可读性和
+> 可运行性，而非生产吞吐量。GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.6/3.8 与 Hy4
 > 已可进行大检查点生成，但数值精度、输出质量、内存占用和速度不保证生产性能。
 > DeepSeek-V4.1 提供了标量基础文本生成路径，并已通过独立真实权重 BOS 预言机验证；
 > 支持批量提示词预填充，并在 RAM 预算内规划权重常驻。
@@ -62,8 +62,11 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.8 与 Hy4等前沿模型。
 从源码构建需要 Rust 1.88 或更新版本。使用 rustup 时，仓库会通过 `rust-toolchain.toml` 自动选择
 Rust 1.88.0，并包含 rustfmt 和 Clippy。
 
-0.2.2 加入 TUI 多轮对话自动 KV cache 复用与交互式 `urb chat` CLI，完整变更见
-[CHANGELOG.md](CHANGELOG.md)。正式发布后，
+0.2.3 加入实验性的 Qwen3.6-35B-A3B 原生 BF16 文本推理，支持 CLI/TUI、思考与非思考聊天、
+常驻会话、RAM 预算内的权重缓存、批量预填充和 AVX2 CPU 优化。规划的缓存可容纳全部路由
+专家时默认使用 128-token 预填充分块，部分缓存默认使用 32-token 分块。完整变更见
+[CHANGELOG.md](CHANGELOG.md)，用法、验证和实测性能见 [Qwen3.6 适配文档](src/models/qwen3_6/README.md)。
+正式发布后，
 [GitHub Releases](https://github.com/inspirewind/Urbilateria/releases) 将提供 Linux x86_64
 （glibc 2.35+）与 Apple Silicon macOS（部署目标 13+，在 15 上测试）的预编译程序，
 默认包含 UI，运行无需安装 Rust。压缩包内容与校验方法见 [RELEASING.md](RELEASING.md)。
@@ -119,7 +122,7 @@ cargo build --release --locked
 `/plan` 默认使用检测到的可用 RAM、2,048 个上下文 token、`--kv-bytes 4`（也接受 `2`）。
 macOS 需要显式传入 `--ram-gib`。`/preflight` 默认检查 1 个上下文 token、每层 0 个专家缓存槽位。
 内存规划展示估算及检查点警告；preflight 验证文件头并展示模型家族对应的需求，不加载权重或执行推理。
-Qwen3.8 通过 `/preflight` 查看混合状态内存需求，不支持 `/plan`。
+Qwen3.6 和 Qwen3.8 通过 `/preflight` 查看混合状态内存需求，不支持 `/plan`。
 Kimi-K3 的 preflight 仅检查 schema，context/cache 参数不影响检查；`--partial` 用于传输过程中
 验证可见的 decoder 层，不代表整个检查点完整。
 
@@ -236,7 +239,7 @@ Xcode Command Line Tools；运行编译好的程序不需要 Rust、Python 或 N
 
 `generate` 要求显式指定 RAM 上限和 `--allow-large-model`；即使只生成很短的内容，
 也可能从存储设备读取许多 GiB 数据。当前公开命令支持 GLM-5.2、DeepSeek-V4、
-DeepSeek-V4.1、纯文本 Kimi-K3、纯文本 Qwen3.8 和 Hy4。Qwen3.8 使用该版本始终开启思考的聊天模板，
+DeepSeek-V4.1、纯文本 Kimi-K3、纯文本 Qwen3.6/3.8 和 Hy4。Qwen3.8 使用该版本始终开启思考的聊天模板，
 因此对该模型应省略 `--no-thinking`。Hy4 可在提示词与生成 token 总数不超过 2,048
 时精确执行，此时其 top-2,048 DSA 选择包含完整的因果历史。
 
@@ -341,7 +344,14 @@ top-6 MoE。解码器层和 LM head 在 RAM 预算内常驻，预算不足时按
 片段组装，同时转义不可信内容。生成在 `<|end_of_msg|>`（163586）停止，而不是在
 tokenizer 元数据的 `[EOS]` token（163585）停止。
 
-**Qwen3.6-35B-A3B。** 新增原生 BF16 文本适配：40 层混合注意力、top-8/256 专家、按专家切片读取、思考/非思考聊天模板，以及 CLI/TUI 生成与预检。26 个分片的完整 schema 已验证，真实权重两步 Transformers 对比和预填充一致性测试已通过。当前属于实验性实现，存在 BF16 数值误差；视觉和 MTP 仅校验，不执行。运行方式、误差范围和内存说明见 [适配文档](src/models/qwen3_6/README.md)。
+**Qwen3.6-35B-A3B。** 原生 BF16 文本适配器，包含 40 层混合注意力、top-8/256 专家、
+思考/非思考 ChatML，以及 CLI/TUI 生成、预检和常驻聊天会话。RAM 规划器先预留序列状态与
+暂存空间，再驻留解码器层、LM head 和按需填充的专家缓存；较小预算保留流式执行路径。
+预填充批量计算投影并按专家分组 token：完整专家缓存默认使用 128-token 分块，部分缓存
+默认使用 32-token 分块。AVX2 内核与共享 CPU 池加速 BF16、DeltaNet、GQA 和专家执行，
+同时保持确定性累加与状态回滚。26 个分片的完整 schema、真实权重两步 Transformers 对比、
+常驻/流式一致性、预填充分块边界和检查点回放均已验证。BF16 数值误差仍存在；视觉和 MTP
+仅校验，不执行。用法、内存、验证与 CPU 基准见 [适配文档](src/models/qwen3_6/README.md)。
 
 **Qwen3.8。** 适配器固定到 `model_type="qwen3_5_moe_text"` 以及已发布的
 `Qwen/Qwen3.8-2.4T-A95B-FP8` ABI。它实现 92 层基础文本 forward、top-10/512
@@ -458,6 +468,7 @@ Urbilateria 将“文件看起来合理”与“模型生成正确 logits”区�
 | DeepSeek-V4 | 独立微型预言机；真实层/token 与 tokenizer 回归 | 持续性能工作 |
 | DeepSeek-V4.1 | 精确头部、原生 MX payload、完整 Engram/CSA2/mHC 基础 forward 与公开生成、按层预填充、真实 40 层 BOS 路由与 top-16-logit 预言机 | 视觉与 DSpark 执行 |
 | Kimi-K3 | 独立全栈 logits 一致性和已知的 `Paris` 延续 | 持续性能和逐版本验证 |
+| Qwen3.6 | 完整 schema；两步 Transformers 数值门禁；常驻/流式、批量/逐 token 及检查点回放的精确一致性 | 长上下文质量及更多负载、硬件上的性能验证 |
 | Qwen3.8 | 独立微型 FP32/BF16 图、真实 FP8 专家 payload 和真实 92 层完整 logits 预言机 | 持续性能和发布版本多 token 验证 |
 | Hy4 | 上游 iHC/Gated-MLA 语义；精确 schema/MXFP8/专家 payload 门禁；真实 78 层 token 与公开 CLI 生成 smoke | 独立完整 logits 一致性和超过 2,048 token 的 IndexCache 执行 |
 
@@ -473,7 +484,7 @@ argmax 和相同的 top 20 token。在全部 248,320 个 logits 上，余弦相�
 cargo test --all-targets --locked
 ```
 
-当前 Linux 结果：**415 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
+当前 Linux 结果：**453 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
 模型目录。
 
 <details>
@@ -497,6 +508,9 @@ KIMI_K3_MODEL_DIR=/path/to/Kimi-K3 \
 
 HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
   cargo test --release --locked --test hy4_real -- --ignored --nocapture
+
+QWEN36_MODEL_DIR=/path/to/Qwen3.6-35B-A3B \
+  cargo test --release --locked --test qwen3_6_real -- --ignored --nocapture --test-threads=1
 ```
 
 </details>
@@ -506,15 +520,15 @@ HY4_MODEL_DIR=/path/to/hy4-preview-fp8 \
 | 命令 | 用途 | 模型支持 |
 | --- | --- | --- |
 | `ui [MODEL_DIR]` | 带历史、补全及后台模型分析、张量浏览、分词与流式生成的交互式终端；13 个命令 | Linux/macOS；模型覆盖及生成限制与对应 CLI 命令一致 |
-| `inspect` | 构建静态参数、量化、张量与路由透视 | 全部六个适配器 |
+| `inspect` | 构建静态参数、量化、张量与路由透视 | 全部七个适配器 |
 | `plan` | 估算常驻、KV、暂存空间与专家缓存预算 | GLM、DeepSeek、Kimi、Hy4 |
-| `preflight` | 不读取 payload，验证精确运行时张量与内存 | 全部六个适配器 |
+| `preflight` | 不读取 payload，验证精确运行时张量与内存 | 全部七个适配器 |
 | `list` | 搜索精确张量名称 | 所有 safetensors 检查点 |
 | `probe` | 在不加载检查点的情况下采样一个张量 | 所有 safetensors 检查点 |
-| `tokenize` | 编码原始文本或模型原生聊天轮次 | 全部六个适配器 |
-| `decode` | 解码逗号分隔的 token ID | 全部六个适配器 |
-| `generate` | 运行经过 RAM 规划的贪心生成 | 全部六个适配器 |
-| `explain` | 输出 token 路径与张量几何 | 全部六个适配器 |
+| `tokenize` | 编码原始文本或模型原生聊天轮次 | 全部七个适配器 |
+| `decode` | 解码逗号分隔的 token ID | 全部七个适配器 |
+| `generate` | 运行经过 RAM 规划的贪心生成 | 全部七个适配器 |
+| `explain` | 输出 token 路径与张量几何 | 全部七个适配器 |
 
 所有支持 JSON 的分析命令都可以为自动化输出 JSON。运行 `urb help` 查看准确的参数
 和默认值。
