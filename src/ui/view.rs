@@ -1,5 +1,6 @@
 use super::app::App;
 use super::commands::clean_text;
+use super::motion;
 use super::report::Kind;
 use super::worker::Task;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -7,11 +8,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use std::time::Instant;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let now = Instant::now();
     let area = frame.area();
     if area.width < 36 || area.height < 10 {
         frame.render_widget(
@@ -107,10 +110,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Kind::Warning => ("!", Color::Yellow),
             Kind::Error => ("!", Color::Red),
         };
-        lines.push(Line::from(Span::styled(
-            format!(" {marker} {}", entry.title),
-            Style::new().fg(color).bold(),
-        )));
+        if let Some(pending) = app.pending.as_ref().filter(|pending| {
+            matches!(pending.task, Task::Generate(_)) && entry.task_id == Some(pending.id)
+        }) {
+            let elapsed = now.saturating_duration_since(pending.started);
+            let mut spans = vec![Span::styled(
+                format!(" {} ", motion::spinner(elapsed)),
+                Style::new().fg(color).bold(),
+            )];
+            spans.extend(motion::generating(elapsed));
+            spans.push(Span::styled(
+                " · Esc to stop",
+                Style::new().fg(color).bold(),
+            ));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(" {marker} {}", entry.title),
+                Style::new().fg(color).bold(),
+            )));
+        }
         for detail in &entry.details {
             for (index, text) in detail.text.lines().enumerate() {
                 let mut spans = vec![Span::raw("   ")];
@@ -196,9 +215,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let mut status = match &app.pending {
         Some(pending) => {
-            let elapsed = pending.started.elapsed();
-            let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-                [(elapsed.as_millis() / 100 % 10) as usize];
+            let elapsed = now.saturating_duration_since(pending.started);
+            let spinner = motion::spinner(elapsed);
             format!(
                 " {spinner} {} · {:.1}s",
                 if pending.cancelling {

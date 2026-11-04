@@ -4,6 +4,7 @@ mod app;
 mod chat;
 mod commands;
 mod generate;
+mod motion;
 mod report;
 mod terminal;
 mod view;
