@@ -146,6 +146,7 @@ impl Bf16Matrix {
         let row_bytes = self.cols * 2;
         let rows = &self.little_endian_bytes[start * row_bytes..end * row_bytes];
         let work = count.saturating_mul(self.cols);
+        let parallel = should_parallelize(count, work);
         let _profile = span_with_work(ProfileStage::MatvecBf16, work);
         let mut output = vec![0.0; count];
         #[cfg(target_arch = "x86_64")]
@@ -159,16 +160,56 @@ impl Bf16Matrix {
             }
             dot_bf16(row, input)
         };
-        if should_parallelize(count, work) {
-            install(|| {
-                output
-                    .par_iter_mut()
-                    .zip(rows.par_chunks_exact(row_bytes))
-                    .for_each(|(output, row)| *output = dot(row));
+        #[cfg(target_arch = "x86_64")]
+        let tiled = exact_avx2
+            && (!parallel || {
+                let workers = crate::execution::worker_threads();
+                // Keep enough independent tiles to occupy the pool. Larger pools already
+                // saturate LM-head memory reads; their original row schedule stays intact.
+                workers <= 4 && count / 8 >= workers
             });
-        } else {
+        #[cfg(not(target_arch = "x86_64"))]
+        let tiled = false;
+        if !tiled {
+            if parallel {
+                install(|| {
+                    output
+                        .par_iter_mut()
+                        .zip(rows.par_chunks_exact(row_bytes))
+                        .for_each(|(output, row)| *output = dot(row));
+                });
+            } else {
+                for (output, row) in output.iter_mut().zip(rows.chunks_exact(row_bytes)) {
+                    *output = dot(row);
+                }
+            }
+            return Ok(output);
+        }
+        let compute_rows = |output: &mut [f32], rows: &[u8]| {
+            #[cfg(target_arch = "x86_64")]
+            if exact_avx2 && output.len() == 8 {
+                // SAFETY: AVX2 is detected, and these are eight complete weight rows.
+                unsafe { dot_bf16_rows_f64_ordered_avx2::<2>(rows, input, output) };
+                return;
+            }
             for (output, row) in output.iter_mut().zip(rows.chunks_exact(row_bytes)) {
                 *output = dot(row);
+            }
+        };
+        let rows_per_task = 8;
+        if parallel {
+            install(|| {
+                output
+                    .par_chunks_mut(rows_per_task)
+                    .zip(rows.par_chunks(row_bytes * rows_per_task))
+                    .for_each(|(output, rows)| compute_rows(output, rows));
+            });
+        } else {
+            for (output, rows) in output
+                .chunks_mut(rows_per_task)
+                .zip(rows.chunks(row_bytes * rows_per_task))
+            {
+                compute_rows(output, rows);
             }
         }
         Ok(output)
@@ -245,7 +286,7 @@ impl Bf16Matrix {
     }
 
     /// Applies consecutive input rows without changing the FP32 GEMV reduction tree.
-    /// Each SIMD weight load is shared by up to eight independent input accumulators.
+    /// Two weight rows share each input load, with four inputs sharing each weight load.
     pub(crate) fn matmul_rows_fp32(
         &self,
         input: &[f32],
@@ -304,20 +345,62 @@ impl Bf16Matrix {
                 *value = dot_bf16(row, token);
             }
         };
-        if should_parallelize(self.rows, work) {
-            install(|| {
-                self.little_endian_bytes
-                    .par_chunks_exact(self.cols * 2)
-                    .zip(by_row.par_chunks_mut(batch))
-                    .for_each(|(row, values)| compute(row, values));
-            });
-        } else {
-            for (row, values) in self
-                .little_endian_bytes
+        let compute_pair = |rows: &[u8], values: &mut [f32]| {
+            #[cfg(target_arch = "x86_64")]
+            if avx2_fma && values.len() == batch * 2 {
+                let (first, second) = values.split_at_mut(batch);
+                let mut offset = 0;
+                for width in [4, 2, 1] {
+                    while batch - offset >= width {
+                        let inputs = &input[offset * self.cols..(offset + width) * self.cols];
+                        let a = &mut first[offset..offset + width];
+                        let b = &mut second[offset..offset + width];
+                        // SAFETY: detected features, two complete weight rows, and N complete
+                        // input/output slices satisfy the helper's bounded SIMD accesses.
+                        unsafe {
+                            match width {
+                                4 => {
+                                    dot_bf16_two_rows_inputs_fp32_avx2_fma::<4>(rows, inputs, a, b)
+                                }
+                                2 => {
+                                    dot_bf16_two_rows_inputs_fp32_avx2_fma::<2>(rows, inputs, a, b)
+                                }
+                                1 => {
+                                    dot_bf16_two_rows_inputs_fp32_avx2_fma::<1>(rows, inputs, a, b)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        offset += width;
+                    }
+                }
+                return;
+            }
+            for (row, values) in rows
                 .chunks_exact(self.cols * 2)
-                .zip(by_row.chunks_mut(batch))
+                .zip(values.chunks_mut(batch))
             {
                 compute(row, values);
+            }
+        };
+        #[cfg(target_arch = "x86_64")]
+        let rows_per_task = if avx2_fma { 2 } else { 1 };
+        #[cfg(not(target_arch = "x86_64"))]
+        let rows_per_task = 1;
+        if should_parallelize(self.rows.div_ceil(rows_per_task), work) {
+            install(|| {
+                self.little_endian_bytes
+                    .par_chunks(self.cols * 2 * rows_per_task)
+                    .zip(by_row.par_chunks_mut(batch * rows_per_task))
+                    .for_each(|(rows, values)| compute_pair(rows, values));
+            });
+        } else {
+            for (rows, values) in self
+                .little_endian_bytes
+                .chunks(self.cols * 2 * rows_per_task)
+                .zip(by_row.chunks_mut(batch * rows_per_task))
+            {
+                compute_pair(rows, values);
             }
         }
         if by_row.iter().any(|value| !value.is_finite()) {
@@ -441,6 +524,68 @@ unsafe fn dot_bf16_f64_ordered_avx2(row: &[u8], input: &[f32]) -> f32 {
     sum as f32
 }
 
+/// Transpose four-column register tiles so F64 lanes hold independent output rows.
+/// Each row still adds products in column order, with separate multiply/add operations.
+/// Native weights remain row-major; no packed copy or widened matrix is allocated.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_bf16_rows_f64_ordered_avx2<const N: usize>(
+    rows: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let stride = input.len() * 2;
+    debug_assert_eq!(rows.len(), N * 4 * stride);
+    debug_assert_eq!(output.len(), N * 4);
+    let complete = input.len() / 4 * 4;
+    let mut sums = [_mm256_set1_pd(-0.0); N];
+    for offset in (0..complete).step_by(4) {
+        let inputs = [
+            _mm256_set1_pd(f64::from(input[offset])),
+            _mm256_set1_pd(f64::from(input[offset + 1])),
+            _mm256_set1_pd(f64::from(input[offset + 2])),
+            _mm256_set1_pd(f64::from(input[offset + 3])),
+        ];
+        for (group, sum) in sums.iter_mut().enumerate() {
+            let load_row = |row| {
+                let ptr = rows.as_ptr().add((group * 4 + row) * stride + offset * 2);
+                let packed = _mm_loadl_epi64(ptr.cast());
+                _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(packed), 16))
+            };
+            let a = load_row(0);
+            let b = load_row(1);
+            let c = load_row(2);
+            let d = load_row(3);
+            let ab_low = _mm_unpacklo_ps(a, b);
+            let ab_high = _mm_unpackhi_ps(a, b);
+            let cd_low = _mm_unpacklo_ps(c, d);
+            let cd_high = _mm_unpackhi_ps(c, d);
+            let columns = [
+                _mm_movelh_ps(ab_low, cd_low),
+                _mm_movehl_ps(cd_low, ab_low),
+                _mm_movelh_ps(ab_high, cd_high),
+                _mm_movehl_ps(cd_high, ab_high),
+            ];
+            for (weights, values) in columns.into_iter().zip(inputs) {
+                *sum = _mm256_add_pd(*sum, _mm256_mul_pd(_mm256_cvtps_pd(weights), values));
+            }
+        }
+    }
+    for (group, sum) in sums.into_iter().enumerate() {
+        let mut lanes = [0.0; 4];
+        _mm256_storeu_pd(lanes.as_mut_ptr(), sum);
+        for (lane, mut sum) in lanes.into_iter().enumerate() {
+            let row = group * 4 + lane;
+            for (column, &value) in input.iter().enumerate().skip(complete) {
+                let byte = row * stride + column * 2;
+                sum += f64::from(decode_bf16(&rows[byte..byte + 2])) * f64::from(value);
+            }
+            output[row] = sum as f32;
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_bf16_fp32_avx2_fma(row: &[u8], input: &[f32]) -> f32 {
@@ -494,6 +639,50 @@ unsafe fn dot_bf16_inputs_fp32_avx2_fma<const N: usize>(
             sum += decode_bf16(&row[column * 2..column * 2 + 2]) * input[token * cols + column];
         }
         output[token] = sum;
+    }
+}
+
+/// Two weight rows and N input rows share loads along both matrix dimensions. Each output
+/// retains the single-row kernel's eight-lane FMA accumulation and final reduction order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_two_rows_inputs_fp32_avx2_fma<const N: usize>(
+    rows: &[u8],
+    input: &[f32],
+    first: &mut [f32],
+    second: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let cols = rows.len() / 4;
+    debug_assert_eq!(input.len(), N * cols);
+    debug_assert_eq!(first.len(), N);
+    debug_assert_eq!(second.len(), N);
+    let stride = cols * 2;
+    let complete = cols / 8 * 8;
+    let mut a = [_mm256_setzero_ps(); N];
+    let mut b = a;
+    for column in (0..complete).step_by(8) {
+        let packed_a = _mm_loadu_si128(rows.as_ptr().add(column * 2).cast());
+        let packed_b = _mm_loadu_si128(rows.as_ptr().add(stride + column * 2).cast());
+        let wa = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed_a), 16));
+        let wb = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed_b), 16));
+        for token in 0..N {
+            let values = _mm256_loadu_ps(input.as_ptr().add(token * cols + column));
+            a[token] = _mm256_fmadd_ps(wa, values, a[token]);
+            b[token] = _mm256_fmadd_ps(wb, values, b[token]);
+        }
+    }
+    for (row, (accumulators, output)) in [(a, first), (b, second)].into_iter().enumerate() {
+        for (token, accumulator) in accumulators.into_iter().enumerate() {
+            let mut lanes = [0.0; 8];
+            _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+            let mut sum = lanes.into_iter().sum::<f32>();
+            for column in complete..cols {
+                let byte = row * stride + column * 2;
+                sum += decode_bf16(&rows[byte..byte + 2]) * input[token * cols + column];
+            }
+            output[token] = sum;
+        }
     }
 }
 
@@ -595,14 +784,89 @@ mod tests {
     }
 
     #[test]
+    fn ordered_row_tiles_preserve_scalar_bits_ranges_and_tails() {
+        for rows in [1, 3, 7, 8, 9, 15, 16, 17, 129] {
+            for cols in [1, 3, 4, 5, 7, 8, 9, 31, 65, 512, 2048] {
+                let weights = (0..rows * cols)
+                    .map(|i| ((i * 137 % 251) as f32 - 125.0) / 37.0)
+                    .collect::<Vec<_>>();
+                let input = (0..cols)
+                    .map(|i| ((i * 19 % 97) as f32 - 48.0) / 31.0)
+                    .collect::<Vec<_>>();
+                let bytes = bf16_bytes(&weights);
+                let expected = bytes
+                    .chunks_exact(cols * 2)
+                    .map(|row| dot_bf16(row, &input).to_bits())
+                    .collect::<Vec<_>>();
+                let matrix = Bf16Matrix::from_le_bytes(rows, cols, bytes).unwrap();
+                for (start, count) in [(0, rows), (1, rows - 1), (rows, 0)] {
+                    let actual = matrix.matvec_rows(start, count, &input).unwrap();
+                    assert_eq!(
+                        actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        expected[start..start + count],
+                        "rows={rows} cols={cols} start={start}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_row_tiles_preserve_cancellation_and_signed_zero() {
+        let patterns = [
+            [-0.0; 8],
+            [0.0; 8],
+            [1e30, 1.0, -1e30, 2.0, -0.0, 0.0, 1e-30, -1e-30],
+            [
+                f32::MAX,
+                f32::MIN,
+                f32::MIN_POSITIVE,
+                -f32::MIN_POSITIVE,
+                f32::from_bits(0x0001_0000),
+                -f32::from_bits(0x0001_0000),
+                0.0,
+                -0.0,
+            ],
+        ];
+        for cols in [3, 4, 5, 7, 8, 9, 65, 2048] {
+            let weights = (0..16 * cols)
+                .map(|i| patterns[(i / cols) % patterns.len()][i % cols % 8])
+                .collect::<Vec<_>>();
+            let bytes = bf16_bytes(&weights);
+            let matrix = Bf16Matrix::from_le_bytes(16, cols, bytes.clone()).unwrap();
+            for input in [
+                vec![1.0; cols],
+                vec![-1.0; cols],
+                vec![0.0; cols],
+                vec![-0.0; cols],
+                vec![f32::from_bits(1); cols],
+                vec![f32::MIN_POSITIVE; cols],
+                vec![f32::MAX; cols],
+            ] {
+                let expected = bytes
+                    .chunks_exact(cols * 2)
+                    .map(|row| dot_bf16(row, &input).to_bits())
+                    .collect::<Vec<_>>();
+                let actual = matrix.matvec(&input).unwrap();
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn batched_fp32_matches_individual_gemv_bits_across_tiles_and_tails() {
-        for rows in [1, 3, 17, 129] {
+        for rows in [1, 2, 3, 16, 17, 129] {
             for cols in [1, 7, 8, 9, 65, 512] {
                 let weights = (0..rows * cols)
                     .map(|i| ((i * 137 % 251) as f32 - 125.0) / 37.0)
                     .collect::<Vec<_>>();
                 let matrix = Bf16Matrix::from_le_bytes(rows, cols, bf16_bytes(&weights)).unwrap();
-                for batch in [1, 2, 3, 4, 7, 8, 9, 15, 16, 19, 32, 33, 128, 129] {
+                for batch in [
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 19, 31, 32, 33, 63, 64, 65, 128, 129,
+                ] {
                     let input = (0..batch * cols)
                         .map(|i| ((i * 19 % 97) as f32 - 48.0) / 31.0)
                         .collect::<Vec<_>>();

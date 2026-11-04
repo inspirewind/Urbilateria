@@ -1,6 +1,8 @@
 //! Header-only schema/runtime preflight with each model family's original result format.
 
-use crate::models::{deepseek_v4, deepseek_v41, glm, hy4, kimi_k3, qwen3_6, qwen3_8};
+use crate::models::{
+    deepseek_v4, deepseek_v41, glm, hy4, kimi_k3, qwen3_6, qwen3_8, qwen3_8_flash_next,
+};
 use crate::storage::TensorIndex;
 use crate::{CommonModelConfig, ModelConfig};
 use serde::Serialize;
@@ -43,6 +45,7 @@ pub struct Preflight {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum PreflightReport {
+    Qwen38FlashNext(Box<qwen3_8_flash_next::Qwen38FlashNextRuntimeRequirements>),
     Glm(Box<glm::runtime::GlmRuntimeRequirements>),
     DeepseekV4(Box<deepseek_v4::schema::DeepseekV4Requirements>),
     DeepseekV41(Box<deepseek_v41::schema::DeepseekV41Requirements>),
@@ -71,13 +74,20 @@ pub fn preflight_checkpoint(
             ModelConfig::Glm52(_) | ModelConfig::DeepseekV4(_) => Some("--partial is currently specific to an in-progress Kimi-K3 transfer"),
             ModelConfig::DeepseekV41(_) => Some("DeepSeek-V4.1 preflight validates the complete native release; --partial applies only to Kimi-K3 shard transfer"),
             ModelConfig::Hy4(_) => Some("Hy4 preflight validates the complete 130-shard release; --partial is Kimi-K3-specific"),
-            ModelConfig::Qwen36(_) | ModelConfig::Qwen38(_) => Some("Qwen hybrid runtime preflight validates the complete official checkpoint; --partial applies only to Kimi-K3 shard transfer"),
+            ModelConfig::Qwen38FlashNext(_) | ModelConfig::Qwen36(_) | ModelConfig::Qwen38(_) => Some("Qwen hybrid runtime preflight validates the complete official checkpoint; --partial applies only to Kimi-K3 shard transfer"),
         };
         if let Some(error) = error {
             return Err(error.into());
         }
     }
     let report = match config {
+        ModelConfig::Qwen38FlashNext(_) => PreflightReport::Qwen38FlashNext(Box::new(
+            qwen3_8_flash_next::Qwen38FlashNextRuntimeModel::inspect_requirements(
+                model_dir,
+                context,
+                expert_slots,
+            )?,
+        )),
         ModelConfig::Glm52(_) => PreflightReport::Glm(Box::new(
             glm::runtime::GlmRuntimeModel::inspect_requirements(model_dir, context, expert_slots)?,
         )),

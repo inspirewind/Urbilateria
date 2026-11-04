@@ -19,16 +19,16 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.6/3.8 与 Hy4 等前沿模型。
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="仅 CPU 运行时">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="五个模型家族">
-<img src="https://img.shields.io/badge/tests-453_passing-2e7d32?style=flat-square" alt="453 项测试通过">
+<img src="https://img.shields.io/badge/tests-480_passing-2e7d32?style=flat-square" alt="480 项测试通过">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT 许可证"></a>
 </p>
 
 <table>
 <tr>
 <td align="center"><b>2.78T</b><br><sub>最大支持参数</sub></td>
-<td align="center"><b>7</b><br><sub>模型适配器</sub></td>
-<td align="center"><b>7</b><br><sub>公开生成路径</sub></td>
-<td align="center"><b>453</b><br><sub>默认测试通过</sub></td>
+<td align="center"><b>8</b><br><sub>模型适配器</sub></td>
+<td align="center"><b>8</b><br><sub>公开生成路径</sub></td>
+<td align="center"><b>480</b><br><sub>默认测试通过</sub></td>
 <td align="center"><b>0</b><br><sub>所需 GPU</sub></td>
 </tr>
 </table>
@@ -61,6 +61,10 @@ GLM-5.2、DeepSeek-V4/V4.1、Kimi-K3、Qwen3.6/3.8 与 Hy4 等前沿模型。
 
 从源码构建需要 Rust 1.88 或更新版本。使用 rustup 时，仓库会通过 `rust-toolchain.toml` 自动选择
 Rust 1.88.0，并包含 rustfmt 和 Clippy。
+
+0.2.4 加入实验性的 Qwen3.8-Flash-Next 原生 BF16 文本推理及 CLI/TUI 支持，
+并进一步优化 Qwen3.6 的 CPU 计算和专家缓存。用法、验证及当前限制见
+[Flash-Next 适配文档](src/models/qwen3_8_flash_next/README.md)。
 
 0.2.3 加入实验性的 Qwen3.6-35B-A3B 原生 BF16 文本推理，支持 CLI/TUI、思考与非思考聊天、
 常驻会话、RAM 预算内的权重缓存、批量预填充和 AVX2 CPU 优化。规划的缓存可容纳全部路由
@@ -314,14 +318,14 @@ grouped output row range 与 compressor/indexer 投影。流式 BF16 matvec 会�
 
 ## 模型覆盖
 
-| 能力 | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 | Qwen3.6 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **检查点 ABI** | 转换后的 Colibri | 原生 48 分片 | 原生 48 分片；96,085 个张量 | 原生 96 分片 | 原生 213 分片 | 原生 130 分片 | 原生 26 分片 / 1,045 张量 |
-| **Tokenizer / 聊天** | byte-BPE | 原生文本聊天 | 原生文本聊天 + 数值 effort | TikToken + XTML | 始终思考的 ChatML | 原生 reasoning/no-think | 思考/非思考 ChatML |
-| **原生权重** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 | 打包 BF16 |
-| **注意力路径** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA | DeltaNet + GQA |
-| **公开 CLI 生成** | 实验性 | 实验性 | 实验性，文本基础运行时 | 实验性 | 实验性 | 实验性，≤2,048 tokens | 实验性，仅文本 |
-| **多模态执行** | 否 | 否 | 仅 schema | 仅 schema | 否 | 否 | 仅 schema |
+| 能力 | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 | Qwen3.6 | Qwen3.8-Flash-Next |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **检查点 ABI** | 转换后的 Colibri | 原生 48 分片 | 原生 48 分片；96,085 个张量 | 原生 96 分片 | 原生 213 分片 | 原生 130 分片 | 原生 26 分片 / 1,045 张量 | 原生 131 分片 / 1,658 张量 |
+| **Tokenizer / 聊天** | byte-BPE | 原生文本聊天 | 原生文本聊天 + 数值 effort | TikToken + XTML | 始终思考的 ChatML | 原生 reasoning/no-think | 思考/非思考 ChatML | 思考/非思考 ChatML |
+| **原生权重** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 | 打包 BF16 | 打包 BF16 + I64 PLE 哈希 |
+| **注意力路径** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA | DeltaNet + GQA | HC + sigmoid DeltaNet + QSA + PLE |
+| **公开 CLI 生成** | 实验性 | 实验性 | 实验性，文本基础运行时 | 实验性 | 实验性 | 实验性，≤2,048 tokens | 实验性，仅文本 | 实验性，仅文本 |
+| **多模态执行** | 否 | 否 | 仅 schema | 仅 schema | 否 | 否 | 仅 schema | 仅 schema |
 
 ### “原生”的含义
 
@@ -343,6 +347,11 @@ top-6 MoE。解码器层和 LM head 在 RAM 预算内常驻，预算不足时按
 使紧凑的 BF16 主干受层边界约束，并保留循环 KDA 与压缩 MLA 状态。XTML 由可信结构
 片段组装，同时转义不可信内容。生成在 `<|end_of_msg|>`（163586）停止，而不是在
 tokenizer 元数据的 `[EOS]` token（163585）停止。
+
+**Qwen3.8-Flash-Next。** 独立的原生 BF16 `qwen4_exp` 文本适配器：48 层、4 路 HC、
+sigmoid DeltaNet、QSA 稀疏注意力、按行读取的 n-gram PLE，以及 top-10/512 专家。
+支持 CLI/TUI 思考与非思考聊天、预算内缓存和会话状态复用；视觉/MTP 权重完成校验，
+不参与文本执行。命令、验证和限制见 [Flash-Next 适配文档](src/models/qwen3_8_flash_next/README.md)。
 
 **Qwen3.6-35B-A3B。** 原生 BF16 文本适配器，包含 40 层混合注意力、top-8/256 专家、
 思考/非思考 ChatML，以及 CLI/TUI 生成、预检和常驻聊天会话。RAM 规划器先预留序列状态与
@@ -470,6 +479,7 @@ Urbilateria 将“文件看起来合理”与“模型生成正确 logits”区�
 | Kimi-K3 | 独立全栈 logits 一致性和已知的 `Paris` 延续 | 持续性能和逐版本验证 |
 | Qwen3.6 | 完整 schema；两步 Transformers 数值门禁；常驻/流式、批量/逐 token 及检查点回放的精确一致性 | 长上下文质量及更多负载、硬件上的性能验证 |
 | Qwen3.8 | 独立微型 FP32/BF16 图、真实 FP8 专家 payload 和真实 92 层完整 logits 预言机 | 持续性能和发布版本多 token 验证 |
+| Qwen3.8-Flash-Next | 独立 BF16 HC/QSA/PLE/DeltaNet 预言机；真实两步 logits；流式、预填充、会话回放一致性；公开 CLI 中文生成 | 长上下文质量、视觉/MTP 与持续性能验证 |
 | Hy4 | 上游 iHC/Gated-MLA 语义；精确 schema/MXFP8/专家 payload 门禁；真实 78 层 token 与公开 CLI 生成 smoke | 独立完整 logits 一致性和超过 2,048 token 的 IndexCache 执行 |
 
 对于 Qwen3.8 发布版 token `Hello`，独立 PyTorch streamer 与 Rust 运行时选择了相同的
@@ -484,7 +494,7 @@ argmax 和相同的 top 20 token。在全部 248,320 个 logits 上，余弦相�
 cargo test --all-targets --locked
 ```
 
-当前 Linux 结果：**453 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
+当前 Linux 结果：**480 项通过，0 项失败**；真实检查点测试会被显式忽略，除非提供对应的
 模型目录。
 
 <details>

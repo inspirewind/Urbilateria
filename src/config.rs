@@ -12,6 +12,7 @@ pub use crate::models::hy4::Hy4Config;
 pub use crate::models::kimi_k3::KimiK3Config;
 pub use crate::models::qwen3_6::Qwen36Config;
 pub use crate::models::qwen3_8::Qwen38Config;
+pub use crate::models::qwen3_8_flash_next::Qwen38FlashNextConfig;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -60,6 +61,7 @@ pub enum ModelFamily {
     KimiK3,
     Qwen38,
     Qwen36,
+    Qwen38FlashNext,
 }
 
 impl fmt::Display for ModelFamily {
@@ -70,6 +72,7 @@ impl fmt::Display for ModelFamily {
             Self::DeepseekV41 => f.write_str("DeepSeek-V4.1-Flash"),
             Self::Hy4 => f.write_str("Hy4-preview-FP8"),
             Self::KimiK3 => f.write_str("Kimi-K3"),
+            Self::Qwen38FlashNext => f.write_str("Qwen3.8-Flash-Next"),
             Self::Qwen36 => f.write_str("Qwen3.6-35B-A3B"),
             Self::Qwen38 => f.write_str("Qwen3.8-2.4T-A95B-FP8"),
         }
@@ -86,6 +89,7 @@ pub enum ModelConfig {
     KimiK3(KimiK3Config),
     Qwen38(Qwen38Config),
     Qwen36(Qwen36Config),
+    Qwen38FlashNext(Qwen38FlashNextConfig),
 }
 
 /// The deliberately small view needed by model-agnostic CLI and generation code.
@@ -131,10 +135,11 @@ impl ModelConfig {
             "deepseek_v41" => DeepseekV41Config::from_json_str(json).map(Self::DeepseekV41),
             "hy_v4" => Hy4Config::from_json_str(json).map(Self::Hy4),
             "kimi_k3" => KimiK3Config::from_json_str(json).map(Self::KimiK3),
+            "qwen4_exp" => Qwen38FlashNextConfig::from_json_str(json).map(Self::Qwen38FlashNext),
             "qwen3_5_moe" => Qwen36Config::from_json_str(json).map(Self::Qwen36),
             "qwen3_5_moe_text" => Qwen38Config::from_json_str(json).map(Self::Qwen38),
             other => Err(ConfigError::Invalid(format!(
-                "unsupported model_type={other:?}; supported values are \"glm_moe_dsa\", \"deepseek_v4\", \"deepseek_v41\", \"hy_v4\", \"kimi_k3\", \"qwen3_5_moe\", and the release-specific \"qwen3_5_moe_text\""
+                "unsupported model_type={other:?}; supported values are \"glm_moe_dsa\", \"deepseek_v4\", \"deepseek_v41\", \"hy_v4\", \"kimi_k3\", \"qwen3_5_moe\", \"qwen4_exp\", and the release-specific \"qwen3_5_moe_text\""
             ))),
         }
     }
@@ -148,6 +153,7 @@ impl ModelConfig {
             Self::KimiK3(_) => ModelFamily::KimiK3,
             Self::Qwen38(_) => ModelFamily::Qwen38,
             Self::Qwen36(_) => ModelFamily::Qwen36,
+            Self::Qwen38FlashNext(_) => ModelFamily::Qwen38FlashNext,
         }
     }
 
@@ -198,6 +204,18 @@ impl ModelConfig {
                 max_position_embeddings: config.text_config.max_position_embeddings,
                 eos_token_ids: vec![config.eos_token_id],
             },
+            Self::Qwen38FlashNext(config) => CommonModelConfig {
+                family: ModelFamily::Qwen38FlashNext,
+                model_type: config.model_type.clone(),
+                vocab_size: config.vocab_size,
+                hidden_size: config.hidden_size,
+                num_hidden_layers: config.num_hidden_layers,
+                max_position_embeddings: config.max_position_embeddings,
+                // The effective chat stop set lives in generation_config.json and is validated
+                // by Qwen38FlashNextGenerationConfig. This config-only view deliberately exposes only the
+                // EOS identity declared by config.json.
+                eos_token_ids: vec![config.eos_token_id],
+            },
             Self::Qwen36(config) => CommonModelConfig {
                 family: ModelFamily::Qwen36,
                 model_type: config.model_type.clone(),
@@ -233,7 +251,8 @@ impl ModelConfig {
             | Self::Hy4(_)
             | Self::KimiK3(_)
             | Self::Qwen38(_)
-            | Self::Qwen36(_) => None,
+            | Self::Qwen36(_)
+            | Self::Qwen38FlashNext(_) => None,
         }
     }
 
@@ -244,7 +263,8 @@ impl ModelConfig {
             | Self::Hy4(_)
             | Self::KimiK3(_)
             | Self::Qwen38(_)
-            | Self::Qwen36(_) => None,
+            | Self::Qwen36(_)
+            | Self::Qwen38FlashNext(_) => None,
             Self::DeepseekV4(config) => Some(config),
         }
     }
@@ -257,7 +277,8 @@ impl ModelConfig {
             | Self::Hy4(_)
             | Self::KimiK3(_)
             | Self::Qwen38(_)
-            | Self::Qwen36(_) => None,
+            | Self::Qwen36(_)
+            | Self::Qwen38FlashNext(_) => None,
         }
     }
 
@@ -269,7 +290,8 @@ impl ModelConfig {
             | Self::DeepseekV41(_)
             | Self::KimiK3(_)
             | Self::Qwen38(_)
-            | Self::Qwen36(_) => None,
+            | Self::Qwen36(_)
+            | Self::Qwen38FlashNext(_) => None,
         }
     }
 
@@ -280,7 +302,8 @@ impl ModelConfig {
             | Self::DeepseekV41(_)
             | Self::Hy4(_)
             | Self::Qwen38(_)
-            | Self::Qwen36(_) => None,
+            | Self::Qwen36(_)
+            | Self::Qwen38FlashNext(_) => None,
             Self::KimiK3(config) => Some(config),
         }
     }
@@ -300,7 +323,7 @@ impl ModelConfig {
             | Self::Hy4(_)
             | Self::KimiK3(_) => None,
             Self::Qwen38(config) => Some(config),
-            Self::Qwen36(_) => None,
+            Self::Qwen36(_) | Self::Qwen38FlashNext(_) => None,
         }
     }
 }

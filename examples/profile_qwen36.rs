@@ -1,7 +1,9 @@
-//! Fixed-length benchmark: MODEL_DIR RAM_GIB THREADS TOKENS [PASSES] [BATCH_SIZES] [PROMPT_FILE].
+//! Fixed-length benchmark: MODEL_DIR RAM_GIB THREADS TOKENS [PASSES] [BATCH_SIZES] [PROMPT_FILE] [PROFILE].
 //! BATCH_SIZES is a comma-separated cycle in 1..=128; defaults to the model's cache-aware policy.
 //! RAM_GIB=0 forces the minimum-memory reference path. Warm pass replays the same
 //! prompt and continuation using retained weights, while clearing all causal state.
+//! PROFILE is on (default) or off. Off disables stage/resource sampling, reports no
+//! profile, and records Linux memory/I/O endpoints outside the timed inference calls.
 use std::{error::Error, path::Path, time::Instant};
 use urbilateria::{
     execution::configure_threads,
@@ -23,6 +25,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("TOKENS must be >= 2".into());
     }
     let pass_count: usize = args.get(5).map(String::as_str).unwrap_or("2").parse()?;
+    let profiling_enabled = match args.get(8).map(String::as_str).unwrap_or("on") {
+        "on" => true,
+        "off" => false,
+        _ => return Err("PROFILE must be on or off".into()),
+    };
     let batches = args
         .get(6)
         .map(|value| {
@@ -87,11 +94,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let batch_size = batches[pass % batches.len()];
         let checkpoint = state.checkpoint();
         let previous = state.expert_telemetry().clone();
-        let profile = ProfileSession::start_with_threads(Some(threads));
+        let resources_before = (!profiling_enabled).then(process_resources).flatten();
+        let profile = profiling_enabled.then(|| ProfileSession::start_with_threads(Some(threads)));
         let start = Instant::now();
         let mut step = model.prefill_tokens_with_batch_size(&tokens, &mut state, batch_size)?;
         let prefill_seconds = start.elapsed().as_secs_f64();
-        let prefill_stages = profile.stage_snapshot();
+        let prefill_stages = profile
+            .as_ref()
+            .map(ProfileSession::stage_snapshot)
+            .unwrap_or_default();
         let mut generated = Vec::new();
         let mut samples = Vec::new();
         let mut hashes = Vec::new();
@@ -116,8 +127,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 samples.push(start.elapsed().as_secs_f64());
             }
         }
-        let p = profile.finish();
-        let decode_stages = p.stages.iter().filter_map(|entry| {
+        let p = profile.map(ProfileSession::finish);
+        let resources_after = (!profiling_enabled).then(process_resources).flatten();
+        let decode_stages = p.iter().flat_map(|p| &p.stages).filter_map(|entry| {
             let before = prefill_stages.iter().find(|before| before.stage == entry.stage);
             let calls = entry.calls - before.map_or(0, |entry| entry.calls);
             (calls > 0).then(|| serde_json::json!({
@@ -130,14 +142,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         let telemetry = state.expert_telemetry();
         let tps = samples.len() as f64 / samples.iter().sum::<f64>();
         eprintln!("pass={pass} batch={batch_size} prefill={prefill_seconds:.3}s decode={tps:.3} tok/s misses={} tokens={generated:?}", telemetry.misses-previous.misses);
-        passes.push(serde_json::json!({"pass":pass, "prefill_batch_size":batch_size, "prefill_stages":prefill_stages, "decode_stage_totals":decode_stages, "prefill_seconds":prefill_seconds, "decode_tokens_per_second":tps, "decode_seconds":samples, "tokens":generated, "logit_hashes":hashes, "expert_hits":telemetry.hits-previous.hits, "expert_misses":telemetry.misses-previous.misses, "expert_read_bytes":telemetry.bytes_read-previous.bytes_read, "resident_expert_bytes":telemetry.resident_bytes, "profile":p}));
+        passes.push(serde_json::json!({"pass":pass, "prefill_batch_size":batch_size, "prefill_stages":prefill_stages, "decode_stage_totals":decode_stages, "prefill_seconds":prefill_seconds, "decode_tokens_per_second":tps, "decode_seconds":samples, "tokens":generated, "logit_hashes":hashes, "expert_hits":telemetry.hits-previous.hits, "expert_misses":telemetry.misses-previous.misses, "expert_read_bytes":telemetry.bytes_read-previous.bytes_read, "resident_expert_bytes":telemetry.resident_bytes, "profile":p, "resources_before":resources_before, "resources_after":resources_after}));
         state.restore(checkpoint)?;
     }
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"schema_version":1, "prefill_batch_cycle":batches, "prompt_file":args.get(7), "model":"qwen3.6-35b-a3b", "ram_gib":ram,"threads":threads,"prompt_tokens":tokens,"load_seconds":load_seconds,"cached_layers":cached_layers,"resident_lm_head":cached_head,"expert_slots_per_layer":options.expert_slots_per_layer,"passes":passes})
+            &serde_json::json!({"schema_version":1, "profiling_enabled":profiling_enabled, "prefill_batch_cycle":batches, "prompt_file":args.get(7), "model":"qwen3.6-35b-a3b", "ram_gib":ram,"threads":threads,"prompt_tokens":tokens,"load_seconds":load_seconds,"cached_layers":cached_layers,"resident_lm_head":cached_head,"expert_slots_per_layer":options.expert_slots_per_layer,"passes":passes})
         )?
     );
     Ok(())
+}
+
+fn process_resources() -> Option<serde_json::Value> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let bytes = |key| {
+        let value = status.lines().find_map(|line| line.strip_prefix(key))?;
+        let mut fields = value.split_whitespace();
+        let amount = fields.next()?.parse::<u64>().ok()?;
+        (fields.next()? == "kB").then_some(())?;
+        amount.checked_mul(1024)
+    };
+    let io = std::fs::read_to_string("/proc/self/io").ok()?;
+    let storage_read_bytes = io
+        .lines()
+        .find_map(|line| line.strip_prefix("read_bytes:"))?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(serde_json::json!({
+        "rss_bytes": bytes("VmRSS:")?,
+        "lifetime_peak_rss_bytes": bytes("VmHWM:")?,
+        "swap_bytes": bytes("VmSwap:")?,
+        "storage_read_bytes": storage_read_bytes,
+    }))
 }

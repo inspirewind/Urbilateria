@@ -1,7 +1,7 @@
 //! One model-family dispatch shared by the plain CLI and interactive frontends.
 
 use super::{analyze_checkpoint, CheckpointReport};
-use crate::models::{deepseek_v41, hy4, qwen3_6, qwen3_8};
+use crate::models::{deepseek_v41, hy4, qwen3_6, qwen3_8, qwen3_8_flash_next};
 use crate::storage::TensorIndex;
 use crate::{CommonModelConfig, ModelConfig};
 use serde::Serialize;
@@ -19,6 +19,7 @@ pub struct Inspection {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum InspectionReport {
+    Qwen38FlashNext(Box<qwen3_8_flash_next::schema::Qwen38FlashNextManifestReport>),
     Checkpoint(Box<CheckpointReport>),
     Qwen36(Box<qwen3_6::schema::Qwen36ManifestReport>),
     Qwen38(Box<qwen3_8::schema::Qwen38ManifestReport>),
@@ -31,6 +32,9 @@ pub fn inspect_checkpoint(model_dir: &Path) -> Result<Inspection, Box<dyn Error 
     let config = ModelConfig::load(model_dir)?;
     let model = config.common();
     let report = match config {
+        ModelConfig::Qwen38FlashNext(config) => InspectionReport::Qwen38FlashNext(Box::new(
+            qwen3_8_flash_next::schema::inspect_manifest(&config, model_dir)?,
+        )),
         ModelConfig::Qwen36(config) => InspectionReport::Qwen36(Box::new(
             qwen3_6::schema::inspect_manifest(&config, model_dir)?,
         )),

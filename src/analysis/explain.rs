@@ -18,6 +18,12 @@ pub fn explain_checkpoint(model_dir: &Path) -> Result<Explanation, Box<dyn Error
     let config = ModelConfig::load(model_dir)?;
     let model = config.common();
     let lines = match &config {
+        ModelConfig::Qwen38FlashNext(_) => vec![
+            "Qwen3.8-Flash-Next: 48 layers (36 sigmoid-gated DeltaNet + 12 QSA gated GQA), 4 HC streams, top-10/512 BF16 experts plus one shared expert.".into(),
+            "Layer 2: EOS-aware 2/3-gram PLE, 16 hash heads, 128 split embedding tables read by row, gated injection and dilation-3 convolution.".into(),
+            "QSA: mean-pool 4 raw index keys, RMSNorm + shared 64-dim RoPE, select 512 blocks (2048 tokens) plus incomplete tail.".into(),
+            "Native text generation and conversation checkpoints; vision and MTP headers validated, excluded from base text execution.".into(),
+        ],
         ModelConfig::Glm52(config) => glm_explanation(config),
         ModelConfig::DeepseekV4(config) => deepseek_explanation(config),
         ModelConfig::DeepseekV41(config) => deepseek_v41_explanation(config),

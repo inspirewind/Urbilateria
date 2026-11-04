@@ -129,6 +129,16 @@ pub fn tokenize_text(
                         },
                     ),
                     ModelConfig::KimiK3(_) => unreachable!("handled above"),
+                    ModelConfig::Qwen38FlashNext(_) => {
+                        use crate::models::qwen3_8_flash_next::prompt as p;
+                        p::render_chat(
+                            &[p::Message::new(p::Role::User, text)],
+                            p::PromptOptions {
+                                enable_thinking: !no_thinking,
+                                ..Default::default()
+                            },
+                        )?
+                    }
                     ModelConfig::Qwen36(_) => crate::models::qwen3_6::prompt::render_chat(
                         &[qwen38_prompt::Message::new(qwen38_prompt::Role::User, text)],
                         crate::models::qwen3_6::prompt::PromptOptions {
@@ -181,6 +191,7 @@ pub fn decode_tokens(
         | ModelConfig::DeepseekV41(_)
         | ModelConfig::Hy4(_)
         | ModelConfig::Qwen38(_)
+        | ModelConfig::Qwen38FlashNext(_)
         | ModelConfig::Qwen36(_) => {
             ByteBpeTokenizer::load(model_dir)?.decode(&token_ids, skip_special)?
         }

@@ -508,8 +508,8 @@ impl Qwen36RuntimeModel {
     pub const MAX_PREFILL_BATCH: usize = 128;
 
     /// Larger chunks improve expert reuse when every routed expert fits in the cache.
-    /// Partial caches retain 32-token grouping so a larger selection cannot turn a
-    /// previously grouped chunk into tokenwise execution because of cache pressure.
+    /// Partial caches keep the measured 32-token default: a larger selection can change
+    /// whether retained or streamed grouping avoids additional cache misses.
     pub fn default_prefill_batch_size(&self) -> usize {
         if self.expert_slots_per_layer == self.config.num_experts {
             Self::MAX_PREFILL_BATCH
@@ -1062,8 +1062,8 @@ impl LoadedLayer {
     }
 }
 
-/// Group independent token inputs only when all selected weights remain cache-charged.
-/// Replaying the complete access sequence retains tokenwise hit/miss and LRU behavior.
+/// Batch selected experts that fit in cache, or stream groups when this adds no misses.
+/// Retained batches replay accesses; streamed groups restore the same final LRU state.
 fn execute_batched_moe(
     layer: usize,
     input: &[f32],
@@ -1100,14 +1100,23 @@ fn execute_batched_moe(
         .map(|(_, route)| route.expert)
         .collect::<Vec<_>>();
     let Some(retained) = experts.acquire_retained(layer, &ids)? else {
-        // No cache access has occurred. Keep the bounded one-token/one-transient fallback.
+        if let Some(grouped) = experts.grouped_access_order(layer, &ids, top_k) {
+            let output = execute_grouped_streamed_moe(
+                layer, input, weights, top_k, &accesses, &grouped, experts,
+            )?;
+            return Ok((output, final_routes));
+        }
+        // No cache access has occurred. Reuse the already validated batched routes while
+        // retaining the bounded one-token/one-transient expert schedule and access order.
         // Close the routing span before recording the individual fallback MoE spans.
         drop(profile);
         let mut output = Vec::with_capacity(input.len());
-        for token in input.chunks_exact(width) {
-            let (values, routes) = execute_streamed_moe(layer, token, weights, top_k, experts)?;
+        for (token, accesses) in input.chunks_exact(width).zip(accesses.chunks_exact(top_k)) {
+            let ordered = accesses.iter().map(|(_, route)| *route).collect::<Vec<_>>();
+            let _profile = span(ProfileStage::Qwen36Moe);
+            let values =
+                execute_ordered_moe(layer, token, weights, &ordered, bf16_activations, experts)?;
             output.extend(values);
-            final_routes = routes;
         }
         return Ok((output, final_routes));
     };
@@ -1227,9 +1236,114 @@ fn execute_streamed_moe(
             route.weight = round_runtime_bf16_scalar(route.weight, "router weight")?;
         }
     }
-    let mut output = vec![0.0f32; input.len()];
     let mut ordered = routes.clone();
     ordered.sort_by_key(|route| route.expert);
+    let output = execute_ordered_moe(layer, input, weights, &ordered, bf16_activations, experts)?;
+    Ok((output, routes))
+}
+
+/// Stream one expert at a time, retaining only its token outputs. The selected schedule
+/// preserves the final hot set; stored results restore the original token/expert reduction order.
+fn execute_grouped_streamed_moe(
+    layer: usize,
+    input: &[f32],
+    weights: &super::weights::Qwen36MoeTrunkWeights,
+    top_k: usize,
+    accesses: &[(usize, Qwen36Route)],
+    grouped: &super::expert_store::Qwen36GroupedAccess,
+    experts: &mut Qwen36ExpertStore,
+) -> Result<Vec<f32>, Qwen36RuntimeError> {
+    let width = weights.router.cols();
+    let bf16_activations = uses_bf16_output(&weights.router);
+    let mut requests = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for (position, (_, route)) in accesses.iter().enumerate() {
+        requests.entry(route.expert).or_default().push(position);
+    }
+    let mut computed = (0..accesses.len()).map(|_| None).collect::<Vec<_>>();
+    let mut loads_succeeded = true;
+    let mut prefetched = experts.prefetch_grouped(grouped);
+    for id in grouped.order() {
+        let positions = &requests[id];
+        let expert = match experts.acquire_grouped(layer, *id, grouped, &mut prefetched) {
+            Ok(expert) => expert,
+            Err(error) => {
+                loads_succeeded = false;
+                // Later occurrences are unreachable: reduction stops at the first occurrence.
+                computed[positions[0]] = Some(Err(Qwen36RuntimeError::from(error)));
+                continue;
+            }
+        };
+        let _compute = span(ProfileStage::Qwen36ExpertCompute);
+        let mut gathered = Vec::with_capacity(positions.len() * width);
+        for &position in positions {
+            let token = accesses[position].0;
+            gathered.extend_from_slice(&input[token * width..(token + 1) * width]);
+        }
+        match expert.value.forward_batch(&gathered, positions.len()) {
+            Ok(values) => {
+                for (&position, values) in positions.iter().zip(values.chunks_exact(width)) {
+                    computed[position] = Some(Ok(values.to_vec()));
+                }
+            }
+            Err(batch_error) => {
+                // A batch can first fail in a later token or projection. Resolve errors per
+                // original request, leaving earlier shared/weighting errors their precedence.
+                let mut failed = false;
+                for (&position, token) in positions.iter().zip(gathered.chunks_exact(width)) {
+                    let result = expert
+                        .value
+                        .forward(token)
+                        .map_err(Qwen36RuntimeError::from);
+                    failed |= result.is_err();
+                    computed[position] = Some(result);
+                }
+                if !failed {
+                    // A batch-only validation failure must never be silently discarded.
+                    computed[positions[0]] = Some(Err(batch_error.into()));
+                }
+            }
+        }
+        // The expert Arc dies here before the next load can recycle its buffers.
+    }
+    if loads_succeeded {
+        let ids = accesses
+            .iter()
+            .map(|(_, route)| route.expert)
+            .collect::<Vec<_>>();
+        experts.finish_grouped_accesses(layer, &ids, grouped);
+    }
+    let mut computed = computed.into_iter();
+    let mut output = Vec::with_capacity(input.len());
+    for (token, routes) in input.chunks_exact(width).zip(accesses.chunks_exact(top_k)) {
+        let mut values = vec![0.0; width];
+        for (_, route) in routes {
+            let expert = computed
+                .next()
+                .expect("one result slot per route")
+                .expect("an earlier failed request precedes every unfilled slot")?;
+            accumulate_routed_expert(&mut values, &expert, route.weight, bf16_activations)?;
+        }
+        output.extend(finish_ordered_moe(
+            token,
+            weights,
+            values,
+            bf16_activations,
+            None,
+        )?);
+    }
+    Ok(output)
+}
+
+/// Execute validated routes in expert-ID order, preserving every accumulation and BF16 cast.
+fn execute_ordered_moe(
+    layer: usize,
+    input: &[f32],
+    weights: &super::weights::Qwen36MoeTrunkWeights,
+    ordered: &[Qwen36Route],
+    bf16_activations: bool,
+    experts: &mut Qwen36ExpertStore,
+) -> Result<Vec<f32>, Qwen36RuntimeError> {
+    let mut output = vec![0.0f32; input.len()];
     let retained = if worker_threads() > 1 {
         experts.acquire_retained(layer, &ordered.iter().map(|r| r.expert).collect::<Vec<_>>())?
     } else {
@@ -1268,7 +1382,7 @@ fn execute_streamed_moe(
         (None, None)
     };
     // Parallel work preserves expert-ID accumulation order and every BF16 cast.
-    for (index, route) in ordered.into_iter().enumerate() {
+    for (index, route) in ordered.iter().enumerate() {
         let values = if let Some(outputs) = &mut parallel_values {
             std::mem::take(&mut outputs[index])
         } else {
@@ -1276,21 +1390,45 @@ fn execute_streamed_moe(
             let _compute = span(ProfileStage::Qwen36ExpertCompute);
             expert.value.forward(input)?
         };
-        for (accumulator, value) in output.iter_mut().zip(values) {
-            let mut contribution = route.weight * value;
-            if bf16_activations {
-                contribution = round_runtime_bf16_scalar(contribution, "routed expert weighting")?;
-            }
-            *accumulator += contribution;
-            if bf16_activations {
-                *accumulator =
-                    round_runtime_bf16_scalar(*accumulator, "routed expert accumulation")?;
-            }
+        accumulate_routed_expert(&mut output, &values, route.weight, bf16_activations)?;
+    }
+    finish_ordered_moe(input, weights, output, bf16_activations, parallel_shared)
+}
+
+fn accumulate_routed_expert(
+    output: &mut [f32],
+    values: &[f32],
+    weight: f32,
+    bf16_activations: bool,
+) -> Result<(), Qwen36RuntimeError> {
+    for (accumulator, &value) in output.iter_mut().zip(values) {
+        let mut contribution = weight * value;
+        if bf16_activations {
+            contribution = round_runtime_bf16_scalar(contribution, "routed expert weighting")?;
+        }
+        *accumulator += contribution;
+        if bf16_activations {
+            *accumulator = round_runtime_bf16_scalar(*accumulator, "routed expert accumulation")?;
         }
     }
+    Ok(())
+}
+
+fn finish_ordered_moe(
+    input: &[f32],
+    weights: &super::weights::Qwen36MoeTrunkWeights,
+    mut output: Vec<f32>,
+    bf16_activations: bool,
+    parallel_shared: Option<Vec<f32>>,
+) -> Result<Vec<f32>, Qwen36RuntimeError> {
     let shared = match parallel_shared {
         Some(values) => values,
-        None => shared_forward()?,
+        None => Qwen36Expert::forward_projections(
+            &weights.shared_gate,
+            &weights.shared_expert_up,
+            &weights.shared_expert_down,
+            input,
+        )?,
     };
     let gate =
         linear(&weights.shared_expert_gate, input).map_err(|source| Qwen36MoeError::Weight {
@@ -1326,7 +1464,7 @@ fn execute_streamed_moe(
             "MoE output contains NaN or infinity".to_owned(),
         ));
     }
-    Ok((output, routes))
+    Ok(output)
 }
 
 fn add_residual(
@@ -1542,8 +1680,280 @@ fn checked_product_u64(factors: &[u64]) -> Result<u64, Qwen36RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    struct GroupedMoeFixture {
+        directory: std::path::PathBuf,
+        index: Arc<TensorIndex>,
+        start: u64,
+    }
+
+    impl GroupedMoeFixture {
+        fn new(label: &str) -> Self {
+            let directory = std::env::temp_dir()
+                .join(format!("urb-qwen36-grouped-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let matrix = 2048u64 * 512 * 2;
+            let gates = 256 * 2 * matrix;
+            let prefix = "model.language_model.layers.0.mlp.experts";
+            let header = serde_json::json!({
+                format!("{prefix}.gate_up_proj"): {"dtype":"BF16", "shape":[256,1024,2048], "data_offsets":[0,gates]},
+                format!("{prefix}.down_proj"): {"dtype":"BF16", "shape":[256,2048,512], "data_offsets":[gates,gates+256*matrix]},
+            }).to_string();
+            let mut file = std::fs::File::create(directory.join("packed.safetensors")).unwrap();
+            file.write_all(&(header.len() as u64).to_le_bytes())
+                .unwrap();
+            file.write_all(header.as_bytes()).unwrap();
+            let start = 8 + header.len() as u64;
+            file.set_len(start + gates + 256 * matrix).unwrap();
+            for id in 0..8u64 {
+                for (offset, value) in [
+                    (id * 2 * matrix, (id + 1) as f32 / 8.0),
+                    (id * 2 * matrix + (2048 + 1) * 2, -0.25),
+                    ((id * 2 + 1) * matrix, 0.75),
+                    ((id * 2 + 1) * matrix + (2048 + 1) * 2, 0.5),
+                    (gates + id * matrix, (id + 1) as f32 / 4.0),
+                    (gates + id * matrix + (512 + 1) * 2, -0.5),
+                    (gates + id * matrix + 1024 * 2, -0.375),
+                ] {
+                    file.seek(SeekFrom::Start(start + offset)).unwrap();
+                    file.write_all(&((value.to_bits() >> 16) as u16).to_le_bytes())
+                        .unwrap();
+                }
+            }
+            drop(file);
+            let index = Arc::new(TensorIndex::open(&directory).unwrap());
+            Self {
+                directory,
+                index,
+                start,
+            }
+        }
+
+        fn store(&self, slots: usize) -> Qwen36ExpertStore {
+            Qwen36ExpertStore::new_shared(
+                Arc::clone(&self.index),
+                1,
+                256,
+                2048,
+                512,
+                slots,
+                6 * 1024 * 1024,
+            )
+            .unwrap()
+        }
+
+        fn gate_scalar(&self, expert: u64, bits: u16) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.directory.join("packed.safetensors"))
+                .unwrap();
+            file.seek(SeekFrom::Start(self.start + expert * 2 * 2048 * 512 * 2))
+                .unwrap();
+            file.write_all(&bits.to_le_bytes()).unwrap();
+        }
+    }
+
+    impl Drop for GroupedMoeFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    fn sparse_bf16(rows: usize, cols: usize, entries: &[(usize, usize, f32)]) -> WeightMatrix {
+        let mut bytes = vec![0; rows * cols * 2];
+        for &(row, col, value) in entries {
+            let offset = (row * cols + col) * 2;
+            bytes[offset..offset + 2]
+                .copy_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        WeightMatrix::Bf16(crate::model::Bf16Matrix::from_le_bytes(rows, cols, bytes).unwrap())
+    }
+
+    fn grouped_moe_weights() -> super::super::weights::Qwen36MoeTrunkWeights {
+        super::super::weights::Qwen36MoeTrunkWeights {
+            router: sparse_bf16(
+                256,
+                2048,
+                &[
+                    (0, 0, 1.0),
+                    (0, 1, 0.5),
+                    (1, 0, 0.5),
+                    (1, 1, -1.0),
+                    (2, 0, -1.0),
+                    (2, 1, -0.5),
+                    (3, 0, -0.5),
+                    (3, 1, 1.0),
+                ],
+            ),
+            shared_gate: sparse_bf16(2, 2048, &[(0, 0, 0.5), (1, 1, 0.75)]),
+            shared_expert_up: sparse_bf16(2, 2048, &[(0, 1, -0.25), (1, 0, 0.5)]),
+            shared_expert_down: sparse_bf16(2048, 2, &[(0, 0, 0.5), (1, 1, -0.75)]),
+            shared_expert_gate: sparse_bf16(1, 2048, &[(0, 0, 0.25)]),
+        }
+    }
+
+    #[test]
+    fn grouped_streaming_matches_tokenwise_moe_with_tiny_and_warm_caches() {
+        let fixture = GroupedMoeFixture::new("parity");
+        let weights = grouped_moe_weights();
+        let coordinates = [
+            [1.0, 0.5],
+            [0.5, -1.0],
+            [-1.0, -0.5],
+            [-0.5, 1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+            [2.0, -0.5],
+            [0.25, 2.0],
+        ];
+        let mut input = vec![0.0; coordinates.len() * 2048];
+        for (token, pair) in input.chunks_exact_mut(2048).zip(coordinates) {
+            token[..2].copy_from_slice(&pair);
+        }
+        let mut saved_reads = false;
+        for slots in [0, 1, 2, 3, 4, 8] {
+            let mut serial = fixture.store(slots);
+            let mut grouped = fixture.store(slots);
+            for _ in 0..2 {
+                let mut expected = Vec::new();
+                let mut final_routes = Vec::new();
+                for token in input.chunks_exact(2048) {
+                    let (values, routes) =
+                        execute_streamed_moe(0, token, &weights, 2, &mut serial).unwrap();
+                    expected.extend(values);
+                    final_routes = routes;
+                }
+                let (actual, routes) =
+                    execute_batched_moe(0, &input, coordinates.len(), &weights, 2, &mut grouped)
+                        .unwrap();
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "slots={slots}"
+                );
+                assert_eq!(routes, final_routes);
+                assert!(grouped.telemetry().bytes_read <= serial.telemetry().bytes_read);
+                assert_eq!(
+                    grouped.telemetry().resident_bytes,
+                    serial.telemetry().resident_bytes
+                );
+                assert!(grouped.telemetry().resident_bytes <= slots as u64 * 6 * 1024 * 1024);
+                saved_reads |= grouped.telemetry().bytes_read < serial.telemetry().bytes_read;
+                for id in [4, 1, 0, 4, 3, 2] {
+                    let a = serial.telemetry().clone();
+                    let b = grouped.telemetry().clone();
+                    serial.acquire(0, id).unwrap();
+                    grouped.acquire(0, id).unwrap();
+                    assert_eq!(
+                        serial.telemetry().misses - a.misses,
+                        grouped.telemetry().misses - b.misses
+                    );
+                    assert_eq!(
+                        serial.telemetry().hits - a.hits,
+                        grouped.telemetry().hits - b.hits
+                    );
+                }
+            }
+        }
+        assert!(saved_reads);
+    }
+
+    #[test]
+    fn grouped_streaming_preserves_earlier_shared_load_and_compute_errors() {
+        let fixture = GroupedMoeFixture::new("errors");
+        fixture.gate_scalar(7, 0x7f7f); // Finite BF16, but multiplying by 2 overflows FP32.
+        fixture.gate_scalar(6, 0x7f80); // Loading this expert fails finite validation.
+        let mut weights = grouped_moe_weights();
+        let check = |weights: &super::super::weights::Qwen36MoeTrunkWeights,
+                     coordinates: &[[f32; 2]],
+                     ids: &[usize]| {
+            let mut input = vec![0.0; coordinates.len() * 2048];
+            for (token, pair) in input.chunks_exact_mut(2048).zip(coordinates) {
+                token[..2].copy_from_slice(pair);
+            }
+            let accesses = ids
+                .iter()
+                .enumerate()
+                .map(|(token, &expert)| {
+                    (
+                        token,
+                        Qwen36Route {
+                            expert,
+                            weight: 1.0,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut serial = fixture.store(0);
+            let expected = input
+                .chunks_exact(2048)
+                .zip(&accesses)
+                .try_for_each(|(token, (_, route))| {
+                    execute_ordered_moe(0, token, weights, &[*route], true, &mut serial).map(|_| ())
+                })
+                .unwrap_err();
+            let mut actual_error = None;
+            for (slots, warm) in [0, 1, 2, 3]
+                .into_iter()
+                .flat_map(|slots| [false, true].map(|warm| (slots, warm)))
+            {
+                let mut grouped = fixture.store(slots);
+                if slots > 0 && warm {
+                    grouped.acquire(0, 0).unwrap();
+                    grouped.acquire(0, 7).unwrap();
+                }
+                let order = grouped.grouped_access_order(0, ids, 1).unwrap();
+                assert_eq!(
+                    matches!(
+                        order,
+                        super::super::expert_store::Qwen36GroupedAccess::Initial(_)
+                    ),
+                    slots > 0 && !warm && worker_threads() > 1,
+                );
+                let actual = execute_grouped_streamed_moe(
+                    0,
+                    &input,
+                    weights,
+                    1,
+                    &accesses,
+                    &order,
+                    &mut grouped,
+                )
+                .unwrap_err();
+                assert_eq!(actual.to_string(), expected.to_string(), "slots={slots}");
+                actual_error = Some(actual);
+            }
+            actual_error.unwrap()
+        };
+        weights.shared_expert_gate = sparse_bf16(1, 2048, &[(0, 1, f32::from_bits(0x7f7f0000))]);
+        assert!(matches!(
+            check(&weights, &[[0.0, 2.0], [2.0, 0.0]], &[7, 7]),
+            Qwen36RuntimeError::Moe(Qwen36MoeError::Weight {
+                projection: "shared_expert_gate",
+                ..
+            })
+        ));
+        weights.shared_expert_gate = sparse_bf16(1, 2048, &[]);
+        assert!(matches!(
+            check(&weights, &[[0.0, 2.0], [2.0, 0.0]], &[7, 7]),
+            Qwen36RuntimeError::Expert(_)
+        ));
+        assert!(matches!(
+            check(&weights, &[[2.0, 0.0], [0.0, 0.0], [0.0, 0.0]], &[7, 6, 7]),
+            Qwen36RuntimeError::Expert(_)
+        ));
+        assert!(matches!(
+            check(&weights, &[[0.0, 0.0], [0.0, 0.0], [2.0, 0.0]], &[7, 6, 7]),
+            Qwen36RuntimeError::ExpertStore(_)
+        ));
+        assert!(matches!(
+            check(&weights, &[[0.0, 0.0], [0.0, 0.0]], &[6, 6]),
+            Qwen36RuntimeError::ExpertStore(_)
+        ));
+    }
 
     #[test]
     fn native_prefill_buffers_fit_fixed_scratch_reserve() {
@@ -1557,12 +1967,17 @@ mod tests {
         // Overcount simultaneously live layer inputs/outputs, attention projections,
         // and shared-expert intermediates. Routed requests include gathered inputs,
         // both output layouts, and gate/up/activation arrays, even across worker jobs.
-        let layer_values = 8 * hidden + 4 * widest;
+        // Grouped streaming retains one output per original route plus one group's gathered
+        // inputs and temporary outputs; these fit the same three-hidden-vector allowance.
+        // Head-major DeltaNet additionally retains convolved QKV, normalized Q/K,
+        // and one head-major output layout: conv + 2K + V = 2 * conv per token.
+        let layer_values = 8 * hidden + 4 * widest + 2 * conv;
         let routed_values = config.num_experts_per_tok as u64 * (3 * hidden + 3 * intermediate);
         let live_bytes =
             Qwen36RuntimeModel::MAX_PREFILL_BATCH as u64 * (layer_values + routed_values) * 4;
         assert!(live_bytes <= 64 * 1024 * 1024);
-        let scores = config.num_attention_heads as u64 * config.max_position_embeddings as u64 * 4;
+        // Grouped GQA values retain head-major scores while packing token-major lanes.
+        let scores = config.num_attention_heads as u64 * config.max_position_embeddings as u64 * 8;
         let transaction = (config.linear_num_value_heads as u64
             * config.linear_key_head_dim as u64
             * config.linear_value_head_dim as u64

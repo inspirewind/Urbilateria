@@ -35,6 +35,35 @@ struct Entry<T> {
     value: T,
 }
 
+/// A read-only schedule for a single layer, consumed without interleaved cache accesses.
+/// Resident selected keys come first; only the original sequence's final survivors are admitted.
+#[derive(Debug)]
+pub(crate) struct GroupedAccessPlan {
+    layer: usize,
+    order: Vec<usize>,
+    retained: Vec<(usize, u64)>,
+    initial_clock: u64,
+    final_clock: u64,
+}
+
+impl GroupedAccessPlan {
+    pub(crate) fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn retained_keys(&self) -> impl Iterator<Item = usize> + '_ {
+        self.retained.iter().map(|&(key, _)| key)
+    }
+
+    fn retained_position(&self, key: usize) -> Result<usize, usize> {
+        self.retained.binary_search_by_key(&key, |&(key, _)| key)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LayerLruCache<T> {
     layers: Vec<Vec<Entry<T>>>,
@@ -182,6 +211,179 @@ impl<T> LayerLruCache<T> {
             }
         }
         self.layers[layer].len().saturating_add(missing.len()) <= layer_capacity
+    }
+
+    /// Collapse repeated accesses in last-use order only when doing so adds no cache misses.
+    /// The surviving keys have the same final LRU order as the complete sequence. A warm
+    /// cache can nevertheless incur extra intermediate misses, so compare both schedules.
+    pub(crate) fn grouped_access_order(&self, layer: usize, keys: &[usize]) -> Option<Vec<usize>> {
+        // Once timestamps saturate, expert-ID tie breaking no longer represents recency.
+        self.clock.checked_add(u64::try_from(keys.len()).ok()?)?;
+        let mut grouped = Vec::new();
+        for &key in keys.iter().rev() {
+            if !grouped.contains(&key) {
+                grouped.push(key);
+            }
+        }
+        if grouped.len() == keys.len() {
+            return None;
+        }
+        grouped.reverse();
+        (self.projected_misses(layer, &grouped) <= self.projected_misses(layer, keys))
+            .then_some(grouped)
+    }
+
+    /// After every grouped load succeeds, recover the complete sequence's timestamps without
+    /// inventing cache hits or reads. This also preserves subsequent clock-saturation behavior.
+    pub(crate) fn finish_grouped_accesses(&mut self, layer: usize, keys: &[usize], groups: usize) {
+        let initial_clock = self.clock - groups as u64;
+        self.clock = initial_clock + keys.len() as u64;
+        for entry in &mut self.layers[layer] {
+            if let Some(position) = keys.iter().rposition(|&key| key == entry.key) {
+                entry.last_used = initial_clock + position as u64 + 1;
+            }
+        }
+    }
+
+    /// Preserve all initially resident selected keys until their computation has finished,
+    /// then admit only the ordered sequence's final hot set. This reaches the lower bound
+    /// of one load per initially absent distinct key without changing the final cache state.
+    pub(crate) fn grouped_access_plan(
+        &self,
+        layer: usize,
+        keys: &[usize],
+    ) -> Option<GroupedAccessPlan> {
+        if self.layer_capacities[layer] == 0 || keys.is_empty() {
+            return None;
+        }
+        let final_clock = self.clock.checked_add(u64::try_from(keys.len()).ok()?)?;
+        let mut order = Vec::new();
+        for &key in keys.iter().rev() {
+            if !order.contains(&key) {
+                order.push(key);
+            }
+        }
+        order.reverse();
+        let (mut retained, original_misses) = self.projected_accesses(layer, keys);
+        let minimum_misses = order
+            .iter()
+            .filter(|&&key| !self.contains(layer, key))
+            .count();
+        if order.len() == keys.len() && minimum_misses == original_misses {
+            return None;
+        }
+        // Stable partition keeps last-use order within hits and misses. Once all resident
+        // keys have been used, unprotected entries can be evicted without another load.
+        order.sort_by_key(|&key| !self.contains(layer, key));
+        retained.sort_unstable_by_key(|&(key, _)| key);
+        Some(GroupedAccessPlan {
+            layer,
+            order,
+            retained,
+            initial_clock: self.clock,
+            final_clock,
+        })
+    }
+
+    /// Access one scheduled group. A non-final miss stays transient; a final miss may evict
+    /// only an entry absent from the original final hot set. The returned transient/displaced
+    /// value can be recycled before the next miss. Loading succeeds before any eviction or
+    /// telemetry mutation on a miss.
+    pub(crate) fn access_grouped_with_evicted<E, R>(
+        &mut self,
+        telemetry: &mut ExpertTelemetry,
+        plan: &GroupedAccessPlan,
+        key: usize,
+        load: impl FnOnce() -> Result<(T, u64, u64), E>,
+        execute: impl FnOnce(&mut T) -> Result<R, E>,
+    ) -> Result<(R, Option<T>), E> {
+        let layer = plan.layer;
+        if self.contains(layer, key) {
+            return self.access_with_evicted(telemetry, layer, key, load, execute);
+        }
+        let (mut value, bytes, read_bytes) = load()?;
+        self.clock = self.clock.saturating_add(1);
+        telemetry.misses = telemetry.misses.saturating_add(1);
+        telemetry.bytes_read = telemetry.bytes_read.saturating_add(read_bytes);
+        if plan.retained_position(key).is_err() {
+            let result = execute(&mut value)?;
+            return Ok((result, Some(value)));
+        }
+        let evicted = if self.layers[layer].len() == self.layer_capacities[layer] {
+            let position = self.layers[layer]
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| plan.retained_position(entry.key).is_err())
+                .min_by_key(|(_, entry)| (entry.last_used, entry.key))
+                .map(|(position, _)| position)
+                .expect("an absent final key leaves an unprotected cache slot");
+            let entry = self.layers[layer].remove(position);
+            telemetry.evictions = telemetry.evictions.saturating_add(1);
+            telemetry.resident_experts = telemetry.resident_experts.saturating_sub(1);
+            telemetry.resident_bytes = telemetry.resident_bytes.saturating_sub(entry.bytes);
+            Some(entry.value)
+        } else {
+            None
+        };
+        telemetry.resident_experts = telemetry.resident_experts.saturating_add(1);
+        telemetry.resident_bytes = telemetry.resident_bytes.saturating_add(bytes);
+        self.layers[layer].push(Entry {
+            key,
+            last_used: self.clock,
+            bytes,
+            value,
+        });
+        let position = self.layers[layer].len() - 1;
+        execute(&mut self.layers[layer][position].value).map(|result| (result, evicted))
+    }
+
+    /// Publish the original clock and timestamps after every scheduled load succeeds.
+    pub(crate) fn finish_grouped_plan(&mut self, plan: &GroupedAccessPlan) {
+        debug_assert_eq!(self.clock, plan.initial_clock + plan.order.len() as u64);
+        debug_assert_eq!(self.layers[plan.layer].len(), plan.retained.len());
+        for entry in &mut self.layers[plan.layer] {
+            let position = plan
+                .retained_position(entry.key)
+                .expect("only final keys survive");
+            entry.last_used = plan.retained[position].1;
+        }
+        self.clock = plan.final_clock;
+    }
+
+    fn projected_misses(&self, layer: usize, keys: &[usize]) -> usize {
+        self.projected_accesses(layer, keys).1
+    }
+
+    fn projected_accesses(&self, layer: usize, keys: &[usize]) -> (Vec<(usize, u64)>, usize) {
+        let capacity = self.layer_capacities[layer];
+        if capacity == 0 {
+            return (Vec::new(), keys.len());
+        }
+        let mut entries = self.layers[layer]
+            .iter()
+            .map(|entry| (entry.key, entry.last_used))
+            .collect::<Vec<_>>();
+        let mut clock = self.clock;
+        let mut misses = 0;
+        for &key in keys {
+            clock = clock.saturating_add(1);
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.0 == key) {
+                entry.1 = clock;
+                continue;
+            }
+            misses += 1;
+            if entries.len() == capacity {
+                let victim = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, &(key, used))| (used, key))
+                    .map(|(index, _)| index)
+                    .expect("a full non-zero cache contains an entry");
+                entries.remove(victim);
+            }
+            entries.push((key, clock));
+        }
+        (entries, misses)
     }
 
     /// Makes an ordered, duplicate-free batch safe to preload concurrently while preserving the
@@ -399,6 +601,340 @@ mod tests {
             .unwrap();
         assert!(cache.can_insert_without_eviction(0, &[7]));
         assert!(!cache.can_insert_without_eviction(0, &[8]));
+    }
+
+    #[test]
+    fn protected_grouping_reaches_minimum_reads_and_preserves_future_lru() {
+        fn apply(
+            cache: &mut LayerLruCache<usize>,
+            telemetry: &mut ExpertTelemetry,
+            keys: &[usize],
+        ) {
+            for &key in keys {
+                cache
+                    .access(
+                        telemetry,
+                        0,
+                        key,
+                        || Ok::<_, ()>((key, key as u64 + 1, 7)),
+                        |value| Ok(*value),
+                    )
+                    .unwrap();
+            }
+        }
+        fn snapshot(cache: &LayerLruCache<usize>) -> Vec<(usize, u64, usize)> {
+            let mut values = cache.layers[0]
+                .iter()
+                .map(|e| (e.key, e.last_used, e.value))
+                .collect::<Vec<_>>();
+            values.sort_unstable_by_key(|e| e.0);
+            values
+        }
+        for capacity in 1..=4 {
+            for seed in [&[][..], &[0, 1], &[2, 0, 1, 2], &[3, 1, 0, 2]] {
+                for encoded in 0..4096 {
+                    let keys = (0..6).map(|i| (encoded >> (i * 2)) & 3).collect::<Vec<_>>();
+                    let mut serial = LayerLruCache::new(1, capacity);
+                    let mut grouped = LayerLruCache::new(1, capacity);
+                    let mut a = ExpertTelemetry::default();
+                    let mut b = ExpertTelemetry::default();
+                    apply(&mut serial, &mut a, seed);
+                    apply(&mut grouped, &mut b, seed);
+                    let initial = snapshot(&grouped);
+                    let initial_clock = grouped.clock;
+                    let mut missing = keys
+                        .iter()
+                        .copied()
+                        .filter(|&key| !grouped.contains(0, key))
+                        .collect::<Vec<_>>();
+                    missing.sort_unstable();
+                    missing.dedup();
+                    let plan = grouped.grouped_access_plan(0, &keys);
+                    assert_eq!(snapshot(&grouped), initial);
+                    assert_eq!(grouped.clock, initial_clock);
+                    apply(&mut serial, &mut a, &keys);
+                    if let Some(plan) = plan {
+                        let before = b.clone();
+                        for &key in plan.order() {
+                            let (value, _retired) = grouped
+                                .access_grouped_with_evicted(
+                                    &mut b,
+                                    &plan,
+                                    key,
+                                    || Ok::<_, ()>((key, key as u64 + 1, 7)),
+                                    |value| Ok(*value),
+                                )
+                                .unwrap();
+                            assert_eq!(value, key);
+                            assert!(b.resident_experts <= capacity);
+                        }
+                        grouped.finish_grouped_plan(&plan);
+                        assert_eq!(b.misses - before.misses, missing.len() as u64);
+                        assert_eq!(b.bytes_read - before.bytes_read, missing.len() as u64 * 7);
+                        assert_eq!(b.accesses() - before.accesses(), plan.order().len() as u64);
+                        assert!(b.misses <= a.misses);
+                        assert_eq!(a.resident_bytes, b.resident_bytes);
+                        assert_eq!(a.resident_experts, b.resident_experts);
+                        assert_eq!(snapshot(&serial), snapshot(&grouped));
+                        assert_eq!(serial.clock, grouped.clock);
+                        let old_a = a.clone();
+                        let old_b = b.clone();
+                        apply(&mut serial, &mut a, &[4, 1, 0, 4, 3]);
+                        apply(&mut grouped, &mut b, &[4, 1, 0, 4, 3]);
+                        assert_eq!(a.misses - old_a.misses, b.misses - old_b.misses);
+                        assert_eq!(a.hits - old_a.hits, b.hits - old_b.hits);
+                        assert_eq!(snapshot(&serial), snapshot(&grouped));
+                    }
+                }
+            }
+        }
+        let mut serial = LayerLruCache::new(1, 2);
+        let mut grouped = LayerLruCache::new(1, 2);
+        let mut a = ExpertTelemetry::default();
+        let mut b = ExpertTelemetry::default();
+        apply(&mut serial, &mut a, &[0, 1]);
+        apply(&mut grouped, &mut b, &[0, 1]);
+        let keys = [0, 2, 0];
+        assert!(grouped.grouped_access_order(0, &keys).is_none());
+        assert_eq!(
+            grouped.grouped_access_plan(0, &keys).unwrap().order(),
+            &[0, 2]
+        );
+        grouped.clock = u64::MAX - 2;
+        assert!(grouped.grouped_access_plan(0, &keys).is_none());
+        serial.clock = u64::MAX - 3;
+        grouped.clock = u64::MAX - 3;
+        let plan = grouped.grouped_access_plan(0, &keys).unwrap();
+        apply(&mut serial, &mut a, &keys);
+        for &key in plan.order() {
+            grouped
+                .access_grouped_with_evicted(
+                    &mut b,
+                    &plan,
+                    key,
+                    || Ok::<_, ()>((key, key as u64 + 1, 7)),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+        grouped.finish_grouped_plan(&plan);
+        assert_eq!(grouped.clock, u64::MAX);
+        assert_eq!(snapshot(&serial), snapshot(&grouped));
+        apply(&mut serial, &mut a, &[3, 0, 3, 2, 1]);
+        apply(&mut grouped, &mut b, &[3, 0, 3, 2, 1]);
+        assert_eq!(snapshot(&serial), snapshot(&grouped));
+        assert!(grouped.grouped_access_plan(0, &keys).is_none());
+        assert!(LayerLruCache::<usize>::new(1, 0)
+            .grouped_access_plan(0, &keys)
+            .is_none());
+    }
+
+    #[test]
+    fn protected_grouping_keeps_one_transient_value_and_preserves_cache_on_failure() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        #[derive(Debug)]
+        struct Value {
+            key: usize,
+            live: Rc<Cell<usize>>,
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.live.set(self.live.get() - 1);
+            }
+        }
+        let live = Rc::new(Cell::new(0));
+        let make = |key| {
+            live.set(live.get() + 1);
+            Rc::new(Value {
+                key,
+                live: Rc::clone(&live),
+            })
+        };
+        let mut cache = LayerLruCache::new(1, 2);
+        let mut telemetry = ExpertTelemetry::default();
+        for key in [0, 1] {
+            cache
+                .access(
+                    &mut telemetry,
+                    0,
+                    key,
+                    || Ok::<_, ()>((make(key), 11, 7)),
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+        // Resident 0 survives; 2 and 3 stream without admission; final miss 4 replaces 1.
+        let keys = [0, 2, 3, 4, 0];
+        let plan = cache.grouped_access_plan(0, &keys).unwrap();
+        assert_eq!(plan.order(), &[0, 2, 3, 4]);
+        for key in [2, 4] {
+            let clock = cache.clock;
+            let before = telemetry.clone();
+            let entries = cache.layers[0]
+                .iter()
+                .map(|e| (e.key, e.last_used))
+                .collect::<Vec<_>>();
+            assert!(cache
+                .access_grouped_with_evicted(
+                    &mut telemetry,
+                    &plan,
+                    key,
+                    || Err::<(Rc<Value>, u64, u64), _>(()),
+                    |_| Ok(())
+                )
+                .is_err());
+            assert_eq!(telemetry, before);
+            assert_eq!(cache.clock, clock);
+            assert_eq!(
+                cache.layers[0]
+                    .iter()
+                    .map(|e| (e.key, e.last_used))
+                    .collect::<Vec<_>>(),
+                entries
+            );
+            assert_eq!(live.get(), 2);
+        }
+        let mut recycled = None;
+        for &key in plan.order() {
+            if !cache.contains(0, key) {
+                drop(recycled.take());
+            }
+            let (selected, displaced) = cache
+                .access_grouped_with_evicted(
+                    &mut telemetry,
+                    &plan,
+                    key,
+                    || {
+                        let value = make(key);
+                        assert!(live.get() <= 3);
+                        Ok::<_, ()>((value, 11, 7))
+                    },
+                    |value| Ok(Rc::clone(value)),
+                )
+                .unwrap();
+            assert_eq!(selected.key, key);
+            assert!(live.get() <= 3);
+            if displaced.is_some() {
+                recycled = displaced;
+            }
+            drop(selected);
+        }
+        cache.finish_grouped_plan(&plan);
+        assert!(cache.contains(0, 0) && cache.contains(0, 4));
+        assert_eq!(telemetry.resident_experts, 2);
+        assert_eq!(telemetry.misses, 5); // two seed loads and three distinct misses
+        drop(recycled);
+        drop(cache);
+        assert_eq!(live.get(), 0);
+    }
+
+    #[test]
+    fn grouped_accesses_preserve_lru_and_never_add_projected_misses() {
+        fn apply(
+            cache: &mut LayerLruCache<usize>,
+            telemetry: &mut ExpertTelemetry,
+            keys: &[usize],
+        ) {
+            for &key in keys {
+                cache
+                    .access(
+                        telemetry,
+                        0,
+                        key,
+                        || Ok::<_, ()>((key, key as u64 + 1, 7)),
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            }
+        }
+        fn recency(cache: &LayerLruCache<usize>) -> Vec<usize> {
+            let mut entries = cache.layers[0].iter().collect::<Vec<_>>();
+            entries.sort_by_key(|entry| (entry.last_used, entry.key));
+            entries.into_iter().map(|entry| entry.key).collect()
+        }
+        for capacity in 0..=4 {
+            for seed in [&[][..], &[0, 1], &[2, 0, 1, 2], &[3, 1, 0, 2]] {
+                for encoded in 0..4096 {
+                    let keys = (0..6).map(|i| (encoded >> (i * 2)) & 3).collect::<Vec<_>>();
+                    let mut serial = LayerLruCache::new(1, capacity);
+                    let mut grouped = LayerLruCache::new(1, capacity);
+                    let mut a = ExpertTelemetry::default();
+                    let mut b = ExpertTelemetry::default();
+                    apply(&mut serial, &mut a, seed);
+                    apply(&mut grouped, &mut b, seed);
+                    let initial = recency(&grouped);
+                    let clock = grouped.clock;
+                    let expected_misses = serial.projected_misses(0, &keys);
+                    let order = grouped.grouped_access_order(0, &keys);
+                    assert_eq!(recency(&grouped), initial);
+                    assert_eq!(grouped.clock, clock);
+                    let before = a.misses;
+                    apply(&mut serial, &mut a, &keys);
+                    assert_eq!(a.misses - before, expected_misses as u64);
+                    if let Some(order) = order {
+                        apply(&mut grouped, &mut b, &order);
+                        grouped.finish_grouped_accesses(0, &keys, order.len());
+                        assert!(b.misses <= a.misses);
+                        assert_eq!(serial.clock, grouped.clock);
+                        for entry in &serial.layers[0] {
+                            assert_eq!(
+                                grouped.layers[0]
+                                    .iter()
+                                    .find(|other| other.key == entry.key)
+                                    .unwrap()
+                                    .last_used,
+                                entry.last_used,
+                            );
+                        }
+                        assert_eq!(recency(&serial), recency(&grouped));
+                        assert_eq!(a.resident_bytes, b.resident_bytes);
+                        let old_a = a.clone();
+                        let old_b = b.clone();
+                        apply(&mut serial, &mut a, &[4, 1, 0, 4, 3]);
+                        apply(&mut grouped, &mut b, &[4, 1, 0, 4, 3]);
+                        assert_eq!(a.misses - old_a.misses, b.misses - old_b.misses);
+                        assert_eq!(a.hits - old_a.hits, b.hits - old_b.hits);
+                        assert_eq!(recency(&serial), recency(&grouped));
+                    }
+                }
+            }
+        }
+        let mut cache = LayerLruCache::new(1, 2);
+        let mut telemetry = ExpertTelemetry::default();
+        apply(&mut cache, &mut telemetry, &[0, 1]);
+        // Touching 0 early protects it: [0,2,0] has one miss, but [2,0] has two.
+        assert_eq!(cache.projected_misses(0, &[0, 2, 0]), 1);
+        assert_eq!(cache.projected_misses(0, &[2, 0]), 2);
+        assert!(cache.grouped_access_order(0, &[0, 2, 0]).is_none());
+        assert!(cache.grouped_access_order(0, &[0, 1]).is_none());
+        cache.clock = u64::MAX - 1;
+        assert!(cache.grouped_access_order(0, &[0, 0]).is_none());
+        cache.clock = u64::MAX - 3;
+        let keys = [0, 1, 0];
+        let grouped = cache.grouped_access_order(0, &keys).unwrap();
+        apply(&mut cache, &mut telemetry, &grouped);
+        cache.finish_grouped_accesses(0, &keys, grouped.len());
+        assert_eq!(cache.clock, u64::MAX);
+        assert_eq!(
+            cache.layers[0]
+                .iter()
+                .find(|entry| entry.key == 0)
+                .unwrap()
+                .last_used,
+            u64::MAX
+        );
+        assert_eq!(
+            cache.layers[0]
+                .iter()
+                .find(|entry| entry.key == 1)
+                .unwrap()
+                .last_used,
+            u64::MAX - 1
+        );
+        apply(&mut cache, &mut telemetry, &[2]);
+        assert!(cache.contains(0, 0));
+        assert!(!cache.contains(0, 1));
     }
 
     #[test]

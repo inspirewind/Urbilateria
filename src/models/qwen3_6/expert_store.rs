@@ -1,15 +1,16 @@
 //! Packed BF16 routed-expert slice loading and deterministic per-layer caching.
 
-use crate::execution::install;
+use crate::execution::{install, worker_threads};
 use crate::model::{Bf16Matrix, WeightMatrix};
 use crate::models::qwen3_8::expert::{
     Qwen38Expert as Qwen36Expert, Qwen38ExpertError as Qwen36ExpertError,
 };
 use crate::profiling::{span, ProfileStage};
-use crate::runtime::cache::LayerLruCache;
+use crate::runtime::cache::{GroupedAccessPlan, LayerLruCache};
 use crate::runtime::ExpertTelemetry;
 use crate::storage::{DType, TensorIndex, WeightLoadError};
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -84,6 +85,26 @@ impl Qwen36LoadedExpert {
         intermediate: usize,
         maximum_resident_bytes: u64,
     ) -> Result<Self, Qwen36ExpertStoreError> {
+        Self::load_reusing(
+            index,
+            layer,
+            expert,
+            hidden,
+            intermediate,
+            maximum_resident_bytes,
+            None,
+        )
+    }
+
+    fn load_reusing(
+        index: &TensorIndex,
+        layer: usize,
+        expert: usize,
+        hidden: usize,
+        intermediate: usize,
+        maximum_resident_bytes: u64,
+        reuse: Option<[Vec<u8>; 3]>,
+    ) -> Result<Self, Qwen36ExpertStoreError> {
         if hidden == 0 || intermediate == 0 || maximum_resident_bytes == 0 {
             return Err(Qwen36ExpertStoreError::Invalid(
                 "hidden/intermediate dimensions and per-expert budget must be non-zero".to_owned(),
@@ -103,13 +124,21 @@ impl Qwen36LoadedExpert {
             });
         }
         let matrix_bytes = hidden * intermediate * 2;
-        let load = |name: &str,
-                    offset: usize,
-                    rows,
-                    cols|
+        let mut buffers = reuse.unwrap_or_default().into_iter();
+        let mut load = |name: &str,
+                        offset: usize,
+                        rows,
+                        cols|
          -> Result<WeightMatrix, Qwen36ExpertStoreError> {
             let bytes = index
-                .read_range(name, offset as u64, matrix_bytes)
+                .read_range_reusing(
+                    name,
+                    offset as u64,
+                    matrix_bytes,
+                    buffers
+                        .next()
+                        .expect("one buffer for each expert projection"),
+                )
                 .map_err(WeightLoadError::from)?;
             let matrix =
                 Bf16Matrix::from_le_bytes(rows, cols, bytes).map_err(WeightLoadError::from)?;
@@ -187,6 +216,29 @@ impl Qwen36LoadedExpert {
 }
 
 #[derive(Debug)]
+pub(super) enum Qwen36GroupedAccess {
+    Ordered(Vec<usize>),
+    Planned(GroupedAccessPlan),
+    Initial(GroupedAccessPlan),
+}
+
+impl Qwen36GroupedAccess {
+    pub(super) fn order(&self) -> &[usize] {
+        match self {
+            Self::Ordered(order) => order,
+            Self::Planned(plan) | Self::Initial(plan) => plan.order(),
+        }
+    }
+}
+
+/// Final survivors staged inside the initially empty layer's cache reservation.
+/// Each successful value moves into the cache once, without another read or allocation.
+#[derive(Debug, Default)]
+pub(super) struct Qwen36PrefetchedExperts {
+    pending: BTreeMap<usize, Result<Arc<Qwen36LoadedExpert>, Qwen36ExpertStoreError>>,
+}
+
+#[derive(Debug)]
 pub struct Qwen36ExpertStore {
     index: Arc<TensorIndex>,
     layers: usize,
@@ -195,6 +247,9 @@ pub struct Qwen36ExpertStore {
     intermediate: usize,
     maximum_expert_bytes: u64,
     cache: LayerLruCache<Arc<Qwen36LoadedExpert>>,
+    // One displaced or uncached expert occupies the existing transient-expert
+    // reserve. Only exclusively owned buffers can be overwritten by the next miss.
+    recycled: Option<Arc<Qwen36LoadedExpert>>,
     telemetry: ExpertTelemetry,
 }
 
@@ -228,6 +283,7 @@ impl Qwen36ExpertStore {
             intermediate,
             maximum_expert_bytes,
             cache: LayerLruCache::new(layers, slots_per_layer),
+            recycled: None,
             telemetry: ExpertTelemetry::default(),
         })
     }
@@ -236,6 +292,74 @@ impl Qwen36ExpertStore {
         &mut self,
         layer: usize,
         expert: usize,
+    ) -> Result<Arc<Qwen36LoadedExpert>, Qwen36ExpertStoreError> {
+        self.acquire_with_plan(layer, expert, None)
+    }
+
+    pub(super) fn acquire_grouped(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        schedule: &Qwen36GroupedAccess,
+        prefetched: &mut Qwen36PrefetchedExperts,
+    ) -> Result<Arc<Qwen36LoadedExpert>, Qwen36ExpertStoreError> {
+        match schedule {
+            Qwen36GroupedAccess::Ordered(_) => self.acquire(layer, expert),
+            Qwen36GroupedAccess::Planned(plan) | Qwen36GroupedAccess::Initial(plan) => {
+                debug_assert_eq!(layer, plan.layer());
+                if let Some(loaded) = prefetched.pending.remove(&expert) {
+                    self.admit_loaded(layer, expert, Some(plan), loaded?)
+                } else {
+                    self.acquire_with_plan(layer, expert, Some(plan))
+                }
+            }
+        }
+    }
+
+    pub(super) fn prefetch_grouped(
+        &self,
+        schedule: &Qwen36GroupedAccess,
+    ) -> Qwen36PrefetchedExperts {
+        let Qwen36GroupedAccess::Initial(plan) = schedule else {
+            return Qwen36PrefetchedExperts::default();
+        };
+        let layer = plan.layer();
+        debug_assert!(self.cache.layer_is_empty(layer));
+        let ids = plan.retained_keys().collect::<Vec<_>>();
+        debug_assert!(ids.len() <= self.cache.layer_capacity(layer));
+        let context = crate::profiling::capture_context();
+        // Staged survivors plus already admitted entries never exceed the cache slots.
+        // Non-final experts use the existing one-expert transient reserve. Keep errors
+        // by expert ID so the runtime still reports their original request positions.
+        let pending = install(|| {
+            ids.par_iter()
+                .map(|&id| {
+                    let result = context.enter(|| {
+                        let _profile = span(ProfileStage::Qwen36ExpertLoad);
+                        Qwen36LoadedExpert::load(
+                            &self.index,
+                            layer,
+                            id,
+                            self.hidden,
+                            self.intermediate,
+                            self.maximum_expert_bytes,
+                        )
+                        .map(Arc::new)
+                    });
+                    (id, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        Qwen36PrefetchedExperts {
+            pending: pending.into_iter().collect(),
+        }
+    }
+
+    fn acquire_with_plan(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        plan: Option<&GroupedAccessPlan>,
     ) -> Result<Arc<Qwen36LoadedExpert>, Qwen36ExpertStoreError> {
         if layer >= self.layers {
             return Err(Qwen36ExpertStoreError::InvalidLayer {
@@ -262,24 +386,51 @@ impl Qwen36ExpertStore {
         // Load before allowing the LRU to evict: a short/corrupt shard must not discard a usable
         // cached expert.
         let _profile = span(ProfileStage::Qwen36ExpertLoad);
-        let loaded = Qwen36LoadedExpert::load(
+        let reuse = self
+            .recycled
+            .take()
+            .and_then(|expert| Arc::try_unwrap(expert).ok())
+            .and_then(|expert| expert.value.into_bf16_buffers());
+        let loaded = Qwen36LoadedExpert::load_reusing(
             &self.index,
             layer,
             expert,
             self.hidden,
             self.intermediate,
             self.maximum_expert_bytes,
+            reuse,
         )?;
+        self.admit_loaded(layer, expert, plan, Arc::new(loaded))
+    }
+
+    fn admit_loaded(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        plan: Option<&GroupedAccessPlan>,
+        loaded: Arc<Qwen36LoadedExpert>,
+    ) -> Result<Arc<Qwen36LoadedExpert>, Qwen36ExpertStoreError> {
         let resident_bytes = loaded.resident_bytes();
         let payload_bytes = loaded.payload_bytes();
-        let loaded = Arc::new(loaded);
-        self.cache.access(
-            &mut self.telemetry,
-            layer,
-            expert,
-            || Ok((loaded, resident_bytes, payload_bytes)),
-            |value| Ok(Arc::clone(value)),
-        )
+        let load = || Ok::<_, Qwen36ExpertStoreError>((loaded, resident_bytes, payload_bytes));
+        let execute = |value: &mut Arc<Qwen36LoadedExpert>| {
+            Ok::<_, Qwen36ExpertStoreError>(Arc::clone(value))
+        };
+        let (selected, evicted) = match plan {
+            Some(plan) => self.cache.access_grouped_with_evicted(
+                &mut self.telemetry,
+                plan,
+                expert,
+                load,
+                execute,
+            ),
+            None => {
+                self.cache
+                    .access_with_evicted(&mut self.telemetry, layer, expert, load, execute)
+            }
+        }?;
+        self.recycled = evicted;
+        Ok(selected)
     }
 
     /// Stage a selected set only when every value remains charged to the cache.
@@ -358,6 +509,44 @@ impl Qwen36ExpertStore {
         Ok(Some(selected))
     }
 
+    /// Choose a bounded grouped schedule without mutating cache contents or counters.
+    pub(super) fn grouped_access_order(
+        &self,
+        layer: usize,
+        ids: &[usize],
+        experts_per_token: usize,
+    ) -> Option<Qwen36GroupedAccess> {
+        let initial = worker_threads() > 1
+            && self.cache.layer_is_empty(layer)
+            && self.cache.layer_capacity(layer) >= experts_per_token;
+        if let Some(plan) = self.cache.grouped_access_plan(layer, ids) {
+            return Some(if initial {
+                Qwen36GroupedAccess::Initial(plan)
+            } else {
+                Qwen36GroupedAccess::Planned(plan)
+            });
+        }
+        self.cache
+            .grouped_access_order(layer, ids)
+            .map(Qwen36GroupedAccess::Ordered)
+    }
+
+    pub(super) fn finish_grouped_accesses(
+        &mut self,
+        layer: usize,
+        ids: &[usize],
+        schedule: &Qwen36GroupedAccess,
+    ) {
+        match schedule {
+            Qwen36GroupedAccess::Ordered(order) => {
+                self.cache.finish_grouped_accesses(layer, ids, order.len());
+            }
+            Qwen36GroupedAccess::Planned(plan) | Qwen36GroupedAccess::Initial(plan) => {
+                self.cache.finish_grouped_plan(plan);
+            }
+        }
+    }
+
     pub fn telemetry(&self) -> &ExpertTelemetry {
         &self.telemetry
     }
@@ -418,6 +607,23 @@ mod tests {
             Err(Qwen36ExpertStoreError::Budget { .. })
         ));
         assert!(Qwen36LoadedExpert::load(&index, 0, 256, 2048, 512, 3 * matrix_bytes).is_err());
+        // Replacing a native expert overwrites every byte without reallocating its projections.
+        let buffers = expert.value.into_bf16_buffers().unwrap();
+        let addresses = buffers.each_ref().map(|bytes| bytes.as_ptr());
+        let reused = Qwen36LoadedExpert::load_reusing(
+            &index,
+            0,
+            0,
+            2048,
+            512,
+            3 * matrix_bytes,
+            Some(buffers),
+        )
+        .unwrap();
+        let buffers = reused.value.into_bf16_buffers().unwrap();
+        assert_eq!(addresses, buffers.each_ref().map(|bytes| bytes.as_ptr()));
+        assert!(buffers.iter().flatten().all(|&byte| byte == 0));
+        drop(buffers);
         let index = Arc::new(index);
         let mut store = Qwen36ExpertStore::new_shared(
             Arc::clone(&index),
@@ -440,20 +646,147 @@ mod tests {
         assert_eq!(store.telemetry().hits, 2);
         assert_eq!(store.telemetry().bytes_read, 6 * matrix_bytes);
         drop(store);
-        let new_store = || {
+        let new_store = |slots| {
             Qwen36ExpertStore::new_shared(
                 Arc::clone(&index),
                 1,
                 256,
                 2048,
                 512,
-                2,
+                slots,
                 3 * matrix_bytes,
             )
             .unwrap()
         };
-        let mut sequential = new_store();
-        let mut grouped = new_store();
+        for slots in [0, 1, 2] {
+            let mut store = new_store(slots);
+            let ids = [255, 0, 1, 255, 0, 1];
+            let before = store.telemetry().clone();
+            let schedule = store.grouped_access_order(0, &ids, 2).unwrap();
+            assert_eq!(
+                matches!(schedule, Qwen36GroupedAccess::Initial(_)),
+                slots >= 2 && worker_threads() > 1,
+            );
+            assert_eq!(store.telemetry(), &before);
+            store.acquire(0, 255).unwrap();
+            assert!(store.grouped_access_order(0, &ids, 2).is_some());
+        }
+        // Only the final survivors occupy staged cache slots. Admission moves their
+        // exact payloads, while all other groups share one transient expert buffer.
+        let mut initial = new_store(2);
+        let mut reference = new_store(2);
+        let accesses = [255, 0, 1, 255, 0, 1];
+        let schedule =
+            Qwen36GroupedAccess::Initial(initial.cache.grouped_access_plan(0, &accesses).unwrap());
+        let before = initial.telemetry().clone();
+        let mut prefetched = initial.prefetch_grouped(&schedule);
+        assert_eq!(
+            prefetched.pending.keys().copied().collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(initial.cache.layer_is_empty(0));
+        assert_eq!(initial.telemetry(), &before);
+        let addresses = prefetched
+            .pending
+            .iter()
+            .map(|(&id, value)| (id, Arc::as_ptr(value.as_ref().unwrap())))
+            .collect::<BTreeMap<_, _>>();
+        for &id in schedule.order() {
+            let expert = initial
+                .acquire_grouped(0, id, &schedule, &mut prefetched)
+                .unwrap();
+            if let Some(&address) = addresses.get(&id) {
+                assert_eq!(Arc::as_ptr(&expert), address);
+            }
+            if id == 255 {
+                assert_eq!(expert.value.forward(&input).unwrap(), output);
+                assert!(!initial.cache.contains(0, id));
+            }
+            assert!(
+                prefetched.pending.len()
+                    + initial.telemetry().resident_experts
+                    + usize::from(initial.recycled.is_some())
+                    <= 3
+            );
+        }
+        assert!(prefetched.pending.is_empty());
+        initial.finish_grouped_accesses(0, &accesses, &schedule);
+        assert_eq!(initial.telemetry().misses, 3);
+        assert_eq!(initial.telemetry().bytes_read, 9 * matrix_bytes);
+        assert_eq!(initial.telemetry().resident_bytes, 6 * matrix_bytes);
+        for id in accesses {
+            reference.acquire(0, id).unwrap();
+        }
+        for id in [255, 0, 1, 2, 0] {
+            let a = initial.telemetry().clone();
+            let b = reference.telemetry().clone();
+            initial.acquire(0, id).unwrap();
+            reference.acquire(0, id).unwrap();
+            assert_eq!(
+                initial.telemetry().misses - a.misses,
+                reference.telemetry().misses - b.misses
+            );
+        }
+        drop(initial);
+        drop(reference);
+        let mut serial = new_store(2);
+        let mut planned = new_store(2);
+        for id in [255, 0] {
+            serial.acquire(0, id).unwrap();
+            planned.acquire(0, id).unwrap();
+        }
+        let accesses = [255, 1, 2, 255];
+        let schedule = planned.grouped_access_order(0, &accesses, 1).unwrap();
+        assert!(matches!(schedule, Qwen36GroupedAccess::Planned(_)));
+        let original = planned.cache.peek(0, 255).unwrap().clone();
+        let before = planned.telemetry().clone();
+        let mut prefetched = planned.prefetch_grouped(&schedule);
+        assert!(prefetched.pending.is_empty());
+        for &id in schedule.order() {
+            let expert = planned
+                .acquire_grouped(0, id, &schedule, &mut prefetched)
+                .unwrap();
+            assert!(planned.cache.contains(0, 255));
+            assert_eq!(planned.telemetry().resident_bytes, 6 * matrix_bytes);
+            if id == 255 {
+                assert!(Arc::ptr_eq(&original, &expert));
+                assert_eq!(expert.value.forward(&input).unwrap(), output);
+            }
+            if id == 1 {
+                assert!(!planned.cache.contains(0, 1));
+                assert!(planned.recycled.is_some());
+            }
+        }
+        planned.finish_grouped_accesses(0, &accesses, &schedule);
+        assert_eq!(planned.telemetry().misses - before.misses, 2);
+        assert_eq!(
+            planned.telemetry().bytes_read - before.bytes_read,
+            6 * matrix_bytes
+        );
+        for id in accesses {
+            serial.acquire(0, id).unwrap();
+        }
+        assert_eq!(serial.telemetry().misses - before.misses, 3);
+        for id in [0, 255, 2, 3, 255] {
+            let a = serial.telemetry().clone();
+            let b = planned.telemetry().clone();
+            serial.acquire(0, id).unwrap();
+            planned.acquire(0, id).unwrap();
+            assert_eq!(
+                serial.telemetry().misses - a.misses,
+                planned.telemetry().misses - b.misses
+            );
+            assert_eq!(
+                serial.telemetry().hits - a.hits,
+                planned.telemetry().hits - b.hits
+            );
+        }
+        assert_eq!(original.value.forward(&input).unwrap(), output);
+        drop(original);
+        drop(planned);
+        drop(serial);
+        let mut sequential = new_store(2);
+        let mut grouped = new_store(2);
         let accesses = [255, 0, 255, 0, 255];
         for id in accesses {
             sequential.acquire(0, id).unwrap();
@@ -471,6 +804,134 @@ mod tests {
         }
         drop(grouped);
         drop(sequential);
+
+        // A caller may still hold an uncached or evicted expert. Neither replacement may
+        // overwrite those buffers, and later misses must still work once the caller drops it.
+        for slots in [0, 1] {
+            let mut store = new_store(slots);
+            let held = store.acquire(0, 255).unwrap();
+            for id in [0, 1, 0] {
+                let selected = store.acquire(0, id).unwrap();
+                assert!(selected
+                    .value
+                    .forward(&input)
+                    .unwrap()
+                    .iter()
+                    .all(|&x| x == 0.0));
+                assert_eq!(held.value.forward(&input).unwrap(), output);
+                assert_eq!(
+                    store.telemetry().resident_bytes,
+                    slots as u64 * 3 * matrix_bytes
+                );
+            }
+            drop(held);
+            assert_eq!(
+                store
+                    .acquire(0, 255)
+                    .unwrap()
+                    .value
+                    .forward(&input)
+                    .unwrap(),
+                output
+            );
+        }
+
+        // Failure after taking the spare must preserve the cached value and logical LRU
+        // counters. Corrupt only the synthetic fixture, then repair it to verify recovery.
+        let mut store = new_store(1);
+        store.acquire(0, 0).unwrap();
+        store.acquire(0, 255).unwrap();
+        assert!(store.recycled.is_some());
+        let before = store.telemetry().clone();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.join("packed.safetensors"))
+            .unwrap();
+        file.seek(SeekFrom::Start(start + 2 * matrix_bytes))
+            .unwrap();
+        file.write_all(&0x7f80u16.to_le_bytes()).unwrap(); // BF16 infinity.
+        let mut planned = new_store(1);
+        planned.acquire(0, 0).unwrap();
+        planned.acquire(0, 255).unwrap();
+        let schedule = planned.grouped_access_order(0, &[255, 1, 255], 1).unwrap();
+        let mut prefetched = planned.prefetch_grouped(&schedule);
+        planned
+            .acquire_grouped(0, 255, &schedule, &mut prefetched)
+            .unwrap();
+        assert!(planned.recycled.is_some());
+        let planned_before = planned.telemetry().clone();
+        assert!(planned
+            .acquire_grouped(0, 1, &schedule, &mut prefetched)
+            .is_err());
+        assert_eq!(planned.telemetry(), &planned_before);
+        assert!(planned.cache.contains(0, 255));
+        assert_eq!(
+            planned
+                .cache
+                .peek(0, 255)
+                .unwrap()
+                .value
+                .forward(&input)
+                .unwrap(),
+            output
+        );
+        drop(planned);
+        let mut initial = new_store(1);
+        let schedule = Qwen36GroupedAccess::Initial(
+            initial
+                .cache
+                .grouped_access_plan(0, &[255, 1, 255, 1])
+                .unwrap(),
+        );
+        let mut prefetched = initial.prefetch_grouped(&schedule);
+        assert!(prefetched.pending.get(&1).unwrap().is_err());
+        assert_eq!(initial.telemetry(), &ExpertTelemetry::default());
+        initial
+            .acquire_grouped(0, 255, &schedule, &mut prefetched)
+            .unwrap();
+        let before_failed_admission = initial.telemetry().clone();
+        assert!(initial
+            .acquire_grouped(0, 1, &schedule, &mut prefetched)
+            .is_err());
+        assert_eq!(initial.telemetry(), &before_failed_admission);
+        assert!(initial.cache.layer_is_empty(0));
+        assert_eq!(
+            initial
+                .recycled
+                .as_ref()
+                .unwrap()
+                .value
+                .forward(&input)
+                .unwrap(),
+            output
+        );
+        drop(initial);
+        assert!(store.acquire(0, 1).is_err());
+        assert_eq!(store.telemetry(), &before);
+        assert!(store.cache.contains(0, 255));
+        assert_eq!(
+            store
+                .acquire(0, 255)
+                .unwrap()
+                .value
+                .forward(&input)
+                .unwrap(),
+            output
+        );
+        assert_eq!(store.telemetry().hits, before.hits + 1);
+        file.seek(SeekFrom::Start(start + 2 * matrix_bytes))
+            .unwrap();
+        file.write_all(&0u16.to_le_bytes()).unwrap();
+        assert!(store
+            .acquire(0, 1)
+            .unwrap()
+            .value
+            .forward(&input)
+            .unwrap()
+            .iter()
+            .all(|&x| x == 0.0));
+        drop(file);
+        drop(store);
         drop(index);
         std::fs::remove_dir_all(directory).unwrap();
     }

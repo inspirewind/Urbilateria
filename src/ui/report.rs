@@ -319,6 +319,14 @@ pub fn inspection_entry(inspection: &Inspection, elapsed: std::time::Duration) -
             details.extend(report.format_notes.iter().cloned().map(Detail::text));
             details.extend(report.warnings.iter().cloned().map(Detail::warning));
         }
+        InspectionReport::Qwen38FlashNext(report) => {
+            details.extend([
+                Detail::field("Manifest", format!("{} shards · {} tensors · {} payload", report.checkpoint_shard_count, report.checkpoint_tensor_count, human_bytes(report.checkpoint_payload_bytes))),
+                Detail::field("Parameters", human_count(report.logical_parameter_count)),
+                Detail::field("Architecture", "36 sigmoid DeltaNet + 12 QSA; 4 HC streams; top-10/512 BF16 experts; row-streamed PLE"),
+                Detail::field("Scope", "Native text; vision and MTP validated but excluded"),
+            ]);
+        }
         InspectionReport::Qwen36(report) => {
             details.extend([
                 Detail::field(
@@ -625,6 +633,17 @@ pub fn preflight_entry(preflight: &Preflight, elapsed: std::time::Duration) -> E
                         human_bytes(report.mtp_payload_bytes)
                     ),
                 ),
+            ]);
+        }
+        PreflightReport::Qwen38FlashNext(report) => {
+            details.extend([
+                Detail::field("Scope", "Complete Flash-Next text-runtime schema"),
+                Detail::field("Context", report.context_limit.to_string()),
+                Detail::field("Resident peak", human_bytes(report.peak_resident_bytes)),
+                Detail::field("Causal state", human_bytes(report.state_bytes())),
+                Detail::field("QSA index cache", human_bytes(report.indexer_cache_bytes)),
+                Detail::field("PLE state", human_bytes(report.ple_state_bytes)),
+                Detail::field("Expert cache", human_bytes(report.expert_cache_bytes)),
             ]);
         }
         PreflightReport::Qwen36(report) => {

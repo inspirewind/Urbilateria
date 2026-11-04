@@ -549,33 +549,128 @@ impl FullAttention {
         let groups = self.geometry.num_query_heads / self.geometry.num_key_value_heads;
         let mut context = vec![0.0; self.geometry.context_width()?];
         let scale = (self.geometry.head_dim as f32).sqrt().recip();
-        let attend_head = |query_head: usize, output: &mut [f32]| -> Result<(), AttentionError> {
+        let score_head = |query_head: usize| -> Result<Vec<f32>, AttentionError> {
             let kv_head = query_head / groups;
             let q_start = query_head * self.geometry.head_dim;
             let q = &query[q_start..q_start + self.geometry.head_dim];
             let current_start = kv_head * self.geometry.head_dim;
             let current_key = &key[current_start..current_start + self.geometry.head_dim];
-            let current_value = &value[current_start..current_start + self.geometry.head_dim];
 
             let mut scores = Vec::with_capacity(cache.len() + 1);
-            for token in 0..cache.len() {
-                let score = dot(q, cache.row(false, token, kv_head)) * scale;
+            let mut push_score = |score: f32| -> Result<(), AttentionError> {
+                let score = score * scale;
                 scores.push(if self.bf16_activations {
                     round_to_bf16(score)?
                 } else {
                     score
                 });
+                Ok(())
+            };
+            #[cfg(target_arch = "x86_64")]
+            let mut token = 0;
+            #[cfg(not(target_arch = "x86_64"))]
+            let token = 0;
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let stride = cache.num_key_value_heads * cache.head_dim;
+                while cache.len() - token >= 8 {
+                    let start = token * stride + kv_head * cache.head_dim;
+                    let keys = &cache.keys[start..start + 7 * stride + cache.head_dim];
+                    let mut tile = [0.0; 8];
+                    // SAFETY: AVX2 is detected, eight complete key rows are present,
+                    // and their width equals q.len(). Each output keeps column order.
+                    unsafe { dot_key_rows_avx2(keys, stride, q, &mut tile) };
+                    for score in tile {
+                        push_score(score)?;
+                    }
+                    token += 8;
+                }
             }
-            let score = dot(q, current_key) * scale;
-            scores.push(if self.bf16_activations {
-                round_to_bf16(score)?
-            } else {
-                score
-            });
+            for token in token..cache.len() {
+                push_score(dot(q, cache.row(false, token, kv_head)))?;
+            }
+            push_score(dot(q, current_key))?;
             softmax_in_place(&mut scores)?;
             if self.bf16_activations {
                 round_to_bf16_in_place(&mut scores)?;
             }
+            Ok(scores)
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        if parallel
+            && self.geometry.num_query_heads == 16
+            && self.geometry.num_key_value_heads == 2
+            && self.geometry.head_dim == 256
+            && cache.len() >= 127
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            let results = install(|| {
+                context
+                    .par_chunks_mut(8 * 256)
+                    .enumerate()
+                    .map(|(kv_head, output)| -> Result<(), AttentionError> {
+                        let scores = (0..8)
+                            .into_par_iter()
+                            .map(|lane| score_head(kv_head * 8 + lane))
+                            .collect::<Vec<_>>();
+                        let mut packed = vec![0.0; (cache.len() + 1) * 8];
+                        for (lane, result) in scores.iter().enumerate() {
+                            if let Ok(scores) = result {
+                                for (token, &probability) in scores.iter().enumerate() {
+                                    packed[token * 8 + lane] = probability;
+                                }
+                            }
+                        }
+                        let current_value = &value[kv_head * 256..(kv_head + 1) * 256];
+                        // Each tile owns 16 columns for all eight queries. Independent
+                        // KV groups can progress through scoring and values concurrently.
+                        let mut sums = [0.0f64; 8 * 256];
+                        sums.par_chunks_mut(8 * 16)
+                            .enumerate()
+                            .for_each(|(tile, output)| {
+                                // SAFETY: AVX2 is detected, this path has 256-wide KV
+                                // rows, and each tile covers 16 complete columns. Packed
+                                // probabilities have eight lanes for every cached/current row.
+                                unsafe {
+                                    grouped_values_tile_avx2(
+                                        cache,
+                                        kv_head,
+                                        tile * 16,
+                                        current_value,
+                                        &packed,
+                                        output,
+                                    )
+                                };
+                            });
+                        for (lane, result) in scores.into_iter().enumerate() {
+                            // Defer score failures until every lower head has had its
+                            // context cast checked, preserving the original error order.
+                            result?;
+                            for column in 0..256 {
+                                let sum = sums[(column / 16) * 128 + (column % 16) * 8 + lane];
+                                let value = sum as f32;
+                                output[lane * 256 + column] = if self.bf16_activations {
+                                    round_to_bf16(value)?
+                                } else {
+                                    value
+                                };
+                            }
+                        }
+                        Ok(())
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for result in results {
+                result?;
+            }
+            return Ok(context);
+        }
+
+        let attend_head = |query_head: usize, output: &mut [f32]| -> Result<(), AttentionError> {
+            let scores = score_head(query_head)?;
+            let current_start = (query_head / groups) * self.geometry.head_dim;
+            let current_value = &value[current_start..current_start + self.geometry.head_dim];
 
             // Native 256-wide heads need no heap scratch. Traverse complete value rows
             // while retaining the original token-order F64 sum for every dimension.
@@ -587,7 +682,7 @@ impl FullAttention {
                 wide_sums = vec![0.0; self.geometry.head_dim];
                 &mut wide_sums
             };
-            weighted_values_into(cache, kv_head, current_value, &scores, sums);
+            weighted_values_into(cache, query_head / groups, current_value, &scores, sums);
             for (output, &sum) in output.iter_mut().zip(sums.iter()) {
                 let value = sum as f32;
                 *output = if self.bf16_activations {
@@ -697,6 +792,69 @@ unsafe fn weighted_values_avx2(
     }
 }
 
+/// A tile is `[16 columns, 8 query heads]`, with token-major probabilities.
+/// Bounded token blocks reuse each loaded value across all eight query heads.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn grouped_values_tile_avx2(
+    cache: &FullAttentionCache,
+    head: usize,
+    column_start: usize,
+    current: &[f32],
+    probabilities: &[f32],
+    output: &mut [f64],
+) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(output.len(), 16 * 8);
+    debug_assert_eq!(current.len(), cache.head_dim);
+    debug_assert_eq!(probabilities.len(), (cache.len() + 1) * 8);
+    debug_assert!(head < cache.num_key_value_heads);
+    debug_assert!(column_start + 16 <= cache.head_dim);
+    output.fill(0.0);
+    for block in (0..cache.len() + 1).step_by(32) {
+        let end = (cache.len() + 1).min(block + 32);
+        for column in (0..16).step_by(4) {
+            let mut sums = [_mm256_setzero_pd(); 8];
+            for (lane, sum) in sums.iter_mut().enumerate() {
+                *sum = _mm256_loadu_pd(output.as_ptr().add(column * 8 + lane * 4));
+            }
+            for (offset, weights) in probabilities[block * 8..end * 8]
+                .chunks_exact(8)
+                .enumerate()
+            {
+                let token = block + offset;
+                let values = if token == cache.len() {
+                    current
+                } else {
+                    cache.row(true, token, head)
+                };
+                let p = [
+                    _mm256_cvtps_pd(_mm_loadu_ps(weights.as_ptr())),
+                    _mm256_cvtps_pd(_mm_loadu_ps(weights.as_ptr().add(4))),
+                ];
+                let values =
+                    _mm256_cvtps_pd(_mm_loadu_ps(values.as_ptr().add(column_start + column)));
+                let values = [
+                    _mm256_permute4x64_pd::<0x00>(values),
+                    _mm256_permute4x64_pd::<0x55>(values),
+                    _mm256_permute4x64_pd::<0xaa>(values),
+                    _mm256_permute4x64_pd::<0xff>(values),
+                ];
+                for (dimension, value) in values.into_iter().enumerate() {
+                    for (group, &weight) in p.iter().enumerate() {
+                        let lane = dimension * 2 + group;
+                        // Keep each output's token order and separate F64 mul/add.
+                        sums[lane] = _mm256_add_pd(sums[lane], _mm256_mul_pd(weight, value));
+                    }
+                }
+            }
+            for (lane, sum) in sums.into_iter().enumerate() {
+                _mm256_storeu_pd(output.as_mut_ptr().add(column * 8 + lane * 4), sum);
+            }
+        }
+    }
+}
+
 fn half_split_rope(values: &mut [f32], position: usize, theta: f32) -> Result<(), AttentionError> {
     if values.is_empty() || values.len() % 2 != 0 {
         return Err(AttentionError::InvalidGeometry(
@@ -779,6 +937,61 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
         .sum::<f64>() as f32
 }
 
+/// Eight keys share the query while each SIMD lane keeps one ordered F64 sum.
+/// Four-column transposes exist only in registers; the KV cache stays unexpanded.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_key_rows_avx2(keys: &[f32], stride: usize, query: &[f32], output: &mut [f32; 8]) {
+    use std::arch::x86_64::*;
+    debug_assert!(stride >= query.len());
+    debug_assert!(keys.len() >= 7 * stride + query.len());
+    let complete = query.len() / 4 * 4;
+    // Match Iterator::sum's identity, including products that are all negative zero.
+    let mut sums = [_mm256_set1_pd(-0.0); 2];
+    for column in (0..complete).step_by(4) {
+        let values = [
+            _mm256_set1_pd(f64::from(query[column])),
+            _mm256_set1_pd(f64::from(query[column + 1])),
+            _mm256_set1_pd(f64::from(query[column + 2])),
+            _mm256_set1_pd(f64::from(query[column + 3])),
+        ];
+        for (group, sum) in sums.iter_mut().enumerate() {
+            let base = keys.as_ptr().add(group * 4 * stride + column);
+            let a = _mm_loadu_ps(base);
+            let b = _mm_loadu_ps(base.add(stride));
+            let c = _mm_loadu_ps(base.add(stride * 2));
+            let d = _mm_loadu_ps(base.add(stride * 3));
+            let ab0 = _mm_unpacklo_ps(a, b);
+            let ab1 = _mm_unpackhi_ps(a, b);
+            let cd0 = _mm_unpacklo_ps(c, d);
+            let cd1 = _mm_unpackhi_ps(c, d);
+            let columns = [
+                _mm_movelh_ps(ab0, cd0),
+                _mm_movehl_ps(cd0, ab0),
+                _mm_movelh_ps(ab1, cd1),
+                _mm_movehl_ps(cd1, ab1),
+            ];
+            for column in 0..4 {
+                *sum = _mm256_add_pd(
+                    *sum,
+                    _mm256_mul_pd(_mm256_cvtps_pd(columns[column]), values[column]),
+                );
+            }
+        }
+    }
+    for (group, sum) in sums.into_iter().enumerate() {
+        let mut lanes = [0.0; 4];
+        _mm256_storeu_pd(lanes.as_mut_ptr(), sum);
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            let row = group * 4 + lane;
+            for column in complete..query.len() {
+                *sum += f64::from(keys[row * stride + column]) * f64::from(query[column]);
+            }
+            output[row] = *sum as f32;
+        }
+    }
+}
+
 fn sigmoid(value: f32) -> f32 {
     if value >= 0.0 {
         1.0 / (1.0 + (-value).exp())
@@ -791,6 +1004,82 @@ fn sigmoid(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn key_score_tiles_preserve_ordered_dot_bits_with_strides_and_tails() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for width in [1, 3, 4, 5, 7, 8, 31, 128, 256, 257] {
+            for heads in [1, 2, 3, 8] {
+                let stride = heads * width;
+                let keys = (0..stride * 8)
+                    .map(|i| ((i * 137 % 251) as f32 - 125.0) / 37.0)
+                    .collect::<Vec<_>>();
+                let query = (0..width)
+                    .map(|i| ((i * 19 % 97) as f32 - 48.0) / 31.0)
+                    .collect::<Vec<_>>();
+                for head in 0..heads {
+                    let mut actual = [0.0; 8];
+                    unsafe {
+                        dot_key_rows_avx2(&keys[head * width..], stride, &query, &mut actual)
+                    };
+                    for (row, value) in actual.iter().enumerate() {
+                        let start = row * stride + head * width;
+                        assert_eq!(
+                            value.to_bits(),
+                            dot(&query, &keys[start..start + width]).to_bits(),
+                            "width={width} heads={heads} head={head} row={row}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn key_score_tiles_preserve_cancellation_subnormals_and_signed_zero() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for width in [3, 4, 5, 31, 256, 257] {
+            let patterns = [
+                [-0.0; 4],
+                [0.0; 4],
+                [1e30, 1.0, -1e30, 2.0],
+                [
+                    f32::MAX,
+                    f32::MIN_POSITIVE,
+                    f32::from_bits(1),
+                    -f32::from_bits(1),
+                ],
+            ];
+            let keys = (0..width * 8)
+                .map(|i| patterns[(i / width) % 4][i % width % 4])
+                .collect::<Vec<_>>();
+            for x in [
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                f32::from_bits(1),
+                f32::MIN_POSITIVE,
+                f32::MAX,
+            ] {
+                let query = vec![x; width];
+                let mut actual = [0.0; 8];
+                unsafe { dot_key_rows_avx2(&keys, width, &query, &mut actual) };
+                for row in 0..8 {
+                    assert_eq!(
+                        actual[row].to_bits(),
+                        dot(&query, &keys[row * width..(row + 1) * width]).to_bits()
+                    );
+                }
+            }
+        }
+    }
 
     fn multi_head_attention(width: usize, bf16: bool) -> FullAttention {
         let geometry = FullAttentionGeometry {
@@ -836,6 +1125,9 @@ mod tests {
                 (5, 17),
                 (128, 33),
                 (256, 65),
+                (256, 126),
+                (256, 127),
+                (256, 128),
                 (257, 129),
                 (256, 513),
             ] {
@@ -874,16 +1166,16 @@ mod tests {
         module.v_proj = matrix(kv, 2, vec![1.0; kv * 2]).into();
         module.o_proj = matrix(2, context, vec![f32::MAX; 2 * context]).into();
         let mut cache = module.new_cache().unwrap();
-        for _ in 0..65 {
+        for _ in 0..129 {
             cache.push(&vec![0.0; kv], &vec![0.0; kv]);
         }
         let before = cache.clone();
-        assert!(module.forward_token(&[1.0, 1.0], 65, &mut cache).is_err());
+        assert!(module.forward_token(&[1.0, 1.0], 129, &mut cache).is_err());
         assert_eq!(cache.keys, before.keys);
         assert_eq!(cache.values, before.values);
         // The first batch token succeeds; the second overflows the output projection.
         assert!(module
-            .forward_tokens(&[0.0, 0.0, 1.0, 1.0], 2, 65, &mut cache)
+            .forward_tokens(&[0.0, 0.0, 1.0, 1.0], 2, 129, &mut cache)
             .is_err());
         assert_eq!(cache.keys, before.keys);
         assert_eq!(cache.values, before.values);
@@ -931,6 +1223,112 @@ mod tests {
         let mut sums = [1.0; 5];
         weighted_values_into(&cache, 0, &[-0.0; 5], &[1.0, 1.0], &mut sums);
         assert!(sums.iter().all(|x| x.to_bits() == 0.0f64.to_bits()));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn grouped_values_match_scalar_oracle_across_tiles_and_token_blocks() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let width = 256;
+        for tokens in [0, 1, 31, 32, 33, 127, 128, 129, 513] {
+            let mut cache = FullAttentionCache::new(2, width).unwrap();
+            let row = |length, offset| {
+                (0..length)
+                    .map(|i| ((i * 137 + offset) % 251) as f32 / 37.0 - 3.0)
+                    .collect::<Vec<_>>()
+            };
+            for token in 0..tokens {
+                cache.push(&vec![0.0; width * 2], &row(width * 2, token * 19));
+            }
+            let current = row(width * 2, 47);
+            let probabilities = row((tokens + 1) * 8, 83);
+            for head in 0..2 {
+                for column in (0..width).step_by(16) {
+                    let mut actual = [17.0; 128];
+                    unsafe {
+                        grouped_values_tile_avx2(
+                            &cache,
+                            head,
+                            column,
+                            &current[head * width..(head + 1) * width],
+                            &probabilities,
+                            &mut actual,
+                        )
+                    };
+                    for dimension in 0..16 {
+                        for lane in 0..8 {
+                            let mut expected = 0.0f64;
+                            for token in 0..tokens {
+                                expected += f64::from(probabilities[token * 8 + lane])
+                                    * f64::from(cache.row(true, token, head)[column + dimension]);
+                            }
+                            expected += f64::from(probabilities[tokens * 8 + lane])
+                                * f64::from(current[head * width + column + dimension]);
+                            assert_eq!(actual[dimension * 8 + lane].to_bits(), expected.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+        let patterns = [
+            0.0,
+            -0.0,
+            1e30,
+            1.0,
+            -1e30,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+        ];
+        let mut cache = FullAttentionCache::new(1, 16).unwrap();
+        for token in 0..65 {
+            let values = std::array::from_fn::<_, 16, _>(|i| patterns[(i + token) % 8]);
+            cache.push(&[0.0; 16], &values);
+        }
+        let current = [-0.0; 16];
+        let probabilities = (0..66 * 8).map(|i| patterns[i % 8]).collect::<Vec<_>>();
+        let mut actual = [17.0; 128];
+        unsafe { grouped_values_tile_avx2(&cache, 0, 0, &current, &probabilities, &mut actual) };
+        for dimension in 0..16 {
+            for lane in 0..8 {
+                let mut expected = 0.0f64;
+                for token in 0..65 {
+                    expected += f64::from(probabilities[token * 8 + lane])
+                        * f64::from(cache.row(true, token, 0)[dimension]);
+                }
+                expected += f64::from(probabilities[65 * 8 + lane]) * f64::from(current[dimension]);
+                assert_eq!(actual[dimension * 8 + lane].to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_heads_preserve_context_and_score_failure_order() {
+        for bf16 in [false, true] {
+            let module = multi_head_attention(256, bf16);
+            let mut cache = module.new_cache().unwrap();
+            for _ in 0..129 {
+                cache.push(&[0.0; 512], &vec![f32::MAX; 512]);
+            }
+            let key = [0.0; 512];
+            let value = [f32::MAX; 512];
+            let mut query = [0.0; 4096];
+            query[8 * 256] = f32::INFINITY;
+            let serial = module
+                .head_context(&query, &key, &value, &cache, false)
+                .unwrap_err();
+            let grouped = module
+                .head_context(&query, &key, &value, &cache, true)
+                .unwrap_err();
+            assert_eq!(serial.to_string(), grouped.to_string());
+            if bf16 {
+                assert!(matches!(serial, AttentionError::Weight(_)));
+            } else {
+                assert!(matches!(serial, AttentionError::Math(_)));
+            }
+        }
     }
 
     fn matrix(rows: usize, columns: usize, values: Vec<f32>) -> DenseMatrix {

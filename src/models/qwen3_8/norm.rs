@@ -102,6 +102,43 @@ pub(crate) fn gated_rms_norm_bf16(
     Ok(output)
 }
 
+/// Flash-Next's sigmoid variant, with the same BF16 normalization boundaries.
+pub(crate) fn gated_rms_norm_sigmoid(
+    input: &[f32],
+    weight: &[f32],
+    gate: &[f32],
+    eps: f32,
+    bf16: bool,
+) -> Result<Vec<f32>, NormError> {
+    validate(input, weight, Some(gate), eps)?;
+    let inverse = inverse_rms(input, eps)?;
+    let output = input
+        .iter()
+        .zip(weight)
+        .zip(gate)
+        .map(|((&x, &w), &g)| {
+            let normalized = if bf16 {
+                round_bf16(x * inverse)
+            } else {
+                x * inverse
+            };
+            let weighted = if bf16 {
+                round_bf16(normalized * w)
+            } else {
+                normalized * w
+            };
+            let value = weighted / (1.0 + (-g).exp());
+            if bf16 {
+                round_bf16(value)
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure_finite("sigmoid gated output", &output)?;
+    Ok(output)
+}
+
 fn validate(
     input: &[f32],
     weight: &[f32],

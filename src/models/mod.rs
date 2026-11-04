@@ -11,3 +11,5 @@ pub mod kimi_k3;
 pub mod qwen3_8;
 
 pub mod qwen3_6;
+
+pub mod qwen3_8_flash_next;

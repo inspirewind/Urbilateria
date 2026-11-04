@@ -113,10 +113,11 @@ fn real_prefill_matches_incremental_decode() {
     assert_eq!(model.default_prefill_batch_size(), 32);
     let tokens = [9419, 11, 0];
     let mut incremental = model.new_state().unwrap();
-    let mut last = Vec::new();
+    let mut last = None;
     for token in tokens {
-        last = model.forward_token(token, &mut incremental).unwrap().logits;
+        last = Some(model.forward_token(token, &mut incremental).unwrap());
     }
+    let last = last.unwrap();
     for batch in [1, 2, 32, Qwen36RuntimeModel::MAX_PREFILL_BATCH] {
         let mut batched = model.new_state().unwrap();
         for invalid in [0, Qwen36RuntimeModel::MAX_PREFILL_BATCH + 1] {
@@ -128,7 +129,7 @@ fn real_prefill_matches_incremental_decode() {
         let actual = model
             .prefill_tokens_with_batch_size(&tokens, &mut batched, batch)
             .unwrap();
-        assert_eq!(actual.logits, last);
+        assert_eq!(actual, last, "batch={batch}: logits and final routes");
         assert_eq!(batched.position(), 3);
     }
 }

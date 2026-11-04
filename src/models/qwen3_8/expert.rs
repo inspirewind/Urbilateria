@@ -112,6 +112,24 @@ impl Qwen38Expert {
             .saturating_add(self.down_proj.resident_bytes())
     }
 
+    /// Recover native buffers after an expert has no remaining readers.
+    pub(crate) fn into_bf16_buffers(self) -> Option<[Vec<u8>; 3]> {
+        let WeightMatrix::Bf16(gate) = self.gate_proj else {
+            return None;
+        };
+        let WeightMatrix::Bf16(up) = self.up_proj else {
+            return None;
+        };
+        let WeightMatrix::Bf16(down) = self.down_proj else {
+            return None;
+        };
+        Some([
+            gate.into_le_bytes(),
+            up.into_le_bytes(),
+            down.into_le_bytes(),
+        ])
+    }
+
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>, Qwen38ExpertError> {
         Self::forward_projections(&self.gate_proj, &self.up_proj, &self.down_proj, input)
     }

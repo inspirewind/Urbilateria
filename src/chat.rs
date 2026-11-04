@@ -324,6 +324,18 @@ fn render_bytes(
                 },
             )
         }
+        ModelFamily::Qwen38FlashNext => {
+            use urbilateria::models::qwen3_8_flash_next::prompt as p;
+            p::render_chat(
+                &messages!(p, |content: &str, reasoning: Option<&str>| {
+                    p::Message::assistant(content, reasoning)
+                }),
+                p::PromptOptions {
+                    enable_thinking: thinking,
+                    ..Default::default()
+                },
+            )?
+        }
         ModelFamily::Qwen36 => {
             use qwen3_6::prompt as p;
             p::render_chat(

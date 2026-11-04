@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+## [0.2.4] - 2026-11-04
+
+- Add the native BF16 Qwen3.8-Flash-Next (`qwen4_exp`) text adapter with HC,
+  sigmoid DeltaNet, QSA block selection, EOS-aware split-table PLE, streamed
+  experts, bounded backbone/expert caching, and conversation state rollback.
+  Wire inspect/preflight/tokenize/generate/chat/UI, validate all 131 shard headers,
+  and add independent PyTorch numerical and shipped-template fixtures.
+
+- Share BF16 input loads across two output rows in AVX2/FMA batch projections,
+  preserving each output's FP32 reduction order, finite checks, and scalar fallback.
+- Extend bit-exact GEMV comparisons across paired/odd rows, four-input groups,
+  and batch tails without changing Qwen3.6 cache budgets or prefill chunk sizes.
+- Process DeltaNet prefill chunks by value head, keeping each head's recurrent
+  state local across tokens and moving its validation and gating into the same
+  worker task. Preserve token order, BF16 rounding, and transactional state commits.
+- Cover native/wide head geometry, continuation, late-token failure, and failed
+  workspace reuse; account for the additional bounded prefill buffers within the
+  existing Qwen3.6 scratch reservation.
+- Accelerate ordered BF16/F64 matrix-vector products on AVX2 with eight independent
+  row sums and register-only transposes. Enable tiles for serial work or pools of
+  up to four workers with enough row tiles, retaining the original row schedule
+  for larger pools and the exact column order, signed zero, and row/column tails.
+- Compute eight cached GQA key scores together on AVX2, preserving each ordered
+  F64 reduction, score cast, BF16 rounding, and error order. Keep the KV cache
+  unexpanded and retain scalar handling for current keys, partial tiles, and tails.
+- Share GQA value loads across the eight query heads of each native KV group on
+  AVX2, using column tiles for parallel work once at least 128 tokens are attended.
+  Preserve ordered F64 sums, BF16 casts, head error order, and transactional KV
+  commits; account for packed probabilities within the existing scratch reserve.
+- Complete DeltaNet decode state checks and output gating on the worker updating
+  each head. Preserve the original validation-phase priority, numerical ordering,
+  and transaction boundary; remove one intermediate core-output allocation.
+- Compare inference at 4/16/32/90 GiB runtime budgets with each cache plan's default
+  prefill chunks, including repeated expert misses, complete-logit hashes, storage
+  reads, and sampled RSS. Document the existing 32 GiB plan's RSS overshoot.
+- Reuse one exclusively owned native Qwen3.6 expert's BF16 buffers within the
+  existing transient reserve, preserving cache capacity, LRU order, validation
+  and logical read counters. Cover outstanding readers, exact buffer replacement,
+  and cache retention and recovery after a corrupt load. Record RSS reductions
+  alongside observed full-cache timing differences across RAM plans.
+- Add an optional profiling-off mode to the Qwen3.6 benchmark, retaining token,
+  complete-logit and cache checks while measuring Linux memory/I/O endpoints
+  outside inference timing. Confirm expert-buffer reuse's RSS reduction without
+  profiling; document that earlier full-cache timing losses did not consistently
+  recur in the rebuilt comparisons.
+- Reuse validated batched MoE routes when partial expert caches require tokenwise
+  execution. Avoid repeating router projections, top-k selection and route-weight
+  casts while preserving expert access order and the existing memory plan. Extend
+  the native prefill/decode gate to compare final routes as well as logits.
+- Group repeated Qwen3.6 prefill expert requests while streaming one expert at a
+  time, using a simulated miss bound and exact final-LRU timestamp replay. Preserve
+  parallel initial filling of partial caches, ordered BF16 outputs and existing
+  cache/scratch/chunk budgets. Verify first-pass and replay behavior across RAM
+  plans, a second input, larger chunks, finite failures and future cache accesses.
+- Audit zero-cache prefill chunks with counterbalanced runs, allocator probes and
+  first-request checks. Reject a larger-default candidate whose faster prefill
+  came with a repeated 9% decode slowdown; retain the existing runtime policies
+  and document why favorable warmed crossovers did not predict its first request.
+
+- Preserve selected resident Qwen3.6 experts during grouped prefill, admitting
+  only the original final LRU survivors and streaming other misses through the
+  existing transient buffer. Minimize partial-cache reloads while preserving exact
+  recency, BF16 outputs, parallel initial filling and existing memory/chunk budgets.
+  Validate across 4/16/32/90 GiB plans, two inputs and extended small-memory decode.
+
 ## [0.2.3]
 
 ### Qwen3.6-35B-A3B text inference
@@ -169,6 +234,7 @@
 - Include model adapters, bounded-memory execution, tokenizer and chat-template support,
   runtime validation, profiling, and an interactive profile-trace viewer.
 
+[0.2.4]: https://github.com/inspirewind/Urbilateria/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/inspirewind/Urbilateria/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/inspirewind/Urbilateria/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/inspirewind/Urbilateria/compare/v0.2.0...v0.2.1

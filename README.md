@@ -19,16 +19,16 @@ GLM-5.2, DeepSeek-V4/V4.1, Kimi-K3, Qwen3.6/3.8, and Hy4 on bounded-memory, CPU-
 <img src="https://img.shields.io/badge/Rust-1.88%2B-b7410e?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+">
 <img src="https://img.shields.io/badge/runtime-CPU--only-3d6b5d?style=flat-square" alt="CPU-only runtime">
 <img src="https://img.shields.io/badge/model_families-5-247ba0?style=flat-square" alt="Five model families">
-<img src="https://img.shields.io/badge/tests-453_passing-2e7d32?style=flat-square" alt="453 tests passing">
+<img src="https://img.shields.io/badge/tests-480_passing-2e7d32?style=flat-square" alt="480 tests passing">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6c5ce7?style=flat-square" alt="MIT License"></a>
 </p>
 
 <table>
 <tr>
 <td align="center"><b>2.78T</b><br><sub>maximum parameter count</sub></td>
-<td align="center"><b>7</b><br><sub>model adapters</sub></td>
-<td align="center"><b>7</b><br><sub>public generation paths</sub></td>
-<td align="center"><b>453</b><br><sub>default tests passing</sub></td>
+<td align="center"><b>8</b><br><sub>model adapters</sub></td>
+<td align="center"><b>8</b><br><sub>public generation paths</sub></td>
+<td align="center"><b>480</b><br><sub>default tests passing</sub></td>
 <td align="center"><b>0</b><br><sub>GPUs required</sub></td>
 </tr>
 </table>
@@ -64,6 +64,11 @@ model weights are included in this repository.
 
 Building from source requires Rust 1.88 or newer. With rustup, this repository automatically selects Rust 1.88.0
 using `rust-toolchain.toml`, including rustfmt and Clippy.
+
+Version 0.2.4 adds experimental Qwen3.8-Flash-Next native BF16 text inference,
+CLI/TUI integration, and further Qwen3.6 CPU and expert-cache optimizations.
+See the [Flash-Next guide](src/models/qwen3_8_flash_next/README.md) for usage,
+validation, and current limitations.
 
 Version 0.2.3 adds experimental Qwen3.6-35B-A3B native BF16 text inference in the CLI and TUI,
 with thinking/no-thinking chat, persistent sessions, RAM-budgeted weight caches, batched prefill,
@@ -347,14 +352,14 @@ grow with compressed history.
 
 ## Model Coverage
 
-| Capability | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 | Qwen3.6 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **Checkpoint ABI** | converted Colibri | native 48-shard | native 48-shard; 96,085 tensors | native 96-shard | native 213-shard | native 130-shard | native 26-shard / 1,045 tensors |
-| **Tokenizer / chat** | byte-BPE | native text chat | native text chat + numeric effort | TikToken + XTML | always-thinking ChatML | native reasoning/no-think | thinking/no-thinking ChatML |
-| **Native weights** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 | packed BF16 |
-| **Attention path** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA | DeltaNet + GQA |
-| **Public CLI generation** | Experimental | Experimental | Experimental, text base runtime | Experimental | Experimental | Experimental, ≤2,048 tokens | Experimental, text only |
-| **Multimodal execution** | No | No | Schema only | Schema only | No | No | Schema only |
+| Capability | GLM-5.2 | DeepSeek-V4 | DeepSeek-V4.1 | Kimi-K3 | Qwen3.8 | Hy4 | Qwen3.6 | Qwen3.8-Flash-Next |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **Checkpoint ABI** | converted Colibri | native 48-shard | native 48-shard; 96,085 tensors | native 96-shard | native 213-shard | native 130-shard | native 26-shard / 1,045 tensors | native 131-shard / 1,658 tensors |
+| **Tokenizer / chat** | byte-BPE | native text chat | native text chat + numeric effort | TikToken + XTML | always-thinking ChatML | native reasoning/no-think | thinking/no-thinking ChatML | thinking/no-thinking ChatML |
+| **Native weights** | INT8/INT4 | 128×128 MXFP8 + MXFP4 | 32×32 MXFP8 + MXFP4 | BF16 + MXFP4 | block FP8 | ModelOpt MXFP8 | packed BF16 | packed BF16 + I64 PLE hashes |
+| **Attention path** | MLA | local + compressed | CED + CSA2 + Engram + mHC | KDA + MLA | DeltaNet + GQA | iHC + MLA/DSA | DeltaNet + GQA | HC + sigmoid DeltaNet + QSA + PLE |
+| **Public CLI generation** | Experimental | Experimental | Experimental, text base runtime | Experimental | Experimental | Experimental, ≤2,048 tokens | Experimental, text only | Experimental, text only |
+| **Multimodal execution** | No | No | Schema only | Schema only | No | No | Schema only | Schema only |
 
 ### What “native” means
 
@@ -378,6 +383,13 @@ vision and DSpark remain schema-only.
 keeps the compact BF16 trunk bounded by layer, and preserves recurrent KDA plus compressed MLA
 state. XTML is assembled from trusted structural segments and escaped untrusted content. Generation
 stops on `<|end_of_msg|>` (163586), not the tokenizer metadata's `[EOS]` token (163585).
+
+**Qwen3.8-Flash-Next.** Separate native BF16 `qwen4_exp` text adapter: 48 layers,
+4 HC streams, sigmoid DeltaNet, QSA sparse attention, streamed n-gram PLE, and
+top-10/512 experts. CLI/TUI support thinking and non-thinking chat, bounded caches,
+and session reuse. Vision/MTP are validated but excluded from text execution.
+See the [Flash-Next guide](src/models/qwen3_8_flash_next/README.md) for commands,
+validation and limitations.
 
 **Qwen3.6-35B-A3B.** Native BF16 text adapter with 40 hybrid-attention layers, top-8/256 experts,
 thinking/no-thinking ChatML, and CLI/TUI generation, preflight, and persistent chat sessions.
@@ -508,6 +520,7 @@ layer of confidence has its own gate:
 | Kimi-K3 | independent full-stack logits parity and known `Paris` continuation | sustained performance and revision-by-revision validation |
 | Qwen3.6 | complete schema; two-step Transformers numerical gates; exact resident/streamed, batched/incremental, and checkpoint-replay parity | long-context quality and broader workload/hardware performance validation |
 | Qwen3.8 | independent tiny FP32/BF16 graph, real FP8 expert payload, and real 92-layer full-logits oracles | sustained performance and multi-token release validation |
+| Qwen3.8-Flash-Next | independent BF16 HC/QSA/PLE/DeltaNet fixtures; real two-step logits; exact streaming, prefill and checkpoint replay; public Chinese CLI smoke | long-context quality, vision/MTP, and sustained performance |
 | Hy4 | upstream iHC/Gated-MLA semantics; exact schema/MXFP8/expert payload gates; real 78-layer token and public CLI generation smoke | independent full-logits parity and >2,048-token IndexCache execution |
 
 For the Qwen3.8 release token `Hello`, the independent PyTorch streamer and Rust runtime select the
@@ -523,7 +536,7 @@ The model-free suite is fast and does not need a checkpoint:
 cargo test --all-targets --locked
 ```
 
-Current Linux result: **453 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
+Current Linux result: **480 passed, 0 failed**, with real-checkpoint tests explicitly ignored unless
 their model directory is supplied.
 
 <details>

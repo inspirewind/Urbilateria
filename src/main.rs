@@ -27,6 +27,7 @@ use urbilateria::models::kimi_k3::runtime::KimiK3RuntimeModel;
 use urbilateria::models::kimi_k3::tokenizer::KimiK3Tokenizer;
 use urbilateria::models::qwen3_6::{schema as qwen36_schema, Qwen36Config, Qwen36RuntimeModel};
 use urbilateria::models::qwen3_8::{schema as qwen38_schema, Qwen38Config, Qwen38RuntimeModel};
+use urbilateria::models::qwen3_8_flash_next::{Qwen38FlashNextConfig, Qwen38FlashNextRuntimeModel};
 use urbilateria::profiling::{span, ProfileSession, ProfileStage};
 use urbilateria::runtime::RuntimeLoadOptions;
 use urbilateria::storage::TensorIndex;
@@ -83,6 +84,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 match &inspection.report {
                     InspectionReport::Checkpoint(report) => print_checkpoint(report),
                     InspectionReport::Qwen38(report) => print_qwen38_manifest(report),
+                    InspectionReport::Qwen38FlashNext(report) => {
+                        print_qwen38_flash_next_manifest(report)
+                    }
                     InspectionReport::Qwen36(report) => print_qwen36_manifest(report),
                     InspectionReport::Hy4(report) => print_hy4_manifest(report),
                     InspectionReport::DeepseekV41(report) => print_deepseek_v41_manifest(report),
@@ -620,6 +624,21 @@ fn run_generate_inner<W: Write>(
             prompt.text().expect("raw text input"),
         )?;
     }
+    if let ModelConfig::Qwen38FlashNext(config) = model_config {
+        return run_generate_qwen38_flash_next(
+            model_dir,
+            config,
+            prompt,
+            requested_ram,
+            max_new_tokens,
+            raw_prompt,
+            no_thinking,
+            available_ram_override,
+            output,
+            progress,
+            cache,
+        );
+    }
     if let ModelConfig::Qwen36(config) = model_config {
         return run_generate_qwen36(
             model_dir,
@@ -880,7 +899,7 @@ fn validate_native_raw_prompt(family: ModelFamily, prompt: &str) -> Result<(), B
         ModelFamily::DeepseekV41 => "<｜begin▁of▁sentence｜>",
         ModelFamily::Hy4 => "<｜hy_start:opensource｜>",
         ModelFamily::KimiK3 => "<|open|>",
-        ModelFamily::Qwen38 | ModelFamily::Qwen36 => "<|im_start|>",
+        ModelFamily::Qwen38FlashNext | ModelFamily::Qwen38 | ModelFamily::Qwen36 => "<|im_start|>",
     };
     if prompt.starts_with(required_prefix) {
         Ok(())
@@ -890,6 +909,150 @@ fn validate_native_raw_prompt(family: ModelFamily, prompt: &str) -> Result<(), B
         )
         .into())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_generate_qwen38_flash_next<W: Write>(
+    model_dir: &Path,
+    config: Qwen38FlashNextConfig,
+    prompt: chat::Input,
+    requested_ram: u64,
+    max_new_tokens: usize,
+    raw_prompt: bool,
+    no_thinking: bool,
+    available_ram_override: Option<u64>,
+    output: &mut W,
+    progress: &mut progress::Progress,
+    cache: &mut session::Cache,
+) -> Result<(), Box<dyn Error>> {
+    let prompt_profile = span(ProfileStage::TokenizerPrompt);
+    let tokenizer = ByteBpeTokenizer::load(model_dir)?;
+    let encoded = prompt.encode_bytes_cached(
+        &tokenizer,
+        ModelFamily::Qwen38FlashNext,
+        raw_prompt,
+        !no_thinking,
+        config.max_position_embeddings,
+        max_new_tokens,
+    )?;
+    let prompt_tokens = &encoded.tokens;
+    progress.prompt(prompt_tokens.len());
+    drop(prompt_profile);
+    if prompt_tokens.is_empty() {
+        return Err("rendered prompt encoded to zero tokens".into());
+    }
+    if let Some(&token) = prompt_tokens
+        .iter()
+        .find(|&&token| token as usize >= config.vocab_size)
+    {
+        return Err(format!(
+            "tokenizer produced ID {token} outside model vocabulary {}",
+            config.vocab_size
+        )
+        .into());
+    }
+    let generation_config =
+        urbilateria::models::qwen3_8_flash_next::Qwen38FlashNextGenerationConfig::load(model_dir)?;
+    let eos = generation_config.eos_token_id;
+    for &token in &eos {
+        if !tokenizer.is_decodable_token_id(token) {
+            return Err(format!(
+                "Qwen3.8-Flash-Next EOS token ID {token} has no tokenizer entry; refusing undecodable stop semantics"
+            )
+            .into());
+        }
+    }
+    let decodable_mask = tokenizer.decodable_token_mask(config.vocab_size);
+    let suppressed_rows = decodable_mask.iter().filter(|allowed| !**allowed).count();
+    let mut generation = GenerationConfig::greedy(max_new_tokens, eos.clone());
+    generation.allowed_token_mask = Some(decodable_mask);
+    generation.validate()?;
+    let required_context = prompt_tokens
+        .len()
+        .checked_add(max_new_tokens)
+        .ok_or("prompt + generation length overflows usize")?;
+    if required_context > config.max_position_embeddings {
+        return Err(format!(
+            "prompt ({}) + max new tokens ({max_new_tokens}) = {required_context}, exceeding Qwen3.8-Flash-Next limit {}",
+            prompt_tokens.len(),
+            config.max_position_embeddings
+        )
+        .into());
+    }
+
+    if let Some(live) = cache.take::<Qwen38FlashNextRuntimeModel>(required_context) {
+        return session::generate(
+            cache,
+            live,
+            encoded,
+            &generation,
+            tokenizer.streaming_decoder(false),
+            output,
+            progress,
+        );
+    }
+    let effective_ram = available_ram_override
+        .or_else(detect_available_ram)
+        .map(|available| available.min(requested_ram))
+        .unwrap_or(requested_ram);
+    let preflight_profile = span(ProfileStage::CheckpointPreflight);
+    // Establish causal-state capacity first, then spend remaining RAM on weight residency.
+    let (required_context, requirements) = session::plan(
+        cache.enabled,
+        required_context,
+        config.max_position_embeddings,
+        |capacity| {
+            let requirements =
+                Qwen38FlashNextRuntimeModel::inspect_requirements(model_dir, capacity, 0)?;
+            let total = requirements.peak_resident_bytes
+                + requirements.state_bytes()
+                + if cache.enabled {
+                    requirements.checkpoint_bytes()
+                } else {
+                    0
+                };
+            Ok((requirements, total <= effective_ram))
+        },
+    )?;
+    let load_options = requirements.plan_load_options(effective_ram, cache.enabled)?;
+    let (cached_layers, cached_head) = requirements.backbone_residency(
+        load_options.resident_budget_bytes - load_options.expert_cache_budget_bytes,
+    );
+    drop(preflight_profile);
+    eprintln!(
+        "preflight: Qwen3.8-Flash-Next prompt={} tokens, context={}, RAM={}, streamed-layer peak={}, recurrent+conv state={}, full-GQA KV={}, cached layers={}/{}, resident LM head={}, expert cache slots/layer={}, expert cache budget={}, transient expert={}, suppressed LM-head rows={}, CPU workers={}",
+        prompt_tokens.len(),
+        required_context,
+        human_bytes(effective_ram),
+        human_bytes(requirements.streamed_layer_bytes),
+        human_bytes(
+            requirements
+                .recurrent_state_bytes
+                .saturating_add(requirements.convolution_state_bytes)
+        ),
+        human_bytes(requirements.kv_cache_bytes),
+        cached_layers,
+        config.num_hidden_layers,
+        cached_head,
+        load_options.expert_slots_per_layer,
+        human_bytes(load_options.expert_cache_budget_bytes),
+        human_bytes(requirements.expert_bytes),
+        suppressed_rows,
+        worker_threads()
+    );
+    let model = {
+        let _profile = span(ProfileStage::ModelLoad);
+        Qwen38FlashNextRuntimeModel::load(model_dir, load_options)?
+    };
+    session::generate(
+        cache,
+        session::Live::new(model, required_context)?,
+        encoded,
+        &generation,
+        tokenizer.streaming_decoder(false),
+        output,
+        progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2016,6 +2179,33 @@ fn print_preflight(report: &PreflightReport) {
                 requirements.checkpoint_shard_count
             );
         }
+        PreflightReport::Qwen38FlashNext(r) => {
+            print_qwen38_flash_next_manifest(&r.schema);
+            println!("  context capacity    {} tokens", r.context_limit);
+            println!(
+                "  resident peak       {} (streamed baseline + expert cache)",
+                human_bytes(r.peak_resident_bytes)
+            );
+            println!(
+                "  streamed layer      {}",
+                human_bytes(r.streamed_layer_bytes)
+            );
+            println!(
+                "  recurrent + conv    {}",
+                human_bytes(r.recurrent_state_bytes + r.convolution_state_bytes)
+            );
+            println!("  GQA KV reserve      {}", human_bytes(r.kv_cache_bytes));
+            println!(
+                "  QSA index reserve   {}",
+                human_bytes(r.indexer_cache_bytes)
+            );
+            println!("  PLE history         {}", human_bytes(r.ple_state_bytes));
+            println!(
+                "  expert cache        {} ({} slots/layer)",
+                human_bytes(r.expert_cache_bytes),
+                r.expert_slots_per_layer
+            );
+        }
         PreflightReport::Qwen36(requirements) => {
             println!("Qwen3.6 complete text-runtime preflight");
             println!(
@@ -2424,6 +2614,23 @@ fn print_probe(report: &ProbeReport) {
         }
     }
     println!("  note                {}", report.sampling_note);
+}
+
+fn print_qwen38_flash_next_manifest(
+    r: &urbilateria::models::qwen3_8_flash_next::schema::Qwen38FlashNextManifestReport,
+) {
+    println!("Qwen3.8-Flash-Next native BF16 text adapter");
+    println!(
+        "  checkpoint          {} tensors across {} shards ({})",
+        r.checkpoint_tensor_count,
+        r.checkpoint_shard_count,
+        human_bytes(r.checkpoint_payload_bytes)
+    );
+    println!("  parameters          {}", r.logical_parameter_count);
+    println!("  decoder             36 sigmoid DeltaNet + 12 QSA gated GQA; 4 HC streams");
+    println!("  experts             top-10/512 plus one shared expert per layer");
+    println!("  PLE                 layer 2; EOS-aware 2/3-gram; 128 tables read by row");
+    println!("  scope               text generation; vision/MTP headers validated");
 }
 
 fn print_qwen36_manifest(report: &qwen36_schema::Qwen36ManifestReport) {
