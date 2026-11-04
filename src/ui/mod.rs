@@ -6,6 +6,8 @@ mod commands;
 mod generate;
 mod motion;
 mod report;
+mod resources;
+mod runtime;
 mod terminal;
 mod view;
 mod worker;

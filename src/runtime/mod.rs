@@ -4,6 +4,7 @@
 
 pub(crate) mod cache;
 pub mod session;
+pub mod telemetry;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLoadOptions {

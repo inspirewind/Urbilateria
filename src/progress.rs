@@ -131,6 +131,7 @@ pub struct Progress {
     timing: Timing,
     mode: Mode,
     last_emit: Instant,
+    _runtime_events: Option<urbilateria::runtime::telemetry::Subscription>,
 }
 
 impl Progress {
@@ -139,6 +140,18 @@ impl Progress {
             timing: Timing::new(started),
             mode,
             last_emit: started,
+            _runtime_events: (mode == Mode::Json).then(|| {
+                urbilateria::runtime::telemetry::subscribe(|event| {
+                    let mut stderr = io::stderr().lock();
+                    let _ = (|| -> io::Result<()> {
+                        stderr
+                            .write_all(urbilateria::runtime::telemetry::JSON_PREFIX.as_bytes())?;
+                        serde_json::to_writer(&mut stderr, &event)?;
+                        stderr.write_all(b"\n")?;
+                        stderr.flush()
+                    })();
+                })
+            }),
         };
         progress.emit(Status::Running, true);
         progress

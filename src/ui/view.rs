@@ -415,21 +415,78 @@ fn draw_runtime(frame: &mut Frame, app: &mut App, area: Rect, expanded: bool) {
         frame.render_widget(Paragraph::new("No generation yet."), inner);
         return;
     };
-    let summary = Paragraph::new(vec![
+    let live = app
+        .pending
+        .as_ref()
+        .is_some_and(|pending| matches!(pending.task, Task::Generate(_)));
+    let cpu = runtime
+        .resources
+        .cpu_percent
+        .map(|percent| format!("{percent:.0}% ({:.1} cores)", percent / 100.0))
+        .unwrap_or_else(|| "—".into());
+    let read = runtime
+        .resources
+        .read_bytes_per_second
+        .map(|bytes| format!("{}/s", crate::human_bytes(bytes.round() as u64)))
+        .unwrap_or_else(|| "—".into());
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label}  "), Style::new().fg(MUTED)),
+            Span::raw(value),
+        ])
+    };
+    let mut summary_lines = vec![
         Line::from(Span::styled(runtime.status, Style::new().fg(ACCENT).bold())),
-        Line::from(Span::styled(&runtime.path, Style::new().fg(MUTED))),
-    ])
-    .wrap(Wrap { trim: false });
+        field(if live { "CPU" } else { "CPU (last)" }, cpu),
+        field(
+            if live {
+                "Disk read"
+            } else {
+                "Disk read (last)"
+            },
+            read,
+        ),
+    ];
+    if inner.height >= 7 {
+        summary_lines.push(Line::from(Span::styled(
+            &runtime.path,
+            Style::new().fg(MUTED),
+        )));
+    }
+    let summary = Paragraph::new(summary_lines).wrap(Wrap { trim: false });
+    // Keep resource readings visible even when the sidebar or expanded terminal is short.
+    if inner.height <= 4 {
+        frame.render_widget(summary, inner);
+        if expanded {
+            app.runtime_max_scroll = 0;
+            app.runtime_page_size = 1;
+            app.runtime_scroll = None;
+        }
+        return;
+    }
     let summary_height = summary
         .line_count(inner.width)
-        .min(4)
+        .min(5)
         .min(inner.height.saturating_sub(2).into()) as u16;
     let [header, log] = Layout::vertical([Constraint::Length(summary_height), Constraint::Min(1)])
         .spacing(1)
         .areas(inner);
     frame.render_widget(summary, header);
-    let text = runtime.text();
-    let logs = Paragraph::new(text).wrap(Wrap { trim: false });
+    let structured = runtime.details.available();
+    let mut lines = runtime.details.lines(expanded, live, log.width);
+    if expanded || !structured {
+        if structured {
+            lines.push(Line::default());
+            lines.push(Line::styled("Diagnostics", Style::new().fg(ACCENT)));
+        }
+        lines.extend(
+            runtime
+                .text()
+                .lines()
+                .map(|line| Line::raw(line.to_owned())),
+        );
+    }
+    let logs = Paragraph::new(lines).wrap(Wrap { trim: false });
     let max_scroll = logs.line_count(log.width).saturating_sub(log.height.into());
     let scroll = if expanded {
         app.runtime_max_scroll = max_scroll;
@@ -438,6 +495,8 @@ fn draw_runtime(frame: &mut Frame, app: &mut App, area: Rect, expanded: bool) {
             *row = (*row).min(max_scroll);
         }
         app.runtime_scroll.unwrap_or(max_scroll)
+    } else if structured {
+        0
     } else {
         max_scroll
     };
@@ -492,6 +551,13 @@ mod tests {
                 ..Default::default()
             }),
         );
+        app.generation_event(
+            request.id,
+            Event::Resources(super::super::resources::Usage {
+                cpu_percent: Some(1420.0),
+                read_bytes_per_second: Some(67_108_864.0),
+            }),
+        );
         let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let left: String = (2..30)
@@ -507,6 +573,9 @@ mod tests {
         assert!(display(&terminal).contains("total 9 tok"));
         assert!(display(&terminal).contains("1.0 tok/s"));
         assert!(display(&terminal).contains("TTFT 2.00s"));
+        assert!(display(&terminal).contains("1420% (14.2 cores)"));
+        assert!(display(&terminal).contains("64.00 MiB/s"));
+        assert!(!left.contains("Disk read"));
         for (width, height) in [(60, 18), (36, 10)] {
             terminal.backend_mut().resize(width, height);
             terminal.resize(Rect::new(0, 0, width, height)).unwrap();
@@ -533,13 +602,73 @@ mod tests {
         app.runtime_open = true;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(display(&terminal).contains("runtime diagnostic"));
+        assert!(display(&terminal).contains("1420% (14.2 cores)"));
+        assert!(display(&terminal).contains("64.00 MiB/s"));
         app.generation_event(request.id, Event::Finished(Outcome::Complete));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(display(&terminal).contains("CPU (last)"));
+        assert!(display(&terminal).contains("Disk read (last)"));
+        assert!(display(&terminal).contains("1420% (14.2 cores)"));
         assert!(app.runtime.as_ref().unwrap().metrics.ttft_seconds.is_some());
         assert!(!app
             .entries
             .iter()
             .flat_map(|entry| &entry.details)
             .any(|detail| detail.label == Some("Runtime")));
+    }
+
+    #[test]
+    fn structured_runtime_replaces_sidebar_logs_and_expands_to_scrollable_layer_details() {
+        use super::super::generate::{Event, Stream};
+        use urbilateria::runtime::telemetry::{Event as RuntimeEvent, Weights};
+        let mut app = App::new(Some("/model".into()));
+        app.paste("/generate hello --ram-gib 2 --allow-large-model");
+        let request = app.submit().unwrap();
+        app.generation_event(
+            request.id,
+            Event::Output(Stream::Log, "original preflight diagnostic".into()),
+        );
+        app.generation_event(
+            request.id,
+            Event::Runtime(RuntimeEvent::Weights(Weights {
+                total_layers: 48,
+                loaded_layers: 48,
+                planned_layers: 48,
+                resident_bytes: 1_048_576,
+                lm_head_loaded: true,
+                lm_head_planned: true,
+                loading: false,
+                expert_budget_bytes: 1_048_576,
+                experts_per_layer: 512,
+                row_streamed_embeddings: true,
+            })),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(display(&terminal).contains("48/48 layers"));
+        assert!(display(&terminal).contains("L32-47"));
+        assert!(!display(&terminal).contains("original preflight diagnostic"));
+        app.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(display(&terminal).contains("L00  cached · experts —"));
+        assert!(app.runtime_max_scroll > 0);
+        app.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(display(&terminal).contains("original preflight diagnostic"));
+        assert!(display(&terminal).contains("L47  cached · experts —"));
+        for (width, height) in [(60, 18), (36, 10)] {
+            terminal.backend_mut().resize(width, height);
+            terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(display(&terminal).contains("Disk read"));
+            assert!(display(&terminal).contains("original preflight diagnostic"));
+        }
     }
 
     #[test]

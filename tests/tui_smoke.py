@@ -401,6 +401,13 @@ def conversation(binary, root):
         assert "preflight:" not in cli.stderr, cli.stderr  # rejected before loading weights
 
     terminal = Terminal([binary, "ui"])
+    def check_runtime_history(history):
+        terminal.send(b"\x1bOQ")
+        terminal.expect(f"History  {history} turns")
+        terminal.send(b"\x1b[1;5F")  # Ctrl+End: the original diagnostics remain available.
+        terminal.expect(f"history={history} turns")
+        terminal.send(b"\x1bOQ")
+        terminal.expect("Message the model")
     try:
         terminal.resize(110, 64)
         terminal.expect("Welcome to Urbilateria")
@@ -417,7 +424,7 @@ def conversation(binary, root):
         terminal.send(b'\x1b[200~don\'t close "the quote\n--profile\x1b[201~\r')
         terminal.expect("Generation complete")
         terminal.expect("Text  中文🙂")
-        terminal.expect("history=0 turns")
+        check_runtime_history(0)
         terminal.expect("1 turns")
         resident_children = None
         if sys.platform == "linux":
@@ -428,7 +435,7 @@ def conversation(binary, root):
         terminal.output.clear()
         terminal.send("继续刚才的回答\r".encode())
         terminal.expect("Generation complete")
-        terminal.expect("history=1 turns")
+        check_runtime_history(1)
         terminal.expect("2 turns")
         assert re.search(rb"reused=[1-9]\d*", ANSI.sub(b"", terminal.output)), terminal.output[-3000:]
         if resident_children is not None:
@@ -444,7 +451,7 @@ def conversation(binary, root):
         terminal.expect("/inspect for details")
         terminal.send(b"New topic\r")
         terminal.expect("Generation complete")
-        terminal.expect("history=0 turns")
+        check_runtime_history(0)
         terminal.send(b"/quit\r")
         terminal.finish()
     finally:
@@ -464,12 +471,18 @@ def generation(binary, root):
     assert "metrics: input=13" in cli.stderr and "output=11" in cli.stderr, cli.stderr
     assert "total=24 tok" in cli.stderr and "TTFT " in cli.stderr, cli.stderr
     assert "URB_PROGRESS " not in cli.stderr, cli.stderr
+    assert "URB_RUNTIME " not in cli.stderr, cli.stderr
     metrics = subprocess.run([
         binary, "generate", str(model), "--prompt", "[gMASK]<sop>A",
         *options.split(), "--threads", "1", "--progress-json",
     ], capture_output=True, text=True, timeout=30)
     assert metrics.returncode == 0, metrics.stderr
     assert metrics.stdout == cli.stdout
+    runtime = [json.loads(line.removeprefix("URB_RUNTIME "))
+               for line in metrics.stderr.splitlines() if line.startswith("URB_RUNTIME ")]
+    assert any(record["kind"] == "kv" and record["prefill"] == 13 for record in runtime), runtime
+    assert any(record["kind"] == "experts" and "resident_bytes" in record["totals"] for record in runtime), runtime
+    assert runtime[-1] == {"kind": "stop", "reason": "EOS 67"}, runtime
     snapshots = [json.loads(line.removeprefix("URB_PROGRESS "))
                  for line in metrics.stderr.splitlines() if line.startswith("URB_PROGRESS ")]
     assert len(snapshots) >= 4, metrics.stderr
@@ -479,6 +492,9 @@ def generation(binary, root):
     final = snapshots[-1]
     assert final["status"] == "complete" and final["generated_tokens"] == 11, final
     assert final["total_tokens"] == 24 and final["prompt_tokens"] == 13, final
+    cached = [record for record in runtime if record["kind"] == "kv_state"]
+    assert cached[-1]["position"] == 23, cached  # Final selected token has not been forwarded.
+    assert all(record["position"] <= record["capacity"] for record in cached), cached
     assert 0 <= final["ttft_seconds"] <= final["elapsed_seconds"], final
     assert final["decode_tokens_per_second"] > 0, final
     # Immediate EOS counts as one selected token but has no post-first-token decode rate.
@@ -491,6 +507,9 @@ def generation(binary, root):
                            for line in reversed(eos.stderr.splitlines()) if line.startswith("URB_PROGRESS ")))
     assert final["generated_tokens"] == 1 and final["decode_tokens_per_second"] is None, final
     assert final["ttft_seconds"] is not None, final
+    eos_cache = [json.loads(line.removeprefix("URB_RUNTIME "))
+                 for line in eos.stderr.splitlines() if line.startswith("URB_RUNTIME ")]
+    assert [record for record in eos_cache if record["kind"] == "kv_state"][-1]["position"] == final["prompt_tokens"]
     live = subprocess.run([
         binary, "generate", str(model), "--prompt", "[gMASK]<sop>A",
         *options.split(), "--threads", "1", "--progress",
@@ -514,7 +533,8 @@ def generation(binary, root):
         run('/generate hi --ram-gib 2', 'requires --allow-large-model')
         run('/generate hi --allow-large-model', 'requires an explicit --ram-gib')
         run(f'/gen\t"[gMASK]<sop>A" --model "{model}" {options} --threads 1',
-            "Generation complete", "Text  中文🙂", "preflight:", "new_tokens=11", "stop=eos:67",
+            "Generation complete", "Text  中文🙂", "Expert cache", "KV cache (last)",
+            "Cached  23 / 29 tok", "Stop  EOS 67",
             "out 11", "total 24 tok", "tok/s", "TTFT", "F2 expand")
         terminal.send(b"\x1bOQ")  # F2 opens a full runtime view with independent scrolling.
         terminal.expect("F2/Esc close")
@@ -573,6 +593,12 @@ def generation_cancel_and_exit(binary, root):
                         raise
                     terminal.read()
             assert writer is not None, "generation child never opened the FIFO"
+            if mode == "escape":
+                # A child blocked before its first token must still produce live samples.
+                terminal.expect("CPU")
+                terminal.expect("Disk read")
+                terminal.expect("0% (0.0 cores)")
+                terminal.expect("0 B/s")
             terminal.send(b"/clear\r/help\r")
             terminal.send(b"\x1b[1;5H")  # help wraps beside Runtime; scroll to its heading
             terminal.expect("Commands & keys")
@@ -581,6 +607,8 @@ def generation_cancel_and_exit(binary, root):
             if mode == "escape":
                 terminal.send(b"\x1b")
                 terminal.expect("Generation cancelled")
+                terminal.expect("CPU (last)")
+                terminal.expect("Disk read (last)")
                 terminal.assert_running()
                 terminal.send(b"/quit\r")
             elif mode == "quit":
@@ -647,6 +675,7 @@ def interactive(binary, model):
         terminal.assert_running()  # newline inside bracketed paste did not execute /quit
         terminal.send(b"\x15\x08\x15")  # remove trailing empty line and command
         terminal.send(b"/he\t\r")
+        terminal.send(b"\x1b[1;5H")  # Ctrl+Home: help may exceed the visible height.
         terminal.expect("Commands & keys")
         terminal.send(b"/inspect\r")
         terminal.expect("Inspection complete")
@@ -706,6 +735,7 @@ def busy_exit(binary, root):
             terminal.send(command)
             terminal.expect(status)
             terminal.send(b"/help\r")
+            terminal.send(b"\x1b[1;5H")  # Scroll to the heading independently of help length.
             terminal.expect("Commands & keys")  # input is responsive during a blocked filesystem read
             terminal.send(b"/version\r")
             terminal.expect("Version")

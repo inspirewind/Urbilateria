@@ -11,6 +11,10 @@ use urbilateria::generation::{
 use urbilateria::models::kimi_k3::tokenizer::KimiK3StreamingDecoder;
 use urbilateria::profiling::{span, ProfileStage};
 use urbilateria::runtime::session::SessionState;
+use urbilateria::runtime::{
+    session::observe_experts,
+    telemetry::{self, Event as RuntimeEvent},
+};
 use urbilateria::tokenizer::{StreamingDecoder, TokenizerError};
 
 #[derive(Default)]
@@ -107,8 +111,17 @@ where
         };
         self.checkpoint = None;
         self.tokens.truncate(reused);
+        telemetry::emit(true, || RuntimeEvent::Kv {
+            reused,
+            prefill: prompt.tokens.len() - reused,
+            capacity: self.capacity,
+        });
         if retain && boundary > reused {
-            self.model.prefill(
+            Observed {
+                model: &self.model,
+                capacity: self.capacity,
+            }
+            .prefill(
                 &prompt.tokens[reused..boundary],
                 self.state.as_mut().unwrap(),
             )?;
@@ -162,9 +175,16 @@ where
     D: TextDecoder,
     W: Write,
 {
+    if let Some(weights) = live.state.as_ref().unwrap().weight_residency() {
+        telemetry::emit(true, || RuntimeEvent::Weights(weights));
+    }
+    observe_experts(live.state.as_ref().unwrap(), true);
     let suffix = live.prepare(&prompt, cache.enabled)?;
     let generated = match try_generate_with_state(
-        &live.model,
+        &Observed {
+            model: &live.model,
+            capacity: live.capacity,
+        },
         &prompt.tokens[suffix..],
         config,
         live.state.as_mut().unwrap(),
@@ -189,6 +209,14 @@ where
     output.write_all(b"\n")?;
     output.flush()?;
     let telemetry = live.state.as_ref().unwrap().expert_telemetry();
+    telemetry::sequence(live.state.as_ref().unwrap().position(), live.capacity, true);
+    observe_experts(live.state.as_ref().unwrap(), true);
+    telemetry::emit(true, || RuntimeEvent::Stop {
+        reason: match generated.stop_reason {
+            StopReason::Eos(token) => format!("EOS {token}"),
+            StopReason::MaxNewTokens => "Token limit".into(),
+        },
+    });
     eprintln!("done: new_tokens={}, stop={}, expert hits={}, misses={}, evictions={}, expert_payload_bytes_read={}",
         generated.generated_tokens.len(), match generated.stop_reason {
             StopReason::Eos(token) => format!("eos:{token}"), StopReason::MaxNewTokens => "max_new_tokens".to_owned(),
@@ -203,6 +231,38 @@ where
         cache.saved = Some(Box::new(live));
     }
     Ok(())
+}
+
+/// Observe state between forward calls without changing sampling, callbacks or model numerics.
+struct Observed<'a, M> {
+    model: &'a M,
+    capacity: usize,
+}
+impl<M: CausalDecoder> CausalDecoder for Observed<'_, M>
+where
+    M::State: SessionState,
+{
+    type State = M::State;
+    type Error = M::Error;
+    fn new_state(&self) -> Result<Self::State, Self::Error> {
+        self.model.new_state()
+    }
+    fn forward_token(&self, token: u32, state: &mut Self::State) -> Result<Vec<f32>, Self::Error> {
+        let result = self.model.forward_token(token, state);
+        if result.is_ok() {
+            telemetry::sequence(state.position(), self.capacity, false);
+        }
+        observe_experts(state, false);
+        result
+    }
+    fn prefill(&self, prompt: &[u32], state: &mut Self::State) -> Result<Vec<f32>, Self::Error> {
+        let result = self.model.prefill(prompt, state);
+        if result.is_ok() {
+            telemetry::sequence(state.position(), self.capacity, true);
+        }
+        observe_experts(state, true);
+        result
+    }
 }
 
 /// Reserve growing context up front, shrinking to the exact request if RAM is tight.
@@ -373,6 +433,53 @@ mod tests {
         assert_eq!(result, cold(&prompt, 2));
         assert_eq!(&trace.borrow().forwarded[..3], &[selected[2], 8, 9]);
         assert_eq!(trace.borrow().initialized, 1);
+    }
+
+    #[test]
+    fn kv_snapshots_count_forwarded_positions_across_reuse_and_reset() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let _subscription = telemetry::subscribe(move |event| received.borrow_mut().push(event));
+        let mut cache = Cache::resident();
+        turn(
+            &mut cache,
+            Live::new(Decoder(Rc::default()), 64).unwrap(),
+            &[1, 2, 3],
+            2,
+            3,
+        );
+        let check = |reused, prefill, cached| {
+            let events = events.borrow();
+            assert!(events.contains(&RuntimeEvent::Kv {
+                reused,
+                prefill,
+                capacity: 64
+            }));
+            let positions: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::KvState {
+                        position,
+                        capacity: 64,
+                    } => Some(*position),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(positions.last(), Some(&cached));
+            assert!(positions.windows(2).all(|p| p[0] <= p[1]));
+            assert!(events.iter().all(RuntimeEvent::is_valid));
+        };
+        check(0, 3, 5); // Three selected tokens, but the last one has not been forwarded.
+        let live = cache.take::<Decoder>(64).unwrap();
+        let mut prompt = live.tokens.clone();
+        prompt.extend([8, 9]);
+        events.borrow_mut().clear();
+        turn(&mut cache, live, &prompt, 6, 2);
+        check(5, 2, 8);
+        let live = cache.take::<Decoder>(64).unwrap();
+        events.borrow_mut().clear();
+        turn(&mut cache, live, &[7, 6], 1, 1);
+        check(0, 2, 2);
     }
 
     #[test]

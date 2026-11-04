@@ -357,6 +357,7 @@ without `--threads`, the pool uses one worker per available physical core. Profi
 stderr and profile JSON to the requested file, never to streamed stdout.\n\n\
 Generation metrics go to stderr: final summary by default; --progress for live text,\n\
 --progress-json for URB_PROGRESS-prefixed JSON records. Counts include EOS; total = input + output.\n\
+JSON mode also emits URB_RUNTIME records for context, weight residency and expert-cache snapshots.\n\
 TTFT includes loading/prefill; tok/s measures tokens after the first. Both are independent of --profile.\n\n\
 The public `generate` path currently drives GLM, DeepSeek-V4, Kimi-K3, Qwen3.6/3.8, and Hy4 (Hy4 is
 exact through 2,048 total tokens, where DSA top-k selects the complete causal history). Qwen3.8

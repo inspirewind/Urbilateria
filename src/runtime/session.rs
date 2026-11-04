@@ -13,4 +13,17 @@ pub trait SessionState {
     fn checkpoint(&self) -> Self::Checkpoint;
     fn restore(&mut self, checkpoint: Self::Checkpoint) -> Result<(), Box<dyn Error>>;
     fn expert_telemetry(&self) -> &ExpertTelemetry;
+    fn expert_layers(&self) -> Vec<super::telemetry::LayerCache> {
+        Vec::new()
+    }
+    fn weight_residency(&self) -> Option<super::telemetry::Weights> {
+        None
+    }
+}
+
+pub fn observe_experts(state: &impl SessionState, force: bool) {
+    super::telemetry::emit(force, || super::telemetry::Event::Experts {
+        totals: state.expert_telemetry().clone(),
+        layers: state.expert_layers(),
+    });
 }

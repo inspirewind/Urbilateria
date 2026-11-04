@@ -930,6 +930,7 @@ name = "urbilateria"
 version = "0.2.4"
 dependencies = [
  "crossterm",
+ "libc",
  "ratatui",
  "ratatui-textarea",
  "rayon",

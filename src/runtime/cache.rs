@@ -1,8 +1,8 @@
 //! Model-agnostic deterministic per-layer LRU mechanics.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpertTelemetry {
     pub hits: u64,
     pub misses: u64,
@@ -73,6 +73,21 @@ pub(crate) struct LayerLruCache<T> {
 }
 
 impl<T> LayerLruCache<T> {
+    pub(crate) fn residency(&self) -> Vec<super::telemetry::LayerCache> {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(layer, entries)| super::telemetry::LayerCache {
+                layer,
+                experts: entries.len(),
+                capacity: self.layer_capacities[layer],
+                bytes: entries
+                    .iter()
+                    .fold(0u64, |sum, entry| sum.saturating_add(entry.bytes)),
+            })
+            .collect()
+    }
+
     pub(crate) fn new(layers: usize, slots_per_layer: usize) -> Self {
         Self::with_layer_capacities(vec![slots_per_layer; layers])
     }
@@ -1029,6 +1044,33 @@ mod tests {
             .unwrap();
         assert!(cache.layer_is_empty(0));
         assert!(!cache.layer_is_empty(1));
+        let before = telemetry.clone();
+        assert_eq!(
+            cache.residency(),
+            vec![
+                super::super::telemetry::LayerCache {
+                    layer: 0,
+                    experts: 0,
+                    capacity: 1,
+                    bytes: 0
+                },
+                super::super::telemetry::LayerCache {
+                    layer: 1,
+                    experts: 1,
+                    capacity: 1,
+                    bytes: 4
+                },
+            ]
+        );
+        assert_eq!(telemetry, before);
+        cache
+            .access(&mut telemetry, 1, 8, || Ok::<_, ()>((80, 9, 8)), |_| Ok(()))
+            .unwrap();
+        assert_eq!(cache.residency()[1].bytes, 9);
+        assert_eq!(cache.residency()[1].experts, 1);
+        cache.drain_layer(&mut telemetry, 1);
+        assert_eq!(cache.residency()[1].bytes, 0);
+        assert_eq!(cache.residency()[1].capacity, 1);
     }
 
     #[test]

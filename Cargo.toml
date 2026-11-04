@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [features]
 default = ["ui"]
-ui = ["dep:crossterm", "dep:ratatui", "dep:ratatui-textarea", "dep:shlex", "dep:signal-hook"]
+ui = ["dep:crossterm", "dep:ratatui", "dep:ratatui-textarea", "dep:shlex", "dep:signal-hook", "dep:libc"]
 
 [dependencies]
 # Keep simultaneous resize/input readiness observable after either event is read.
@@ -34,6 +34,7 @@ unicode-general-category = "1.1"
 unicode-normalization = "0.1"
 
 [target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 signal-hook = { version = "0.3", optional = true }
 
 [profile.release]

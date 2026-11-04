@@ -191,6 +191,14 @@ impl Input {
         for dropped in 0..=chat.turns.len() {
             let tokens = encode(&chat.turns[dropped..], &chat.prompt)?;
             if tokens.len() <= budget {
+                urbilateria::runtime::telemetry::emit(true, || {
+                    urbilateria::runtime::telemetry::Event::Context {
+                        history: chat.turns.len() - dropped,
+                        dropped,
+                        prompt: tokens.len(),
+                        limit: context,
+                    }
+                });
                 eprintln!("chat: history={} turns, dropped={} turns, prompt={} tokens, context limit={context}",
                     chat.turns.len() - dropped, dropped, tokens.len());
                 return Ok(tokens);

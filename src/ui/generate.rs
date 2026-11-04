@@ -2,6 +2,7 @@
 //! Only pipe readers use threads; the UI owns, cancels, and reaps the child process.
 
 use super::commands::GenerateOptions;
+use super::resources::{Monitor, Usage};
 use crate::progress::{Snapshot, JSON_PREFIX};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ pub enum Outcome {
 pub enum Event {
     Output(Stream, String),
     Progress(Snapshot),
+    Resources(Usage),
+    Runtime(urbilateria::runtime::telemetry::Event),
     Finished(Outcome),
 }
 
@@ -50,6 +53,7 @@ pub struct Generation {
     text_end: Option<Outcome>,
     log_end: bool,
     cancelled: bool,
+    resources: Monitor,
 }
 
 impl Generation {
@@ -98,6 +102,7 @@ impl Generation {
         let (send, output) = mpsc::sync_channel(32);
         let mut generation = Self {
             id,
+            resources: Monitor::new(child.id()),
             child,
             output,
             cancelled: false,
@@ -175,6 +180,7 @@ impl Generation {
             .try_send(bytes)
             .map_err(|error| io::Error::other(error.to_string()))?;
         self.id = id;
+        self.resources = Monitor::new(self.child.id());
         self.running = true;
         self.text_end = None;
         self.log_end = false;
@@ -207,6 +213,7 @@ impl Generation {
         let stderr = child.stderr.take().unwrap();
         let mut generation = Self {
             id,
+            resources: Monitor::new(child.id()),
             child,
             output,
             cancelled: false,
@@ -253,6 +260,9 @@ impl Generation {
     pub fn poll(&mut self) -> io::Result<Option<Event>> {
         if !self.running {
             return Ok(None);
+        }
+        if !self.cancelled && self.resources.is_due() && self.child.try_wait()?.is_none() {
+            return Ok(Some(Event::Resources(self.resources.sample())));
         }
         match self.output.try_recv() {
             Ok(Ok(Incoming::Event(event))) => Ok(Some(event)),
@@ -399,9 +409,22 @@ impl LogLines {
                         .filter(Snapshot::is_valid)
                 })
                 .flatten();
+            let runtime = (!self.continued)
+                .then(|| {
+                    line.strip_prefix(urbilateria::runtime::telemetry::JSON_PREFIX)
+                        .and_then(|json| {
+                            serde_json::from_str::<urbilateria::runtime::telemetry::Event>(json)
+                                .ok()
+                        })
+                        .filter(urbilateria::runtime::telemetry::Event::is_valid)
+                })
+                .flatten();
             events.push(match snapshot {
                 Some(snapshot) => Event::Progress(snapshot),
-                None => Event::Output(Stream::Log, line.to_owned()),
+                None => match runtime {
+                    Some(runtime) => Event::Runtime(runtime),
+                    None => Event::Output(Stream::Log, line.to_owned()),
+                },
             });
             consumed += line.len();
             self.continued = false;
@@ -530,7 +553,7 @@ mod tests {
             match generation.poll().unwrap() {
                 Some(Event::Output(Stream::Text, chunk)) => text.push_str(&chunk),
                 Some(Event::Output(Stream::Log, chunk)) => log.push_str(&chunk),
-                Some(Event::Progress(_)) => {}
+                Some(Event::Progress(_) | Event::Resources(_) | Event::Runtime(_)) => {}
                 Some(Event::Finished(outcome)) => return (text, log, outcome),
                 None => thread::sleep(Duration::from_millis(5)),
             }
@@ -600,5 +623,68 @@ mod tests {
         generation.cancel().unwrap();
         assert_eq!(collect(&mut generation).2, Outcome::Cancelled);
         assert!(generation.child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn resources_update_without_tokens_and_stop_after_cancellation() {
+        let mut generation = Generation::spawn(1, Command::new("/bin/sleep").arg("60")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no resource sample before first token"
+            );
+            match generation.poll().unwrap() {
+                Some(Event::Resources(usage)) => {
+                    assert!(usage.cpu_percent.is_some());
+                    assert!(usage.read_bytes_per_second.is_some());
+                    break;
+                }
+                None => thread::sleep(Duration::from_millis(5)),
+                _ => panic!("unexpected output from sleeping child"),
+            }
+        }
+        generation.cancel().unwrap();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "child did not finish after cancellation"
+            );
+            match generation.poll().unwrap() {
+                Some(Event::Finished(outcome)) => {
+                    assert_eq!(outcome, Outcome::Cancelled);
+                    break;
+                }
+                None => thread::sleep(Duration::from_millis(5)),
+                _ => panic!("resources must stop updating after cancellation"),
+            }
+        }
+    }
+    #[test]
+    fn structured_runtime_records_survive_split_reads_and_preserve_invalid_diagnostics() {
+        use urbilateria::runtime::telemetry::{Event as RuntimeEvent, JSON_PREFIX};
+        let snapshot = RuntimeEvent::Kv {
+            reused: 10,
+            prefill: 3,
+            capacity: 2048,
+        };
+        let wire = format!(
+            "{JSON_PREFIX}{}\n",
+            serde_json::to_string(&snapshot).unwrap()
+        );
+        let mut lines = LogLines::default();
+        let mut events = Vec::new();
+        for c in wire.chars() {
+            events.extend(lines.push(&c.to_string(), false));
+        }
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Event::Runtime(event) if *event == snapshot));
+        let invalid = format!(
+            "{JSON_PREFIX}{{\"kind\":\"kv\",\"reused\":10,\"prefill\":3,\"capacity\":2}}\n"
+        );
+        assert!(
+            matches!(&lines.push(&invalid, false)[0], Event::Output(Stream::Log, text) if text == &invalid)
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::models::qwen3_8::{
     math::{linear, round_to_bf16 as bf},
     moe::route_softmax_top_k,
 };
+use crate::runtime::telemetry::{self, Event as RuntimeEvent, Weights as WeightResidency};
 use crate::runtime::{
     cache::LayerLruCache, session::SessionState, ExpertTelemetry, RuntimeLoadOptions,
 };
@@ -145,6 +146,7 @@ pub struct Qwen38FlashNextRuntimeModel {
     mixer: HyperConnection,
     head: Option<WeightMatrix>,
     slots: usize,
+    residency: WeightResidency,
 }
 enum Attention {
     Linear(Box<GatedDeltaNet>),
@@ -173,6 +175,7 @@ pub struct Qwen38FlashNextRuntimeState {
     ple: PleState,
     experts: LayerLruCache<Qwen38Expert>,
     telemetry: ExpertTelemetry,
+    residency: WeightResidency,
 }
 pub struct SessionCheckpoint {
     model_id: u64,
@@ -229,6 +232,12 @@ impl SessionState for Qwen38FlashNextRuntimeState {
     }
     fn expert_telemetry(&self) -> &ExpertTelemetry {
         &self.telemetry
+    }
+    fn expert_layers(&self) -> Vec<telemetry::LayerCache> {
+        self.experts.residency()
+    }
+    fn weight_residency(&self) -> Option<WeightResidency> {
+        Some(self.residency.clone())
     }
 }
 
@@ -324,9 +333,25 @@ impl Qwen38FlashNextRuntimeModel {
         let index = Arc::new(TensorIndex::open(directory)?);
         let (count, keep_head) = requirements
             .backbone_residency(options.resident_budget_bytes - requirements.expert_cache_bytes);
+        let mut residency = WeightResidency {
+            total_layers: config.num_hidden_layers,
+            loaded_layers: 0,
+            planned_layers: count,
+            resident_bytes: 0,
+            lm_head_loaded: false,
+            lm_head_planned: keep_head,
+            loading: true,
+            expert_budget_bytes: requirements.expert_cache_bytes,
+            experts_per_layer: config.num_experts,
+            row_streamed_embeddings: true,
+        };
+        telemetry::emit(true, || RuntimeEvent::Weights(residency.clone()));
         let mut w = Weights::load(&index, &format!("{ROOT}hyper_connection_mixer."))?;
         let mixer = HyperConnection::take(&mut w, "", &config, false)?;
         w.finish()?;
+        residency.resident_bytes =
+            resident_bytes(&index, &format!("{ROOT}hyper_connection_mixer."));
+        telemetry::emit(true, || RuntimeEvent::Weights(residency.clone()));
         let head = if keep_head {
             Some(load_compact_bf16_matrix(
                 &index,
@@ -338,9 +363,20 @@ impl Qwen38FlashNextRuntimeModel {
         } else {
             None
         };
-        let layers = (0..count)
-            .map(|l| Layer::load(&index, &config, l))
-            .collect::<Result<Vec<_>>>()?;
+        if head.is_some() {
+            residency.lm_head_loaded = true;
+            residency.resident_bytes += requirements.lm_head_resident_bytes;
+            telemetry::emit(true, || RuntimeEvent::Weights(residency.clone()));
+        }
+        let mut layers = Vec::with_capacity(count);
+        for layer in 0..count {
+            layers.push(Layer::load(&index, &config, layer)?);
+            residency.loaded_layers = layers.len();
+            residency.resident_bytes += requirements.layer_resident_bytes[layer];
+            telemetry::emit(true, || RuntimeEvent::Weights(residency.clone()));
+        }
+        residency.loading = false;
+        telemetry::emit(true, || RuntimeEvent::Weights(residency.clone()));
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             config,
@@ -350,6 +386,7 @@ impl Qwen38FlashNextRuntimeModel {
             mixer,
             head,
             slots: options.expert_slots_per_layer,
+            residency,
         })
     }
     pub fn requirements(&self) -> &Qwen38FlashNextRuntimeRequirements {
@@ -472,6 +509,7 @@ impl Qwen38FlashNextRuntimeModel {
             if let Some(trace) = trace.as_mut() {
                 trace.push(hidden.last().unwrap().clone());
             }
+            crate::runtime::session::observe_experts(state, false);
         }
         let (last, _) = self.mixer.mix(hidden.last().unwrap())?;
         let logits = if let Some(head) = &self.head {
@@ -495,6 +533,7 @@ impl Qwen38FlashNextRuntimeModel {
         };
         state.position += tokens.len();
         state.poisoned = false;
+        telemetry::sequence(state.position, self.requirements.context_limit, false);
         Ok(logits)
     }
 }
@@ -520,6 +559,7 @@ impl CausalDecoder for Qwen38FlashNextRuntimeModel {
             ple: PleState::new(),
             experts: LayerLruCache::new(self.config.num_hidden_layers, self.slots),
             telemetry: ExpertTelemetry::default(),
+            residency: self.residency.clone(),
         })
     }
     fn forward_token(&self, token: u32, state: &mut Self::State) -> Result<Vec<f32>> {

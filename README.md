@@ -206,6 +206,25 @@ settings for later plain messages, but never its profile destinations. Generated
 conversation; runtime diagnostics appear beneath the model card in the right sidebar.
 **F2** expands the runtime log, including on narrow terminals; **PgUp/PgDn** scroll it and
 **F2/Esc** close it. The footer shows generated and total token counts, decode speed and TTFT.
+Runtime also samples the inference process's CPU usage and disk read rate once per second on
+Linux and macOS, including while waiting for the first token. CPU usage is 100% per busy logical
+core and can exceed 100%. Disk reads are storage-layer bytes attributed to the process; page-cache
+hits do not count. Unavailable readings show `—`; after generation, `(last)` marks the last sample.
+Below these readings, structured context and expert-cache summaries replace raw diagnostic paragraphs;
+**F2** opens details from the top, and **Ctrl+End** jumps to the original logs. Qwen3.8-Flash-Next
+also reports successfully loaded backbone layers with zero-based IDs (`■` cached, `□` pending,
+`·` streamed). Cells are separated, grouped by four, and arranged in rows of 8 or 16 to fit the panel.
+It also shows LM-head residency, approximate backbone payload, and per-layer expert-cache counts
+and bytes. Backbone excludes routed experts; embedding/PLE rows remain streamed. Expert occupancy
+is actual cached payload, distinct from its budget, while payload-read totals can include OS cache
+hits. These are model-owned payload statistics, not process RSS. After a run, the panel labels the
+last weight snapshot; it does not claim cancelled or released weights remain in memory. Other
+backends currently provide context and aggregate expert-cache statistics without the layer map.
+The KV cache section separates prompt reuse (tokens and percentage), prefill progress, and current
+cached positions/capacity with a usage bar and free-token count. Cached positions come from completed
+forward passes, so the final sampled token is not counted yet. For hybrid/recurrent models this is
+logical sequence coverage, not a memory byte count. Capacity is the runtime reservation, not the
+model's maximum context; completed runs label the last snapshot.
 Metrics remain visible after completion and reset when the next request starts.
 **Esc** stops generation and keeps partial text; close an expanded runtime view or completion
 menu first. Exiting also stops the generation process and releases its model resources.
@@ -218,6 +237,7 @@ The resident child uses the same `urb` executable; no extra runtime is needed.
 The ordinary `urb generate` CLI prints a final `metrics:` summary to stderr without requiring
 `--profile`. Add `--progress` for periodic human-readable snapshots, or `--progress-json` for
 structured snapshots prefixed with `URB_PROGRESS ` on stderr (the two flags are mutually exclusive).
+JSON mode also emits `URB_RUNTIME ` records for context, weight residency and expert-cache snapshots.
 The TUI reads these same structured metrics. Public `generate` and `chat` commands keep stdout
 as generated text; the TUI's internal session transport frames text and turn completion as JSON.
 Input count includes the rendered prompt and retained history; total is input plus generated

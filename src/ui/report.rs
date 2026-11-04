@@ -191,6 +191,8 @@ pub struct RuntimeInfo {
     pub path: String,
     pub status: &'static str,
     pub metrics: crate::progress::Snapshot,
+    pub resources: super::resources::Usage,
+    pub details: super::runtime::Details,
     log: Tail,
 }
 
@@ -200,6 +202,8 @@ impl RuntimeInfo {
             path: clean_text(&path.display().to_string(), 1024).replace('\n', " "),
             status: "Generating",
             metrics: crate::progress::Snapshot::default(),
+            resources: super::resources::Usage::default(),
+            details: super::runtime::Details::default(),
             log: Tail::default(),
         }
     }
@@ -1063,11 +1067,14 @@ pub fn help_entry() -> Entry {
         Detail::field("Enter", "Complete the selected command when suggestions are open; otherwise send message or run command"),
         Detail::field("Ctrl+J / Alt+Enter", "Insert newline (Shift+Enter also works)"),
         Detail::field("Tab / Esc", "Complete command / dismiss suggestions; Esc with no suggestions stops generation"),
-        Detail::field("F2", "Expand/close Runtime logs (also in narrow terminals). PgUp/PgDn scroll this view; Esc closes it before stopping generation."),
+        Detail::field("F2", "Expand/close Runtime details and logs (also in narrow terminals). PgUp/PgDn scroll; Ctrl+End jumps to logs; Esc closes before stopping generation."),
         Detail::field("Up / Down", "Select a command when suggestions are open; otherwise history at the first/last input line. Ctrl+P / Ctrl+N always browse history"),
         Detail::field("PgUp / PgDn", "Scroll output; Ctrl+Home / Ctrl+End jump to top / follow latest"),
         Detail::field("Ctrl+C", "Quit and stop generation; Ctrl+D also quits when input is empty"),
-        Detail::text("Runtime logs stay in the right panel. The footer shows output/total token counts, decode tok/s and request TTFT (includes loading and prefill). EOS counts as a token; rates need at least two tokens. Metrics remain after completion."),
+        Detail::text("Runtime shows context and expert-cache summaries; F2 keeps the original logs. Qwen3.8-Flash-Next also shows loaded backbone layers and per-layer expert occupancy. Backbone excludes routed experts; payload estimates are not RSS. Finished runs show the last weight snapshot."),
+        Detail::text("KV cache shows prompt reuse, prefill progress, cached positions/capacity and free tokens. F2 explains counts and layer states."),
+        Detail::text("The footer shows output/total token counts, decode tok/s and request TTFT (includes loading and prefill). EOS counts as a token; rates need at least two tokens. Metrics remain after completion."),
+        Detail::text("Runtime CPU and disk read rates sample the inference process every second on Linux/macOS, including before the first token. CPU: 100% per busy logical core. Disk read: storage-layer bytes, excluding page-cache hits. Unavailable readings show —; (last) marks the last sample after generation ends."),
         Detail::text("Model commands run in the background. /generate loads weights after RAM/runtime checks; /probe reads bounded samples. Use the plain CLI for --json or full output; generation supports --progress and --progress-json on stderr."),
     ])
 }

@@ -143,6 +143,14 @@ impl App {
         match key.code {
             KeyCode::F(2) => {
                 self.runtime_open = !self.runtime_open;
+                if self.runtime_open
+                    && self
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.details.available())
+                {
+                    self.runtime_scroll = Some(0);
+                }
                 return None;
             }
             KeyCode::Esc if self.runtime_open => {
@@ -561,6 +569,20 @@ impl App {
             self.pending = Some(pending);
             return;
         }
+        if let GenerationEvent::Resources(usage) = event {
+            if let Some(runtime) = &mut self.runtime {
+                runtime.resources = usage;
+            }
+            self.pending = Some(pending);
+            return;
+        }
+        if let GenerationEvent::Runtime(event) = event {
+            if let Some(runtime) = &mut self.runtime {
+                runtime.details.update(event);
+            }
+            self.pending = Some(pending);
+            return;
+        }
         let mut history_warning = false;
         let (kind, title, error, finished): (Kind, String, Option<String>, bool) = match event {
             GenerationEvent::Output(stream, text) => {
@@ -627,7 +649,11 @@ impl App {
                     true,
                 )
             }
-            GenerationEvent::Progress(_) => unreachable!("progress is handled separately"),
+            GenerationEvent::Progress(_)
+            | GenerationEvent::Resources(_)
+            | GenerationEvent::Runtime(_) => {
+                unreachable!("metrics are handled separately")
+            }
         };
         let entry = output.entry(id, kind, title, error.as_deref());
         if let Some(existing) = self
@@ -741,16 +767,37 @@ mod tests {
         assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 0);
         app.generation_event(request.id, GenerationEvent::Progress(snapshot.clone()));
         assert_eq!(app.runtime.as_ref().unwrap().metrics, snapshot);
+        let usage = super::super::resources::Usage {
+            cpu_percent: Some(250.0),
+            read_bytes_per_second: Some(1_048_576.0),
+        };
+        app.generation_event(request.id + 1, GenerationEvent::Resources(usage));
+        assert_eq!(app.runtime.as_ref().unwrap().resources, Default::default());
+        app.generation_event(request.id, GenerationEvent::Resources(usage));
+        assert_eq!(app.runtime.as_ref().unwrap().resources, usage);
+        let details = urbilateria::runtime::telemetry::Event::Kv {
+            reused: 0,
+            prefill: 6,
+            capacity: 2048,
+        };
+        app.generation_event(request.id + 1, GenerationEvent::Runtime(details.clone()));
+        assert!(!app.runtime.as_ref().unwrap().details.available());
+        app.generation_event(request.id, GenerationEvent::Runtime(details));
+        assert!(app.runtime.as_ref().unwrap().details.available());
         app.key(key(KeyCode::F(2)));
         assert!(app.runtime_open);
+        assert_eq!(app.runtime_scroll, Some(0));
         app.key(key(KeyCode::Esc));
         assert!(!app.runtime_open);
         assert!(!app.cancel_requested);
         finish_reply(&mut app, request.id, "reply\n", Outcome::Cancelled);
         assert_eq!(app.runtime.as_ref().unwrap().status, "Cancelled");
+        assert_eq!(app.runtime.as_ref().unwrap().resources, usage);
         assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 3);
         assert!(app.runtime.as_ref().unwrap().text().contains("diagnostics"));
         let next = message(&mut app, "retry");
+        assert!(!app.runtime.as_ref().unwrap().details.available());
+        assert_eq!(app.runtime.as_ref().unwrap().resources, Default::default());
         assert_eq!(app.runtime.as_ref().unwrap().metrics.generated_tokens, 0);
         assert_eq!(app.runtime.as_ref().unwrap().metrics.ttft_seconds, None);
         assert_eq!(
