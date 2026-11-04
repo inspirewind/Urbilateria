@@ -97,9 +97,11 @@ For an interactive terminal interface on Linux or macOS:
 The UI provides a scrollable transcript, multiline Unicode input, session history,
 slash-command completion, and background model analysis, tokenization and streamed generation.
 Commands are `/inspect`, `/plan`, `/preflight`, `/list`, `/explain`, `/probe`, `/tokenize`, `/decode`, `/generate`, `/settings`,
-plus `/help`, `/version`, `/clear`, and `/quit`. Use **Enter** to run, **Ctrl+J** or
-**Alt+Enter** for a newline, **Tab** to complete, **Up/Down** for history at the input boundaries,
-**PgUp/PgDn** to scroll, and **Ctrl+C** to exit. Pasted text stays in the editor until submitted.
+plus `/help`, `/version`, `/clear`, and `/quit`. When command suggestions are open, use
+**Up/Down** to select and **Enter** or **Tab** to complete; press **Enter** again to run.
+Otherwise, **Enter** submits and **Up/Down** browses history at the input boundaries.
+Use **Ctrl+J** or **Alt+Enter** for a newline, **PgUp/PgDn** to scroll, and **Ctrl+C** to exit.
+Pasted text stays in the editor until submitted.
 Quote paths with spaces. The minimum terminal size is 36 columns by 10 rows.
 After `/inspect`, a model card stays at the upper right while the transcript scrolls or is cleared.
 Narrow terminals retain the model name and family in the header instead.

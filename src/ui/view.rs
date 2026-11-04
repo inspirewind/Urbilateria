@@ -243,6 +243,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .is_some_and(|pending| matches!(pending.task, Task::Generate(_)));
     let hints = if app.runtime_open {
         "F2/Esc close · PgUp/PgDn scroll"
+    } else if !completions.is_empty() && area.width >= 90 {
+        "Enter/Tab complete · Up/Down select · Esc dismiss · Ctrl+C quit"
+    } else if !completions.is_empty() {
+        "Enter/Tab complete · Esc dismiss"
     } else if generating && area.width >= 140 {
         "Esc stop · F2 runtime · Ctrl+C quit"
     } else if generating {

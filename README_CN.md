@@ -92,7 +92,8 @@ cargo build --release --locked
 界面提供可滚动的结果区、多行 Unicode 输入、会话历史、斜杠命令补全，以及带耗时显示的后台
 模型分析、分词和流式生成。支持 `/inspect`、`/plan`、`/preflight`、`/list`、`/explain`、`/probe`、
 `/tokenize`、`/decode`、`/generate`、`/settings`，以及 `/help`、`/version`、`/clear`、`/quit`。
-**Enter** 执行，**Ctrl+J** 或 **Alt+Enter** 换行，**Tab** 补全，输入首行/末行的
+命令候选菜单打开时，**↑/↓** 选择，**Enter** 或 **Tab** 补全，再按 **Enter** 执行。
+其他情况下，**Enter** 提交，**Ctrl+J** 或 **Alt+Enter** 换行，输入首行/末行的
 **↑/↓** 浏览历史，**PgUp/PgDn** 滚动结果，**Ctrl+C** 退出。粘贴只进入编辑框，提交后才执行。
 包含空格的路径需要加引号；终端最小尺寸为 36 列 × 10 行。
 `/inspect` 成功后，模型信息卡片常驻右上角，不随结果区滚动或清空而消失；

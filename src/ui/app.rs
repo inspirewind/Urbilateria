@@ -196,7 +196,6 @@ impl App {
             {
                 self.newline()
             }
-            KeyCode::Enter => return self.submit(),
             KeyCode::Esc => {
                 if completions.is_empty() {
                     if let Some(pending) = &mut self.pending {
@@ -208,7 +207,7 @@ impl App {
                 }
                 self.completion_dismissed = true;
             }
-            KeyCode::Tab if !completions.is_empty() => {
+            KeyCode::Tab | KeyCode::Enter if !completions.is_empty() => {
                 let (name, _) = completions[self.completion_index % completions.len()];
                 self.editor = editor(&format!(
                     "{name}{}",
@@ -216,6 +215,7 @@ impl App {
                 ));
                 self.edited();
             }
+            KeyCode::Enter => return self.submit(),
             KeyCode::Tab => {}
             KeyCode::Up if !completions.is_empty() => {
                 self.completion_index =
@@ -1066,21 +1066,58 @@ mod tests {
 
     #[test]
     fn completion_and_history_restore_the_draft() {
+        for complete in [KeyCode::Tab, KeyCode::Enter] {
+            let mut app = App::new(None);
+            app.paste("/he");
+            assert!(app.key(key(complete)).is_none());
+            assert_eq!(app.input(), "/help");
+            assert_eq!(app.entries.len(), 1);
+            app.key(key(KeyCode::Enter));
+            assert_eq!(app.entries.back().unwrap().title, "Commands & keys");
+            app.paste("unfinished 中文");
+            app.key(key(KeyCode::Up));
+            assert_eq!(app.input(), "/help");
+            app.key(key(KeyCode::Down));
+            assert_eq!(app.input(), "unfinished 中文");
+            app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+            app.paste("second line");
+            app.key(key(KeyCode::Up));
+            assert!(app.input().ends_with("second line"));
+            assert_eq!(app.editor.cursor().0, 0);
+        }
+    }
+
+    #[test]
+    fn enter_completes_the_selected_command_before_running_it() {
         let mut app = App::new(None);
-        app.paste("/he");
-        app.key(key(KeyCode::Tab));
-        assert_eq!(app.input(), "/help");
-        app.submit();
-        app.paste("unfinished 中文");
+        app.paste("/");
         app.key(key(KeyCode::Up));
-        assert_eq!(app.input(), "/help");
-        app.key(key(KeyCode::Down));
-        assert_eq!(app.input(), "unfinished 中文");
-        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        app.paste("second line");
-        app.key(key(KeyCode::Up));
-        assert!(app.input().ends_with("second line"));
-        assert_eq!(app.editor.cursor().0, 0);
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert_eq!(app.input(), "/quit");
+        assert!(!app.quit);
+        app.key(key(KeyCode::Enter));
+        assert!(app.quit);
+
+        let mut app = App::new(None);
+        app.paste("/ins");
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert_eq!(app.input(), "/inspect ");
+        assert_eq!(app.entries.len(), 1);
+        app.paste("/new/model");
+        let request = app.key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(request.path, PathBuf::from("/new/model"));
+        assert!(matches!(request.task, Task::Inspect));
+    }
+
+    #[test]
+    fn modified_enter_inserts_a_newline_with_suggestions_open() {
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            let mut app = App::new(None);
+            app.paste("/he");
+            assert!(app.key(KeyEvent::new(KeyCode::Enter, modifiers)).is_none());
+            assert_eq!(app.input(), "/he\n");
+            assert_eq!(app.entries.len(), 1);
+        }
     }
 
     #[test]
